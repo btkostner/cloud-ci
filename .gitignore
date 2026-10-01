@@ -1,0 +1,30 @@
+# Rust
+target/
+**/*.rs.bk
+
+# Node
+node_modules/
+.pnpm-store/
+
+# Cloudflare / wrangler local state
+.wrangler/
+.dev.vars
+.dev.vars.*
+
+# mise
+.mise.local.toml
+mise.local.toml
+
+# Local secrets and machine-specific config
+.env
+.env.local
+/local/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Agent tooling state
+.claude/
+.codex/
+.omp/
