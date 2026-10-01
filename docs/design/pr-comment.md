@@ -4,6 +4,10 @@ Status: Proposed
 
 Related: [../architecture.md](../architecture.md), [./byo-ci.md](./byo-ci.md), [./parallelization.md](./parallelization.md), [./analytics.md](./analytics.md), [./ai.md](./ai.md), [./auth.md](./auth.md), [./assets.md](./assets.md), [./pipeline-config.md](./pipeline-config.md)
 
+
+> Check Runs are now opt-in per node or per named selector, plus the always-on `cloud-ci`
+> aggregate check; see [dynamic-pipelines](./dynamic-pipelines.md#github-status-checks). Where
+> this doc says "one Check Run per job", read "per enabled node or selector".
 ## Summary
 
 cloud-ci reports results to GitHub in two ways:

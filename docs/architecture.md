@@ -9,7 +9,8 @@ build. Per-feature mechanics live in [`design/`](./design/), decisions and their
 A CI system you deploy into **your own Cloudflare account**. One deployment serves one GitHub
 organization (or user) across any number of repositories. It does three jobs:
 
-1. **Runs CI** on Cloudflare Containers, driven by `.cloud-ci/pipeline.yml` in each repo
+1. **Runs CI** on Cloudflare Containers, driven by `.cloud-ci/pipeline.ts` (a program that can discover the
+   repo's Turborepo or mise graph) or the static `.cloud-ci/pipeline.yml` in each repo
    (*managed runs*).
 2. **Accepts CI results from anywhere else** — GitHub Actions, Buildkite, a laptop — through an
    ingest API and the `cloud-ci` CLI (*external runs*).
@@ -64,7 +65,8 @@ None exist yet; [roadmap](./roadmap.md) says when each arrives.
 | --- | --- | --- |
 | `cloud-ci-proto` | protobuf | API contract source of truth: run/job/step/test/artifact model, ingest, query |
 | `cloud-ci-proto-rust` | Rust | Generated bindings, imported as `cloud_ci_proto` |
-| `cloud-ci-proto-typescript` | TypeScript | Generated bindings for the dashboard |
+| `cloud-ci-proto-typescript` | TypeScript | Generated bindings for the dashboard and pipeline SDK |
+| `cloud-ci-pipeline-sdk` | TypeScript | `@cloud-ci/pipeline`: typed API for `pipeline.ts` programs |
 | `cloud-ci-core` | Rust (no `worker` dep) | Report parsers, merging, splitter, rightsizer — shared by Worker and CLI, tested natively |
 | `cloud-ci-worker` | Rust → wasm32 | HTTP front door, webhooks, ingest, asset serving, queue consumers, Durable Objects, cron |
 | `cloud-ci-cli` | Rust (native) | `cloud-ci` binary: `upload`, `split`, `merge`, `login`, `agent` |
@@ -109,7 +111,8 @@ External runs skip `queued`; they go straight to `running` on first upload.
 
 1. GitHub `push`/`pull_request` webhook → Worker verifies signature, enqueues, returns 200
    immediately (GitHub's webhook timeout is short; all real work happens off the request).
-2. Queue consumer fetches `.cloud-ci/pipeline.yml` at the commit sha, validates it, creates the
+2. Queue consumer fetches `.cloud-ci/pipeline.ts` or `.cloud-ci/pipeline.yml` at the commit sha,
+   evaluates it into a plan (TypeScript in a sandboxed Dynamic Worker), creates the
    run in D1, and hands it to the repo's `RepoState` DO, which applies concurrency rules
    (cancel-superseded, per-repo limits).
 3. `RunCoordinator` DO for the run owns the job DAG. For each ready job it resolves the instance
@@ -159,7 +162,8 @@ GitLab/Gitea support would be a second `Forge`, not a change to the coordinator.
 
 | Doc | Covers |
 | --- | --- |
-| [pipeline-config](./design/pipeline-config.md) | `.cloud-ci/pipeline.yml` format |
+| [pipeline-config](./design/pipeline-config.md) | `.cloud-ci/pipeline.yml` static format |
+| [dynamic-pipelines](./design/dynamic-pipelines.md) | `pipeline.ts` programs, Turborepo/mise graph discovery, per-node containers, selector checks |
 | [pr-comment](./design/pr-comment.md) | Sticky PR comment, Check Runs, slash commands |
 | [byo-ci](./design/byo-ci.md) | Ingest API, `cloud-ci upload`, external runs |
 | [parallelization](./design/parallelization.md) | Sharding, test splitting, merging |

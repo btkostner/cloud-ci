@@ -2,6 +2,11 @@
 
 Status: Proposed
 
+> This YAML format is now the static shorthand. Pipelines can also be TypeScript programs that
+> discover their task graph from Turborepo or mise; both compile to the same `cloud_ci.v1.Plan`.
+> See [dynamic-pipelines](./dynamic-pipelines.md) and
+> [ADR 0009](../adr/0009-typescript-pipeline-programs.md).
+
 Related: [../architecture.md](../architecture.md), [./parallelization.md](./parallelization.md), [./analytics.md](./analytics.md), [./pr-comment.md](./pr-comment.md), [./ai.md](./ai.md), [./auth.md](./auth.md), [./assets.md](./assets.md), [./byo-ci.md](./byo-ci.md)
 
 ## Summary

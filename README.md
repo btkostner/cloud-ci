@@ -11,6 +11,7 @@ Rust as a Cloudflare Worker.
 | Feature | What it does | Design |
 | --- | --- | --- |
 | Managed CI | Runs `.cloud-ci/pipeline.yml` on Cloudflare Containers | [pipeline-config](docs/design/pipeline-config.md) |
+| Dynamic pipelines | TypeScript pipeline programs; runs each Turborepo/mise task in its own container, skipping cached ones | [dynamic-pipelines](docs/design/dynamic-pipelines.md) |
 | Single PR comment | One optional, continuously updated comment summarizing every run on a PR | [pr-comment](docs/design/pr-comment.md) |
 | Bring your own CI | Upload results from GitHub Actions or any CI for the same comment and analytics | [byo-ci](docs/design/byo-ci.md) |
 | Parallelization | Timing-based test splitting and merging results back together | [parallelization](docs/design/parallelization.md) |
