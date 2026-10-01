@@ -1,6 +1,6 @@
 # 0009: TypeScript pipeline programs with discovered task graphs
 
-- Status: Proposed (supersedes [0006](./0006-own-pipeline-format.md))
+- Status: Proposed (would supersede [0006](./0006-own-pipeline-format.md) once accepted)
 - Date: 2026-10-01
 
 ## Context

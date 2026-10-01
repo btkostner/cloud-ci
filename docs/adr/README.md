@@ -10,7 +10,7 @@ deleted; a later ADR supersedes it and the old one's Status line says so.
 | [0003](./0003-single-tenant-deployment.md) | Single-tenant, deploy-to-your-own-account | Proposed |
 | [0004](./0004-storage-and-coordination.md) | Storage and coordination primitives | Proposed |
 | [0005](./0005-containers-for-execution.md) | Cloudflare Containers for job execution | Proposed |
-| [0006](./0006-own-pipeline-format.md) | Own pipeline format, not GitHub Actions syntax | Superseded by 0009 |
+| [0006](./0006-own-pipeline-format.md) | Own pipeline format, not GitHub Actions syntax | Proposed (0009 would supersede) |
 | [0007](./0007-one-upload-path.md) | One upload path for managed and external runs | Proposed |
 | [0008](./0008-auth-modes.md) | Access or GitHub OAuth for humans; OIDC for machines | Proposed |
 | [0009](./0009-typescript-pipeline-programs.md) | TypeScript pipeline programs with discovered task graphs | Proposed |
