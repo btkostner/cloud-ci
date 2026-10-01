@@ -35,8 +35,9 @@ stays as a static shorthand that compiles to the same plan.
 
 ## Non-goals
 
-- Running arbitrary user code inside `cloud-ci-worker`. Pipeline programs run in a sandbox
-  (Dynamic Workers) or in a container, never in our own isolate.
+- Running arbitrary user code in `cloud-ci-worker`'s own isolate. `cloud-ci-worker` creates and
+  calls a Dynamic Worker sandbox (or uses a container) for pipeline programs. Whether that
+  sandbox isolates well enough is a Phase 0 spike, not an established fact.
 - Re-implementing Turborepo's hashing. We use turbo's own hashes and cache protocol.
 - A plugin system for third-party graph tools in v1. Turborepo and mise are built in; everything
   else uses the generic graph-JSON adapter.
@@ -304,8 +305,10 @@ job.
 
 ## Security considerations
 
-- `pipeline.ts` comes from the PR head, including fork PRs. It runs only in a Dynamic Worker with
-  egress blocked and no bindings except the read-only inputs we pass. It never receives secrets.
+- `pipeline.ts` comes from the PR head, including fork PRs. It is intended to run only in a
+  host-orchestrated Dynamic Worker with egress blocked, no secrets, and no bindings except the
+  read-only inputs we pass. The Phase 0 Dynamic Workers spike must confirm this isolation before
+  managed runs depend on it.
 - Secrets reach task containers only, under the rules already in
   [pipeline-config](./pipeline-config.md) (no secrets for fork PRs unless an admin approves).
 - The turbo cache is scoped per repo. A fork-PR run gets `cache:read` only, so it cannot poison
