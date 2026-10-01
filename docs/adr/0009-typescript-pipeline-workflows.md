@@ -1,6 +1,6 @@
 # 0009: Pipelines as durable TypeScript workflows
 
-- Status: Proposed (would supersede [0006](./0006-own-pipeline-format.md) once accepted)
+- Status: Accepted (supersedes [0006](./0006-own-pipeline-format.md))
 - Date: 2026-10-01
 
 ## Context
@@ -13,17 +13,24 @@ plan expanded by adapters; that kept the same problem one level up.
 
 ## Decision
 
-- Pipelines are TypeScript scripts in `.cloud-ci/pipelines/<name>.ts` that orchestrate the run
-  imperatively through a `ci` API: start containers, await results, branch, loop.
+- Pipelines are TypeScript scripts in `.cloud-ci/pipelines/*.ts`, one file per pipeline (e.g.
+  `ci.ts`, `deploy.ts`, `maintenance.ts`). Each file declares its own triggers (`on:`) and runs
+  as its own Dynamic Workflow / run; multiple pipelines can run for the same commit. Each
+  orchestrates imperatively through a `ci` API: start containers, await results, branch, loop.
 - Scripts run as Cloudflare **Dynamic Workflows**. Every side effect is a durable step, so an
   isolate recycle or redeploy replays the script without repeating finished work.
 - `RunCoordinator` remains the single writer of run state and enforces policy the script cannot
   override (secrets, runner bounds, concurrency, node caps).
-- Turborepo and mise support ships as library helpers (`turbo.plan`, `turbo.execute`) in
-  `@cloud-ci/pipeline`, not as engine features.
-- GitHub checks are created by name from the script; nodes attach to them. The aggregate
-  `cloud-ci` check is always reported.
-- `pipeline.yml` remains, executed by a built-in script.
+- Turborepo and mise support ships as library helpers in their own SDK modules
+  (`@cloud-ci/pipeline/turbo`, `@cloud-ci/pipeline/mise`), not as engine features; core
+  `@cloud-ci/pipeline` only has the generic graph + `ci` API.
+- GitHub checks are created explicitly by name from the script (`ci.check(name, opts)`); nodes
+  attach to checks. No check is always-on — a check only exists if a script creates it. One
+  aggregate check (default name `cloud-ci`, configurable, can be disabled) is the recommended
+  branch-protection target.
+- Static repo configuration (PR comment on/off, default check behavior, concurrency policy,
+  runner bounds defaults, cache/retention prefs) lives in `.cloud-ci/settings.yml`, not in a
+  pipeline file. See [settings](../design/settings.md).
 
 Details: [dynamic-pipelines](../design/dynamic-pipelines.md).
 
@@ -48,4 +55,5 @@ Details: [dynamic-pipelines](../design/dynamic-pipelines.md).
 ## What would reverse this
 
 Dynamic Workflows not isolating PR-controlled code well enough, or step costs and limits making
-large graphs impractical. The fallback is the static-plan design or YAML only.
+large graphs impractical. The fallback is the static-plan design from the earlier draft of this
+ADR, with no built-in YAML format.

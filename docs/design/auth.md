@@ -5,28 +5,47 @@ details.
 
 ## Summary
 
-Every request into `cloud-ci-worker` is either a **human** request (dashboard, PR comment slash command) or a **machine** request (GitHub Actions upload, BYO-CI upload, our own container agent, our own coordinator). Humans authenticate with Cloudflare Access or GitHub OAuth (deploy-time choice, either or both); machines authenticate with GitHub Actions OIDC, a scoped API token, or a per-job token minted by `RunCoordinator`. Every authenticated identity resolves to exactly one of three roles — **viewer**, **operator**, **admin** — evaluated per repository, and every action maps to a minimum role. GitHub access, including webhooks and the role lookup itself, goes through a single GitHub App, registered once per deployment via the manifest flow.
+Every request into `cloud-ci-worker` is either a **human** request (dashboard, PR comment slash
+command) or a **machine** request (GitHub Actions upload, BYO-CI upload, our own container
+agent, our own coordinator). Humans authenticate with GitHub OAuth (GitHub App user flow);
+machines authenticate with GitHub Actions OIDC, a scoped API token, or a per-job token minted by
+`RunCoordinator`. Every authenticated identity resolves to exactly one of three roles —
+**viewer**, **operator**, **admin** — evaluated per repository. A single deployment can serve
+**multiple GitHub orgs** at once, each through its own GitHub App installation, for companies
+that split work across more than one org ([ADR 0003](../adr/0003-single-tenant-deployment.md)); all data is keyed by installation and repo
+id, and a user's dashboard is scoped to the repos their GitHub permissions actually grant them
+access to, across every installation this deployment has. GitHub access, including webhooks and
+the role lookup itself, goes through a single GitHub App, registered once per deployment via the
+manifest flow.
 
 ## Goals
 
-- One role model (viewer / operator / admin), enforced the same way regardless of which human
-  auth mode is active.
+- One role model (viewer / operator / admin), enforced identically for every repo regardless of
+  which installation (org) it belongs to.
 - Zero stored secrets for GitHub Actions callers — OIDC only.
 - Every long-lived credential is revocable and stored in a form that is useless if the
   database leaks (hashed, not reversible).
 - One GitHub App per deployment, requesting only the permissions the shipped feature set
-  actually uses.
+  actually uses, installable into every org the deployer's company uses.
+- Only orgs the deployer explicitly allowed at setup can ever create usable data in this
+  deployment, even if the App's GitHub-side visibility is broader than that.
 - Webhook and token verification happen before any other request handling; nothing touches D1,
   R2, or a Durable Object on behalf of an unverified caller.
 
 ## Non-goals
 
-- Hosting an identity provider. Cloudflare Access or GitHub remain the identity source; we only
-  verify what they issue.
+- Hosting an identity provider. GitHub remains the identity source; we only verify what it
+  issues.
+- Cloudflare Access/Zero Trust as a cloud-ci auth mode. Considered and rejected — see
+  [ADR 0008](../adr/0008-auth-modes.md#alternatives-considered). Deployers who still want an
+  IdP gate in front of a hostname can put Cloudflare Zero Trust there themselves; see
+  [Deployment note](#deployment-note) below.
 - Per-action ACLs finer than the three roles (e.g. "can view logs but not cancel runs"). Three
   roles cover the feature set in [architecture.md](../architecture.md); a fourth role is an
   [open question](#open-questions), not a v1 feature.
-- Multiple GitHub orgs per deployment — single-tenant per [ADR 0003](../adr/0003-single-tenant-deployment.md).
+- Multi-company tenancy within one deployment. Multiple orgs under one deployment must belong to
+  one company ([ADR 0003](../adr/0003-single-tenant-deployment.md)) — this doc's org allowlist narrows which orgs *can* onboard, it does
+  not isolate orgs from each other the way separate deployments would.
 - Non-GitHub forges. The `Forge` trait in architecture.md leaves room; this doc assumes GitHub.
 - Usage-based or billing-based access control.
 
@@ -37,11 +56,9 @@ Every request into `cloud-ci-worker` is either a **human** request (dashboard, P
 ```toml
 # wrangler.toml (excerpt)
 [vars]
-AUTH_MODE = "access"                              # "access" | "github_oauth" | "both"
-ACCESS_TEAM_DOMAIN = "https://acme.cloudflareaccess.com"
-ACCESS_AUD = "32eafc7626e974616deaf0dc3ce63d7bcbed58a2731e84d06bc3cdf1b53c4228"
 GITHUB_APP_ID = "123456"
 GITHUB_APP_CLIENT_ID = "Iv1.8a61f9b3a7aba766"
+GITHUB_ALLOWED_ORGS = "acme-corp,acme-labs"            # set once at setup, see below
 
 [[secrets_store_secrets]]
 binding = "GITHUB_APP_PRIVATE_KEY"
@@ -64,21 +81,28 @@ commands are the account-level Secrets Store mechanism, distinct from per-Worker
 secret put` — see [Secret storage](#secret-storage)
 (developers.cloudflare.com/secrets-store/integrations/workers, updated 2026-05-05).
 
-When `AUTH_MODE = "both"`, a request is authenticated if either mode succeeds; the resulting
-role is the one derived from whichever mode matched (a user who is both an Access-group member
-and a GitHub collaborator is not required to reconcile two roles — Access is checked first,
-then GitHub OAuth).
+`GITHUB_ALLOWED_ORGS` is the org allowlist: a comma-separated list of GitHub org (or user
+account) logins the deployer names during [GitHub App setup](#github-app-setup). It is enforced
+on every `installation` webhook — see [Multiple orgs and installations](#multiple-orgs-and-installations)
+— independently of whatever install-time restriction the App's own GitHub-side visibility
+provides, since a public App (needed when a company's orgs are not all under one GitHub
+Enterprise account) can otherwise be installed by any GitHub account.
 
 ### Per-repo overrides
 
 ```yaml
-# .cloud-ci/pipeline.yml (excerpt) — optional, defaults shown
-auth:
-  comment_commands: operator   # minimum role for /cloud-ci rerun, /cloud-ci cancel
-  autofix: operator            # minimum role to request AI autofix (see ./ai.md)
+# .cloud-ci/settings.yml (excerpt) — optional, defaults shown
+commands:
+  roles:
+    rerun: operator      # /cloud-ci rerun, rerun checkbox, check-run action
+    cancel: operator      # /cloud-ci cancel
+    autofix: operator     # request AI autofix (see ./ai.md)
 ```
 
-See [pipeline-config.md](./pipeline-config.md) for the rest of the file format.
+Values can only be raised (`operator` → `admin`), never lowered below `operator` — `viewer`
+cannot invoke commands, so it is not a valid value here. For fork PRs this file is read from the
+base branch, same as every other `settings.yml` key. See
+[settings.md](./settings.md#commands) for the rest of the file format.
 
 ### CLI login
 
@@ -98,56 +122,10 @@ Store this now — it will not be shown again.
 exchanges the resulting GitHub user access token for a `cloud-ci`-scoped token (see
 [Machine auth](#machine-auth)). The device flow requires **Enable Device Flow** to be turned on
 for the App in its settings (docs.github.com/en/apps/maintaining-github-apps/modifying-a-github-app-registration,
-accessed 2026-09-30); it is set during [GitHub App setup](#github-app-setup).
+accessed 2026-09-30); it is set during [GitHub App setup](#github-app-setup). `octocat`'s roles
+are resolved per repo across every installation this deployment has, not just one org.
 
 ## Design
-
-### Human auth: Cloudflare Access
-
-When `AUTH_MODE` includes `access`, Access sits in front of the dashboard hostname and attaches
-a signed JWT to every request as the `Cf-Access-Jwt-Assertion` header (and, for browser
-requests, a `CF_Authorization` cookie — the header is authoritative since the cookie is not
-guaranteed to be present)
-(developers.cloudflare.com/cloudflare-one/.../validating-json, updated 2026-05-06).
-
-Standard Access browser flow: an unauthenticated browser is redirected to the configured IdP,
-then back to Access with a `CF_Authorization` cookie, then on to the Worker with both the
-cookie and the `Cf-Access-Jwt-Assertion` header set. Verification, every request:
-
-1. Reject if `Cf-Access-Jwt-Assertion` is missing (do not fall back to the cookie).
-2. Fetch `https://<team>.cloudflareaccess.com/cdn-cgi/access/certs`, cached by `kid`; Access
-   rotates its signing key roughly every 6 weeks and keeps the previous key valid for 7 days —
-   match on `kid` against `public_certs`, never pin a key or read `public_cert` from a stale
-   cache (same source as above).
-3. Verify RS256 signature, `iss == ACCESS_TEAM_DOMAIN`, `aud == ACCESS_AUD`, `exp`/`nbf`.
-4. Read `email` and, if present, the `groups` custom claim from the payload.
-
-Access only places `groups` in the JWT if the IdP's `groups` SAML attribute or OIDC claim was
-explicitly mapped when configuring the IdP in Zero Trust — Access does not add it
-automatically — and the payload is trimmed (dropping configured claims from the end, groups
-usually first) once the serialized `custom` claim exceeds roughly 1 KB, since the JWT also
-rides in a browser cookie (developers.cloudflare.com/.../application-token, updated
-2026-06-25). Because group membership can silently disappear from the JWT for a user in many
-groups, the Worker does not trust `groups` in the JWT for the admin/operator boundary; it calls
-`GET https://<team>.cloudflareaccess.com/cdn-cgi/access/get-identity` with the forwarded
-`CF_Authorization` cookie and reads the untrimmed `idp` group list, cached 5 minutes per `sub`.
-`email` and `sub` are used directly from the JWT (never trimmed).
-
-Role mapping is deploy-time config, not a schema:
-
-```toml
-[access_role_map]
-admin = ["eng-leads", "platform-team"]
-operator = ["engineering"]
-# anything else authenticated via Access and not listed is "viewer"
-```
-
-**Machine-to-Access**: Access also supports service tokens (`CF-Access-Client-Id` /
-`CF-Access-Client-Secret` headers) for non-interactive callers
-(developers.cloudflare.com/cloudflare-one/access-controls/service-credentials/service-tokens,
-accessed 2026-09-30). cloud-ci does not use these: GitHub Actions callers use OIDC and BYO-CI
-systems use scoped API tokens (below), both already scoped to this deployment without
-provisioning anything in Access.
 
 ### Human auth: GitHub OAuth
 
@@ -161,8 +139,8 @@ cookie.
 The Worker never stores the GitHub user access token past the callback: it is used once, to
 call `GET /user` for a verified `login`/`id`, then discarded. Repo-level role resolution does
 **not** reuse that token (it would need `read:org` scoped correctly and goes stale after 8
-hours); instead the Worker calls the role-lookup endpoint below using the App's own
-installation token, keyed on the GitHub login already captured.
+hours); instead the Worker calls the role-lookup endpoint below using the token of the
+installation that owns the target repo, keyed on the GitHub login already captured.
 
 Session storage is **D1 rows, not stateless signed cookies** — see
 [Alternatives considered](#alternatives-considered) for why. The cookie holds only a random
@@ -173,10 +151,66 @@ export does not yield usable sessions:
 Set-Cookie: __Host-cc_session=<base64url(32 random bytes)>; Secure; HttpOnly; SameSite=Lax; Path=/
 ```
 
-### Role resolution (both modes, GitHub-derived)
+A session is not org-scoped: one login covers every installation this deployment has, and each
+repo's role is resolved independently (below) at the time it is needed.
 
-For GitHub OAuth always, and for Access when `access_role_map` does not list any of the user's
-groups, the role for a given repo comes from the user's GitHub permission on that repo:
+### Multiple orgs and installations
+
+One GitHub App, one Worker deployment, many installations — one per org the company uses. Two
+install paths, and a runtime allowlist that gates both:
+
+- **Enterprise-owned App** (if the deployer has a GitHub Enterprise account): the App is
+  registered under the enterprise, which restricts installation to orgs within that enterprise
+  and authorization to enterprise members
+  (docs.github.com/en/enterprise-cloud@latest/admin/managing-github-apps-for-your-enterprise/creating-github-apps-for-your-enterprise,
+  accessed 2026-10-01) — GitHub itself does most of the gating here.
+- **Public App owned by one org** (no Enterprise account, or orgs span more than one
+  Enterprise): a private App "can only be installed on the account that owns the app"
+  (docs.github.com/en/apps/creating-github-apps/registering-a-github-app/making-a-github-app-public-or-private,
+  accessed 2026-10-01), so serving a second org requires making the App public, which lets *any*
+  GitHub account install it. `GITHUB_ALLOWED_ORGS` is what keeps that safe: it is the only gate
+  in this path.
+
+**Discovery.** The `installation` and `installation_repositories` webhooks (subscribed in the
+[manifest](#github-app-setup)) are the primary signal: `installation.created` upserts an
+`installations` row *only if* the installing account's login is in `GITHUB_ALLOWED_ORGS`;
+otherwise the Worker immediately calls `DELETE /app/installations/{installation_id}`
+(docs.github.com/en/rest/apps/apps#delete-an-installation-for-the-authenticated-app, accessed
+2026-10-01) to uninstall itself from the disallowed account and never creates rows for it.
+`installation_repositories.added`/`removed` keep each installation's visible-repo set current.
+Because webhook delivery is at-least-once but not guaranteed, a periodic reconcile job calls
+`GET /app/installations` (paginated, App JWT auth) and diffs against the `installations` table,
+catching any installation whose webhook was missed or whose delivery arrived while the Worker
+was deploying.
+
+**Data scoping.** Every row that is per-repo is also implicitly per-installation, since `repo_id`
+only exists once per `(installation_id, repo)` pair in the `repos` table
+([architecture.md](../architecture.md)). Nothing in this doc's tables (`repo_role_cache`,
+`api_tokens.repo_allowlist`, `sessions`) needs its own `installation_id` column — joining through
+`repo_id` is enough, and keeps queries from needing to special-case the single-org case.
+
+**Role resolution per repo.** The lookup in [Role resolution](#role-resolution) always uses the
+installation token that owns the target repo (looked up via `repos.installation_id`), never a
+token from a different installation — an installation token is scoped by GitHub to only the
+repos that installation can see, so using the wrong one simply 404s rather than leaking access.
+
+**Dashboard scoping.** A signed-in user's repo list is the union, across every installation this
+deployment has, of repos where `GET /repos/{owner}/{repo}/collaborators/{username}/permission`
+(via that repo's installation token) returns a non-`none` permission. A user who is, say, an
+`acme-corp` engineer and has no access to `acme-labs` simply sees zero `acme-labs` repos — there
+is no separate "which orgs can this user see" step, it falls out of the per-repo check.
+
+**Org allowlist changes.** Adding an org to `GITHUB_ALLOWED_ORGS` does not retroactively install
+anything — the org owner still has to run the GitHub install flow, which then succeeds because
+the allowlist no longer rejects it. Removing an org from the allowlist does not uninstall it
+automatically (the Worker only acts on `installation` webhooks); a deployer who wants it
+removed immediately also uninstalls the App from that org in GitHub's UI, or the next full
+reconcile pass flags the mismatch for manual follow-up [open question, below].
+
+### Role resolution
+
+The role for a given repo comes from the user's GitHub permission on that repo, looked up
+through the repo's own installation:
 
 ```
 GET /repos/{owner}/{repo}/collaborators/{username}/permission
@@ -217,10 +251,11 @@ handling.
 | Issue, list, revoke scoped API tokens | admin |
 | View/rotate per-repo config | admin |
 
-Rotating the GitHub App's own private key, webhook secret, or `CLOUD_CI_MASTER_KEY` is a
-deployment-operator action performed through Cloudflare (dashboard or `wrangler`), not a
-cloud-ci role — anyone who can deploy the Worker already has that access, and no cloud-ci role
-is meant to substitute for it.
+Rotating the GitHub App's own private key, webhook secret, or `CLOUD_CI_MASTER_KEY`, and
+changing `GITHUB_ALLOWED_ORGS` or installing/uninstalling the App on an org, are
+deployment-operator actions performed through Cloudflare (dashboard or `wrangler`) and GitHub,
+not a cloud-ci role — anyone who can deploy the Worker or administer the GitHub App already has
+that access, and no cloud-ci role is meant to substitute for it.
 
 ### Machine auth
 
@@ -243,13 +278,13 @@ sequenceDiagram
     R->>W: BeginRun (Authorization: Bearer <OIDC JWT>)
     W->>GH: fetch JWKS from /.well-known/jwks (cached)
     W->>W: verify sig, iss, aud, exp
-    W->>W: check repository_id == installation's repo, event_name allowed
+    W->>W: check repository_id matches a repos row whose installation is allowlisted, event_name allowed
     W->>R: ingest token (1h, scope ingest:write, bound to repo_id/run)
 ```
 
 - **Issuer**: `https://token.actions.githubusercontent.com`; JWKS URI is published at `/.well-known/openid-configuration` (token.actions.githubusercontent.com/.well-known/openid-configuration, accessed 2026-09-30).
 - **Audience**: the action step sets a custom `aud` (via `id-token: write` + `core.getIDToken(audience)`) equal to the deployment's own Worker URL, not GitHub's default repository-owner-URL audience — this is what scopes the token to *this* deployment and nothing else.
-- **Repo binding**: rather than trust the `sub` claim's string format (collision-resistant only for repositories created after 2026-07-15, when GitHub began optionally issuing `owner_id`/`repo_id`-qualified subjects — docs.github.com/en/actions/reference/security/oidc, accessed 2026-09-30), the Worker checks the numeric `repository_id`/`repository_owner_id` claims against the `repos`/`installations` rows for this deployment's installation. Numeric IDs are never reused if a repo is renamed or transferred, closing the gap the legacy `sub` format has.
+- **Repo binding**: rather than trust the `sub` claim's string format (collision-resistant only for repositories created after 2026-07-15, when GitHub began optionally issuing `owner_id`/`repo_id`-qualified subjects — docs.github.com/en/actions/reference/security/oidc, accessed 2026-09-30), the Worker checks the numeric `repository_id`/`repository_owner_id` claims against the `repos`/`installations` rows for this deployment — across every allowlisted installation, not just one. Numeric IDs are never reused if a repo is renamed or transferred, closing the gap the legacy `sub` format has.
 - `event_name` is checked against an allowlist (`push`, `pull_request`, `workflow_dispatch`, `schedule`) to reject tokens minted for unrelated job types [unverified — exact allowlist is a product decision, not a GitHub guarantee].
 
 A verified OIDC token never touches D1; it produces a short-lived ingest token (below) and is
@@ -265,7 +300,11 @@ cc_tok_<32 random bytes, base64url>
 ```
 
 Only `sha256(token)` is stored, in `api_tokens.token_hash` (BLOB, 32 bytes) — the plaintext is shown once at creation and is not recoverable from the database, mirroring the GitHub webhook secret and the App's own credentials in never storing a secret anywhere it could be read back.
-Each row carries a `scopes` array and an optional `repo_allowlist`; requests present `Authorization: Bearer cc_tok_...`, the Worker hashes and looks up the row, checks `revoked_at IS NULL` and `expires_at` (if set), and checks the requested action's scope against `scopes`.
+Each row carries a `scopes` array and an optional `repo_allowlist` (repo ids, which may span
+installations/orgs if the issuing admin has admin role on repos in more than one); requests
+present `Authorization: Bearer cc_tok_...`, the Worker hashes and looks up the row, checks
+`revoked_at IS NULL` and `expires_at` (if set), and checks the requested action's scope against
+`scopes`.
 
 | Scope | Grants |
 | --- | --- |
@@ -301,7 +340,10 @@ The `info` string namespaces keys per token type (`job`, `ingest`) so a job toke
 
 The App is registered once per deployment via the [manifest
 flow](https://docs.github.com/en/apps/sharing-github-apps/registering-a-github-app-from-a-manifest)
-(accessed 2026-09-30), driven by a one-time setup command/page rather than manual form-filling:
+(accessed 2026-09-30), driven by a one-time setup command/page rather than manual form-filling.
+Setup also collects `GITHUB_ALLOWED_ORGS` (the deployer types the org logins they intend to use)
+before the first installation, since the allowlist check on `installation.created` needs it in
+place from the start:
 
 ```mermaid
 sequenceDiagram
@@ -310,14 +352,14 @@ sequenceDiagram
     participant GH as GitHub
 
     Op->>W: GET /setup/github-app
-    W->>Op: HTML form, POSTs manifest JSON to GitHub
+    W->>Op: HTML form (incl. GITHUB_ALLOWED_ORGS), POSTs manifest JSON to GitHub
     Op->>GH: POST github.com/settings/apps/new (or /organizations/{org}/settings/apps/new)
     GH->>Op: 302 to redirect_url?code=...
     Op->>W: GET /setup/github-app/callback?code
     W->>GH: POST /app-manifests/{code}/conversions
     GH->>W: { id, pem, webhook_secret, client_id, client_secret }
-    W->>W: store pem + webhook_secret in Secrets Store, app_id/client_id in vars
-    W->>Op: "App registered — click to install"
+    W->>W: store pem + webhook_secret in Secrets Store, app_id/client_id/allowed_orgs in vars
+    W->>Op: "App registered — install it on each allowed org"
 ```
 
 All three steps must complete within one hour of the manifest `POST`
@@ -345,15 +387,21 @@ accessed 2026-09-30). The manifest:
     "check_suite",
     "check_run",
     "issue_comment",
-    "installation"
+    "installation",
+    "installation_repositories"
   ]
 }
 ```
 
+`public` starts `false`; it is flipped to `true` during setup only if the deployer's orgs are
+not all under one GitHub Enterprise account — see
+[Multiple orgs and installations](#multiple-orgs-and-installations) for why that is the only
+case that needs it, and why `GITHUB_ALLOWED_ORGS` is mandatory as soon as it is.
+
 | Permission | Level | Used for |
 | --- | --- | --- |
-| Contents | read | Fetch `.cloud-ci/pipeline.yml` at a commit; read-only, never pushes (write is opt-in, see below) |
-| Checks | write | Per-job GitHub Check Runs (always on, per [architecture.md](../architecture.md)) |
+| Contents | read | Fetch `.cloud-ci/settings.yml` and pipeline scripts at a commit; read-only, never pushes (write is opt-in, see below) |
+| Checks | write | GitHub Check Runs created by pipeline scripts (see [pr-comment.md](./pr-comment.md)) |
 | Pull requests | write | Sticky PR comment ([pr-comment.md](./pr-comment.md)), suggested-changes reviews |
 | Issues | write | `issue_comment` events carry `/cloud-ci` slash commands on PRs (PRs are issues in the GitHub API) |
 | Metadata | read | Mandatory for every GitHub App; also backs the collaborator-permission role lookup above |
@@ -365,7 +413,7 @@ accessed 2026-09-30). The manifest:
 | `pull_request` | Trigger managed runs, detect PR open/sync/close |
 | `check_suite`, `check_run` | `rerequested` action drives re-run from GitHub's own UI |
 | `issue_comment` | `/cloud-ci` slash commands |
-| `installation`, `installation_repositories` | Track which repos the App can see; invalidate `repo_role_cache` and `repos` rows on suspend/uninstall/repo add-remove |
+| `installation`, `installation_repositories` | Discover/allowlist-gate new installations (see [Multiple orgs and installations](#multiple-orgs-and-installations)); invalidate `repo_role_cache` and `repos` rows on suspend/uninstall/repo add-remove |
 
 **Contents: write** and the ability to open PRs with the suggested-changes bot identity is requested only when a deployment opts into AI autofix's fix-PR mode at setup time ([ai.md](./ai.md)); it is not in the default manifest, keeping the default install's blast radius to "comment and check status," never "push code," matching the autofix invariant in architecture.md.
 
@@ -378,7 +426,7 @@ App-level authentication (fetching an installation token, or any `/app/*` endpoi
 | GitHub App private key (PEM) | Secrets Store, `workers` scope binding | Account-level, encrypted, never readable again after creation; shared only by this Worker |
 | GitHub webhook secret | Secrets Store | Same as above |
 | `CLOUD_CI_MASTER_KEY` (HKDF root for job/ingest tokens and asset grants, see [assets.md](./assets.md)) | Secrets Store | Same as above; rotating it invalidates all outstanding job/ingest tokens, which is acceptable since they are minutes-to-hours lived |
-| `ACCESS_AUD`, `GITHUB_APP_ID`, `GITHUB_APP_CLIENT_ID` | Worker `vars` | Not secret — public identifiers |
+| `GITHUB_APP_ID`, `GITHUB_APP_CLIENT_ID`, `GITHUB_ALLOWED_ORGS` | Worker `vars` | Not secret — public identifiers / an allowlist, not a credential |
 | Scoped API tokens | D1, `api_tokens.token_hash` (SHA-256) | Caller-controlled lifetime; must be revocable, so hashed-at-rest, not HMAC-derived |
 | Session ids | D1, `sessions.id` (SHA-256 of the cookie value) | Same reasoning as API tokens — revocable, worthless if D1 leaks |
 
@@ -414,11 +462,11 @@ No R2 keys belong to this doc (see [assets.md](./assets.md) for the R2 layout). 
 
 | Table | Columns | Notes |
 | --- | --- | --- |
-| `users` | `id` (ULID PK), `github_user_id` (int, unique, nullable), `github_login` (text, nullable), `access_sub` (text, unique, nullable), `email`, `created_at`, `last_login_at` | One row per human identity regardless of which auth mode they used; `github_user_id`/`access_sub` are alternate keys, not both required |
-| `sessions` | `id` (text PK, sha256 hex of cookie value), `user_id` (FK), `auth_mode` (`access`\|`github_oauth`), `created_at`, `expires_at`, `last_seen_at` | Deleted on logout or admin-triggered revoke |
-| `repo_role_cache` | `user_id`, `repo_id` (PK pair), `role`, `checked_at` | TTL enforced at read time (`checked_at` + 5 min), not by a cron sweep |
-| `api_tokens` | `id` (ULID PK), `token_hash` (BLOB 32), `name`, `scopes` (JSON array), `repo_allowlist` (JSON array of `repo_id`, null = all repos visible to `created_by`), `created_by` (FK `users.id`), `created_at`, `expires_at` (nullable), `last_used_at` (nullable), `revoked_at` (nullable) | `last_used_at` updated best-effort (not every request needs a write) for anomaly review |
-| `installations` | `installation_id` (PK), `account_login`, `account_type`, `suspended_at` (nullable), `installed_at` | Updated from `installation`/`installation_repositories` webhooks |
+| `users` | `id` (ULID PK), `github_user_id` (int, unique), `github_login`, `email`, `created_at`, `last_login_at` | One row per human identity |
+| `sessions` | `id` (text PK, sha256 hex of cookie value), `user_id` (FK), `created_at`, `expires_at`, `last_seen_at` | Not org-scoped; deleted on logout or admin-triggered revoke |
+| `repo_role_cache` | `user_id`, `repo_id` (PK pair), `role`, `checked_at` | TTL enforced at read time (`checked_at` + 5 min), not by a cron sweep; `repo_id` implies installation via `repos` |
+| `api_tokens` | `id` (ULID PK), `token_hash` (BLOB 32), `name`, `scopes` (JSON array), `repo_allowlist` (JSON array of `repo_id`, null = all repos visible to `created_by`, which may span installations), `created_by` (FK `users.id`), `created_at`, `expires_at` (nullable), `last_used_at` (nullable), `revoked_at` (nullable) | `last_used_at` updated best-effort (not every request needs a write) for anomaly review |
+| `installations` | `installation_id` (PK), `account_login`, `account_type`, `suspended_at` (nullable), `installed_at` | One row per allowlisted org; updated from `installation`/`installation_repositories` webhooks and the reconcile job |
 
 `repos` itself (repo_id, installation_id, name) is owned by [architecture.md](../architecture.md)'s
 core data model, not duplicated here.
@@ -427,10 +475,10 @@ core data model, not duplicated here.
 
 | Threat | Mitigation |
 | --- | --- |
-| Forged `Cf-Access-Jwt-Assertion` header sent directly to the Worker, bypassing Access | Worker validates signature/`iss`/`aud`/`exp` regardless of path, so a forged header without the account's Access private key fails; deployments SHOULD also make the dashboard hostname reachable only through the Access application (not a second, unprotected DNS record) so this is defense-in-depth, not the sole gate |
-| Access JWT minted for a different Access application on the same Zero Trust team, replayed here | `aud` is checked against this specific application's AUD tag, which never changes unless the application is deleted/recreated |
 | GitHub OAuth session cookie theft (XSS, log leakage) | `__Host-` prefix + `Secure` + `HttpOnly` + `SameSite=Lax`; session id is random and only its SHA-256 hash is stored, so a D1 leak alone does not yield a usable session |
 | GitHub permission downgrade not reflected immediately (e.g. removed from a team) | `repo_role_cache` TTL is 5 minutes, bounding exposure; no webhook subscription forces immediate invalidation in v1 (see [Open questions](#open-questions)) |
+| Public App installed by a GitHub account outside the company (only relevant when `public: true`, see [Multiple orgs and installations](#multiple-orgs-and-installations)) | `GITHUB_ALLOWED_ORGS` checked on `installation.created` before any row is created; non-allowlisted installations are uninstalled immediately via the API, not merely ignored, so they cannot retry into a race |
+| Role lookup for one org's user served from a different org's installation token | Role resolution always looks up `repos.installation_id` first and uses that installation's own token; a mismatched token 404s against GitHub rather than silently returning another org's permission |
 | Forged webhook delivery | `X-Hub-Signature-256` HMAC verified in constant time before parsing; see [Webhook signature verification](#webhook-signature-verification) |
 | OIDC token for a different, same-named repo (rename/recreate) | Checked against numeric `repository_id`/`repository_owner_id`, not the `repo:OWNER/REPO` string, closing the gap the legacy (pre-2026-07-15) `sub` format has |
 | OIDC token audience broadened to GitHub's default (org URL) by a misconfigured workflow | Worker requires `aud` to equal this deployment's own URL exactly; GitHub's default audience is the repo-owner URL, which is shared across every deployment that org might run, so it is explicitly rejected |
@@ -444,16 +492,14 @@ core data model, not duplicated here.
 
 | Failure | Behavior |
 | --- | --- |
-| Access `/cdn-cgi/access/certs` unreachable | Serve from the last successfully fetched JWKS (in-memory/cached) if still within its own cache window; if no cached JWKS exists, fail closed with 401 rather than skip verification |
 | GitHub API rate-limited or down during role lookup | Serve the last cached `repo_role_cache` row if present, even if its TTL expired, rather than fail closed immediately; if no cached row exists, resolve to viewer (least privilege) and surface a banner in the dashboard |
 | D1 unavailable | Sessions and API tokens cannot be validated; all authenticated requests fail closed (503), since there is no safe default for "is this session still valid" |
 | Installation suspended or uninstalled | `installations.suspended_at` set from the webhook; role lookups for that installation's repos resolve to no access until reinstalled; outstanding sessions/tokens are not auto-revoked (next role-cache refresh catches it within 5 minutes) |
-| Clock drift between edge and GitHub/Access issuers | All three token types carry `exp`/`nbf`/`iat`; the Worker applies no additional leeway beyond what each issuer already builds in (Access JWTs, GitHub App JWTs with the recommended 60s `iat` backdate) |
+| `installation.created` webhook missed for a disallowed org (delivery lost, Worker deploying) | The periodic `GET /app/installations` reconcile job (see [Multiple orgs and installations](#multiple-orgs-and-installations)) catches it on its next pass and uninstalls it then, rather than depending on the webhook alone |
+| Clock drift between edge and GitHub issuers | All token types carry `exp`/`nbf`/`iat`; the Worker applies no additional leeway beyond what GitHub's own issuers already build in (App JWTs with the recommended 60s `iat` backdate) |
 
 ## Open questions
 
-- Should Access `groups` resolution require the IdP's `groups` claim to be configured, or is an
-  email-domain fallback acceptable for deployments that skip that IdP setup step?
 - Is a 5-minute `repo_role_cache` TTL tight enough, or should `member`/`team` org webhooks be
   added to invalidate it immediately at the cost of two more webhook event subscriptions?
 - Default `cloud-ci login` to the device flow (requires enabling it per-App) or a local-loopback
@@ -463,6 +509,19 @@ core data model, not duplicated here.
   hour" sufficient?
 - Is "Commit statuses: write" actually needed once Check Runs fully cover the status-reporting
   surface, or can it be dropped from the default manifest?
+- Should the reconcile job's "mismatch between `GITHUB_ALLOWED_ORGS` and live installations"
+  case (an org removed from the allowlist but not yet uninstalled in GitHub) auto-uninstall, or
+  only surface a dashboard banner for a deployment admin to act on? Auto-uninstall is more
+  consistent with the `installation.created` path but is a more surprising default for an admin
+  who only meant to pause, not remove, an org.
+- How many installations is "a deployment" expected to carry before the per-repo role-cache and
+  reconcile-job design needs a scalability pass — is there a soft cap worth documenting?
+
+## Deployment note
+
+Deployers MAY put the asset hostname (artifacts/reports, see [assets.md](./assets.md)) behind
+Cloudflare Zero Trust themselves; that is out of band of cloud-ci auth and is not a cloud-ci
+auth mode (see [Non-goals](#non-goals)).
 
 ## Alternatives considered
 
@@ -479,7 +538,13 @@ core data model, not duplicated here.
   for months must be revocable without rotating a shared signing key for everyone, so it is
   opaque-and-hashed instead; job/ingest tokens keep the HMAC format because their lifetime (an
   hour or less) makes the revocation gap irrelevant.
-- **Model roles entirely through Cloudflare Access applications/policies (one Access app per
-  role).** Rejected: forces every operator/admin action through a Zero Trust re-auth prompt and
-  does not work at all in GitHub-OAuth-only deployments, which must stay fully usable without
-  Access configured.
+- **Cloudflare Access as a cloud-ci auth mode** (verify the Access JWT, map IdP groups to
+  roles). Rejected: a second human auth path to test and maintain, duplicating what GitHub
+  permissions already express, and off-brand for a tool whose roles are already "who can touch
+  this GitHub repo." See [ADR 0008](../adr/0008-auth-modes.md#alternatives-considered) for the
+  full rationale; deployers who still want an IdP gate can front a hostname with Access
+  themselves (see [Deployment note](#deployment-note)).
+- **One GitHub App per org instead of one App installed into many orgs.** Rejected: multiplies
+  the number of private keys, webhook secrets, and manifest registrations a deployer has to
+  manage for what [ADR 0003](../adr/0003-single-tenant-deployment.md) treats as a single deployment; the allowlist plus per-installation
+  tokens give the same isolation without the operational multiplication.

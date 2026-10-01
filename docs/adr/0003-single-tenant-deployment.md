@@ -11,14 +11,19 @@ put customer source code and secrets in our account.
 
 ## Decision
 
-Every deployment is one Worker plus its bindings in the deployer's own Cloudflare account,
-serving one GitHub App installation target (an org or user). Setup is `wrangler deploy` (or a
-Deploy-to-Cloudflare button) followed by a GitHub App manifest flow that creates the App
-owned by the deployer.
+Every deployment is one Worker plus its bindings in the deployer's own Cloudflare account. One
+deployment can serve **multiple GitHub orgs** (multiple GitHub App installations) belonging to
+one company; data is keyed by installation/org id + repo id, and the dashboard scopes access by
+the signed-in user's permission per repo. Setup is `wrangler deploy` (or a Deploy-to-Cloudflare
+button) followed by a GitHub App manifest flow that creates the App owned by the deployer, then
+installing that App on each org.
 
 ## Consequences
 
-- No tenant id in the data model; isolation is the Cloudflare account boundary.
+- No tenant id in the data model; isolation is the Cloudflare account boundary. Multiple orgs
+  under one deployment share that boundary — they are not isolated from each other the way
+  separate deployments are, only scoped by installation/org id + repo id in queries and by
+  per-repo permission in the dashboard.
 - Source code, logs, secrets, and AI prompts never leave the deployer's account.
 - Upgrades are the deployer's responsibility: D1 migrations must be forward-only and safe to
   run against a live deployment, and the proto contract must stay backward compatible with

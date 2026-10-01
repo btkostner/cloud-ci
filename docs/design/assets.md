@@ -38,9 +38,10 @@ expire, and get re-aliased.
 - The ingest API's request/response shapes (endpoints, idempotency keys, resumable upload
   protocol) — that contract belongs to [byo-ci](./byo-ci.md); this doc only fixes the R2 key
   layout and the multipart part size those endpoints target.
-- `.cloud-ci/pipeline.yml` schema for declaring artifacts/sites/cache — see
-  [pipeline-config](./pipeline-config.md); examples below are illustrative, not authoritative.
-- Access/OAuth session mechanics for the dashboard itself, GitHub OIDC/App auth — see
+- Pipeline script syntax for declaring artifacts/sites/cache via `ci.container`'s `artifacts`/
+  `reports`/`cache` options — see [dynamic-pipelines](./dynamic-pipelines.md); examples below are
+  illustrative, not authoritative.
+- OAuth session mechanics for the dashboard itself, GitHub App auth — see
   [auth](./auth.md). This doc only defines the asset-host grant/cookie that auth.md's capability
   token rides in.
 - Merge semantics for sharded blob reports (Playwright `blob`, Vitest blob) — see
@@ -56,23 +57,23 @@ cloud-ci upload --report junit=./test-results/junit.xml
 cloud-ci upload --artifact build-output=./dist.tar.zst
 ```
 
-Illustrative pipeline fragment (authoritative schema: [pipeline-config](./pipeline-config.md)):
+Illustrative pipeline script fragment (authoritative schema: [dynamic-pipelines](./dynamic-pipelines.md)):
 
-```yaml
-jobs:
-  e2e:
-    runner: standard-2
-    steps:
-      - run: npx playwright test
-    artifacts:
-      - site: playwright-html
-        path: playwright-report/
-      - report: junit
-        path: test-results/junit.xml
-    cache:
-      - key: npm-${{ checksum("package-lock.json") }}
-        restore-keys: [npm-]
-        paths: [node_modules]
+```ts
+// .cloud-ci/pipelines/ci.ts, inside a workflow's run(ci)
+await ci.container("e2e", {
+  runner: "standard-2",
+  steps: [{ name: "e2e", run: "npx playwright test" }],
+  artifacts: [{ site: "playwright-html", path: "playwright-report/" }],
+  reports: [{ report: "junit", path: "test-results/junit.xml" }],
+  cache: [
+    {
+      key: `npm-${ci.checksum("package-lock.json")}`,
+      restoreKeys: ["npm-"],
+      paths: ["node_modules"],
+    },
+  ],
+});
 ```
 
 Resulting URLs (dedicated asset zone, not the dashboard's zone):
@@ -311,6 +312,12 @@ plan tier without a plan-aware branch in the client.
   the Worker verifies it, mints a session token (`exp` ≤ 1h, same claim shape) into a cookie, and
   redirects to the same path with the query stripped. Subsequent requests on that host use only
   the cookie.
+- **Optional deployer-added Zero Trust.** The capability-token auth above is cloud-ci's own and
+  is independent of this: a deployer MAY additionally put the `*.assets.example.com` /
+  `assets.example.com` hostname behind Cloudflare Zero Trust (Access) themselves, as an
+  extra network-layer gate in front of the Worker. That policy is out of band of cloud-ci —
+  the deployer configures and owns it like any other zone-level Access policy ([auth](./auth.md)
+  does not manage it) — and cloud-ci's capability-token checks still run underneath it.
 - **Cookie scoping, per hosting flavor:**
   - Per-site subdomain: cookie is `__Host-cc_asset` (`Secure`, `HttpOnly`, `SameSite=Lax`,
     `Path=/`), host-only (no `Domain` attribute). Because it is host-only, JS on
@@ -325,7 +332,7 @@ plan tier without a plan-aware branch in the client.
     `Path=/s/{artifact_id}/`, so one report's JS cannot read another concurrently-open report's
     session cookie on the same host.
 - **Dashboard session never crosses.** The dashboard's own session cookie is scoped to the
-  dashboard's host (or, in shared-Access-cookie deployments, to the dashboard's path); it is
+  dashboard's host; it is
   never set with a `Domain` attribute that would make it visible to `*.assets.example.com` or
   `assets.example.com`.
 - **Origin check on the shared-host flavor.** Per [auth](./auth.md)'s threat model: because the
@@ -378,7 +385,7 @@ see Design above for why that layout was kept. Instead:
   pointed at a deleted artifact in the same D1 transaction.
 - Reports that have already been parsed into D1/analytics rollups may get a shorter default
   (e.g. 7 days) for the raw file, since the structured data they fed into outlives them; this is a
-  per-`kind` default, not a hardcoded rule, so pipeline-config can override it.
+  per-`kind` default, not a hardcoded rule, so settings.yml can override it.
 
 ## Caching for jobs
 

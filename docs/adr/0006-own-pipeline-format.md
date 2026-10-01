@@ -1,6 +1,6 @@
 # 0006: Own pipeline format, not GitHub Actions syntax
 
-- Status: Proposed; would be superseded by [0009](./0009-typescript-pipeline-workflows.md) if that is accepted
+- Status: Superseded by [0009](./0009-typescript-pipeline-workflows.md)
 - Date: 2026-09-30
 
 ## Context
@@ -11,14 +11,17 @@ we cannot run faithfully in a container agent.
 
 ## Decision
 
-`.cloud-ci/pipeline.yml` is our own minimal format: jobs, `needs`, steps (shell), image,
-`runner`, `parallel`, caches, reports, artifacts. Users who need Actions keep running Actions
-and send results with `cloud-ci upload` (BYO CI). See [pipeline-config](../design/pipeline-config.md).
+`.cloud-ci/pipeline.yml` was our own minimal format: jobs, `needs`, steps (shell), image,
+`runner`, `parallel`, caches, reports, artifacts. Users who needed Actions kept running Actions
+and sent results with `cloud-ci upload` (BYO CI). Superseded: pipelines are now TypeScript
+scripts with no YAML format at all — see [0009](./0009-typescript-pipeline-workflows.md) and
+[dynamic-pipelines](../design/dynamic-pipelines.md).
 
 ## Consequences
 
-- Clear semantics we fully control, including first-class `parallel:` and `reports:`.
-- Migration is manual; the docs ship side-by-side translations of common Actions workflows.
+- This format never shipped; TypeScript pipeline scripts replaced it before any release.
+- Alternatives considered here (Actions YAML reuse) remain rejected for the same reason under
+  0009: we cannot run Actions' `uses:` ecosystem faithfully in a container agent.
 
 ## What would reverse this
 

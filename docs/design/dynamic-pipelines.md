@@ -1,21 +1,34 @@
 # Dynamic pipelines: CI as durable TypeScript workflows
 
-Status: Proposed
+Status: Proposed. [ADR 0009](../adr/0009-typescript-pipeline-workflows.md), which this design
+implements, is **Accepted**; this document's defaults and APIs are still proposals.
 
 > Every threshold, default, and API name here is a proposed starting point. Implementation is out
 > of scope until the Phase 0 spikes in [the roadmap](../roadmap.md) land.
 
 Related: [ADR 0009](../adr/0009-typescript-pipeline-workflows.md),
-[pipeline-config](./pipeline-config.md), [parallelization](./parallelization.md),
-[pr-comment](./pr-comment.md), [assets](./assets.md), [analytics](./analytics.md)
+[ADR 0010](../adr/0010-pluggable-executors.md), [settings](./settings.md),
+[parallelization](./parallelization.md), [pr-comment](./pr-comment.md), [assets](./assets.md),
+[analytics](./analytics.md), [auth](./auth.md)
 
 ## Summary
 
-A pipeline is a TypeScript **script** in `.cloud-ci/pipelines/<name>.ts`. It does not return a
-static plan. It runs for the whole CI run: it starts containers, reads their results, decides
-what to do next, and loops. The script can run `turbo run --dry=json` in a container, parse the
-edges, and run each task in its own container as soon as its dependencies finish. That logic
-lives in plain code using helpers from `@cloud-ci/pipeline`, not in a fixed engine feature.
+A pipeline is a TypeScript **script** in `.cloud-ci/pipelines/<name>.ts` — one file per pipeline
+(`ci.ts`, `deploy.ts`, `maintenance.ts`). Each file declares its own `on:` triggers and runs as
+its own Dynamic Workflow instance; several pipeline files can run for the same commit (e.g.
+`ci.ts` on `pull_request`, `deploy.ts` on `push` to `main`), independently of each other. There is
+no YAML pipeline format. The only static file is `.cloud-ci/settings.yml`
+([settings](./settings.md)): non-executable repo config — PR comment behavior, check naming and
+aggregation, concurrency policy, runner pool definitions, cache/retention preferences, and which
+secrets a pipeline may request. settings.yml cannot start a container or run code; it only narrows
+what pipeline scripts are allowed to do.
+
+A pipeline script does not return a static plan. It runs for the whole CI run: it starts
+containers, reads their results, decides what to do next, and loops. The script can run
+`turbo run --dry=json` in a container, parse the edges, and run each task in its own container as
+soon as its dependencies finish. That logic lives in plain code using helpers from
+`@cloud-ci/pipeline` and its integration modules (`@cloud-ci/pipeline/turbo`,
+`@cloud-ci/pipeline/mise`), not in a fixed engine feature.
 
 Scripts run as **Dynamic Workflows**: a Cloudflare Workflow whose code is loaded at runtime into a
 Dynamic Worker. Every side effect (starting a container, waiting for it, publishing a check) is a
@@ -27,16 +40,16 @@ completed steps return their recorded results instead of running again
 narrow API; the coordinator enforces policy (secrets, runner limits, concurrency) and records
 facts.
 
-The static `pipeline.yml` ([pipeline-config](./pipeline-config.md)) remains available. It is
-executed by a built-in script, so there is one execution engine, not two.
-
 ## Goals
 
+- One pipeline file per workflow, each with its own triggers; multiple pipelines can run against
+  the same commit without coordinating with each other.
 - Turborepo/mise graphs executed node by node across containers, written as ordinary code.
 - Full control over steps, sidecars, retries, conditional work, and fan-out from inside the
   script.
-- Per-check control over GitHub status reporting.
-- Crash-safe: a recycled isolate or a redeploy of `cloud-ci-worker` never re-runs finished work.
+- Checks created explicitly and named by the script, not implied by job names.
+- Crash-safe: a recycled isolate or a redeploy of `cloud-ci-worker` never re-runs finished work,
+  and never silently drops a completion that arrived mid-crash.
 
 ## Non-goals
 
@@ -51,19 +64,24 @@ executed by a built-in script, so there is one execution engine, not two.
 
 ```ts
 // .cloud-ci/pipelines/ci.ts
-import { workflow, turbo } from "@cloud-ci/pipeline";
+import { workflow } from "@cloud-ci/pipeline";
+import { turbo } from "@cloud-ci/pipeline/turbo";
 
 export default workflow({
   on: { pull_request: {}, push: { branches: ["main"] } },
   async run(ci) {
-    const setup = ci.setup({
-      image: "node:24",
-      run: ["corepack enable", "pnpm install --frozen-lockfile"],
-      snapshot: true, // reuse post-install state across this run's containers
+    const toolchain = ci.snapshot("toolchain", {
+      files: ["mise.toml", "mise.lock"],
+      run: "mise install",
+    });
+    const deps = ci.snapshot("deps", {
+      from: toolchain,
+      files: ["**/package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"],
+      run: "pnpm install --frozen-lockfile",
     });
 
     const graph = await turbo.plan(ci, {
-      setup,
+      snapshot: deps,
       tasks: ["build", "lint", "test", "typecheck"],
       affected: ci.event.kind === "pull_request",
     });
@@ -72,7 +90,7 @@ export default workflow({
     const test = ci.check("ci/test", { required: true });
 
     await turbo.execute(ci, graph, {
-      setup,
+      snapshot: deps,
       concurrency: 24,
       runner: (node) => (node.task === "build" ? "standard-2" : "auto"),
       check: (node) =>
@@ -94,7 +112,7 @@ export async function execute(ci, graph, opts) {
         if (deps.some((d) => !d.ok)) return ci.skip(id, "dependency failed");
         if (await ci.turboCache.has(graph.node(id).hash)) return ci.cached(id);
         return ci.container(id, {
-          setup: opts.setup,
+          snapshot: opts.snapshot,
           runner: opts.runner(graph.node(id)),
           run: `turbo run ${graph.node(id).task} --filter=${graph.node(id).package}`,
           check: opts.check(graph.node(id)),
@@ -113,7 +131,7 @@ Users who need something different copy or wrap it.
 
 ```ts
 await ci.container("e2e", {
-  setup,
+  snapshot: deps,
   runner: "standard-3",
   sidecars: {
     postgres: { image: "postgres:17", env: { POSTGRES_PASSWORD: "ci" }, ready: "tcp:5432" },
@@ -133,6 +151,43 @@ if (ci.changedFiles.some((f) => f.startsWith("infra/"))) {
   await ci.container("tf-check", { run: "terraform show plan.bin", check: false });
 }
 ```
+
+### Splitting tests across shards
+
+Sharding is a library helper, not a core primitive — it reuses the same deterministic split
+algorithm as `cloud-ci split` ([parallelization](./parallelization.md)):
+
+```ts
+const shards = await ci.shard("test", {
+  snapshot: deps,
+  files: "tests/**/*.spec.ts",
+  count: "auto",
+  run: (index, total) => `npx playwright test --shard=${index}/${total} --reporter=blob`,
+  reports: [{ type: "playwright-blob", merge: "html" }],
+  check: test,
+});
+```
+
+`ci.shard` resolves a shard count and per-shard file/test assignment (timing-aware or round-robin,
+same algorithm and same `test_timings` data as `cloud-ci split`), starts one `ci.container` per
+shard, and runs the generated merge step once every shard reaches a terminal state. See
+[parallelization](./parallelization.md) for split strategies, the merge barrier, and OOM-retry
+semantics — `ci.shard` is the dynamic-pipelines entry point into that same design, not a separate
+one.
+
+### Runner selection
+
+Any node (`ci.container`, `turbo.execute`'s `runner`, `ci.shard`) accepts either a named size on
+the default executor (`"standard-2"`, `"auto"`) or an explicit executor:
+
+```ts
+runner: { executor: "aws-ec2", type: "c7i.4xlarge" }
+```
+
+or a named runner pool defined in [settings.yml](./settings.md) by an admin. Executors besides
+Cloudflare Containers, their capabilities, and the pull/callback agent model are
+[ADR 0010](../adr/0010-pluggable-executors.md); the script-facing surface is just the `runner`
+field above.
 
 ## Design
 
@@ -180,7 +235,8 @@ happened. The coordinator therefore treats `(run_id, node_id)` as an idempotency
 | --- | --- |
 | `startNode` retried after the container already started | Returns the existing node; never starts a second container |
 | `startNode` with the same id but a different spec hash | Rejected as nondeterministic; run fails |
-| Completion event delivered twice | Workflows' `waitForEvent` consumes the first; the coordinator re-sends until the node is acknowledged, and the duplicate is harmless |
+| Completion event delivered twice | The coordinator tracks delivery per `(run_id, node_id)` and keeps re-sending until the script acknowledges it — `ack` is recorded on the node by the next step after `waitForEvent`; `waitForEvent` itself only ever surfaces the first delivery to the script, so a duplicate send is harmless |
+| Isolate crashes after consuming the completion event but before the next step persists it | The event is un-acked until that next step runs, so the coordinator has no record of an ack and re-sends the completion on its next attempt instead of treating the node as done; the script's `ack` is what closes the gap |
 | Event arrives before the script waits for it | Supported by the protocol `[unverified: Workflows buffering of events sent before waitForEvent]`; if not, the coordinator re-sends on a timer until acknowledged |
 | Run cancelled | Coordinator stops containers, marks nodes `cancelled`, and terminates the Workflow instance; late completion events for cancelled nodes are dropped |
 | `waitForEvent` timeout (default: node timeout + 10 min) | Script sees a failed node with `timed out`; coordinator stops the container |
@@ -205,7 +261,8 @@ The script decides *what* to run. `RunCoordinator` still:
 
 - owns run/node state and is its only writer (D1 projection, Check Runs, PR comment notify);
 - enforces policy the script cannot override: secret grants (none for fork PRs), runner min/max
-  per repo, max concurrent containers, max nodes per run;
+  per repo, the repo-wide concurrent-container cap from [settings.yml](./settings.md) (a script's
+  own `ci.limit`/`concurrencyGroup` can only narrow further, never raise it), max nodes per run;
 - starts and stops containers, mints per-node tokens, and receives agent uploads.
 
 Without this split, a PR could edit its own script to request a production secret or 500
@@ -218,9 +275,15 @@ Without this split, a PR could edit its own script to request a production secre
 | `turbo.plan(ci, opts)` | Runs `turbo run <tasks> --dry=json` in a container; returns a graph of `taskId`, `package`, `task`, `hash`, `outputs`, `dependencies` (fields per turborepo.dev/docs/reference/run, checked 2026-10-01) |
 | `turbo.execute(ci, graph, opts)` | Dependency-ordered fan-out with cache-hit skipping and bounded concurrency (above) |
 | `mise.plan(ci, opts)` | Same for mise tasks `[unverified: mise's machine-readable graph command and format]` |
-| `graph.fromJson(json)` | Any tool's output in our graph JSON |
-| `ci.limit(n, thunks)` | Concurrency limiter that is replay-safe (ordering is by call, not completion) |
+| `graph.fromJson(json)` | Lifts any tool's own graph output (Nx, Bazel, Pants, a custom script that prints JSON) into cloud-ci's generic graph shape, so `ci.limit` and dependency-ordered fan-out work the same way as for turbo/mise. This is the escape hatch for tools without a built-in integration module |
+| `ci.shard(id, opts)` | Deterministic test splitting, per-shard containers, and merge barrier, reusing the `cloud-ci split` algorithm ([parallelization](./parallelization.md)) |
+| `ci.limit(n, thunks)` | Concurrency limiter that is replay-safe (ordering is by call, not completion); the per-call half of concurrency control — repo-wide caps come from settings.yml (see Limits below) |
 | `ci.group(ids, spec)` | Run several nodes in one container to save startup cost |
+
+`turbo` and `mise` are separate entry points (`@cloud-ci/pipeline/turbo`,
+`@cloud-ci/pipeline/mise`), not exports of the core package. A script that only needs
+`graph.fromJson` and the generic `ci` API imports just `@cloud-ci/pipeline` and does not bundle
+turbo- or mise-specific code.
 
 Upstream outputs move through cloud-ci's Turborepo remote cache. Each node runs
 `turbo run <task> --filter=<pkg>` without `--only`, so turbo restores upstream outputs from the
@@ -239,25 +302,51 @@ processes inside the job's container: the agent starts them from their images' e
 `ready`, and tears them down after the steps. A sidecar that needs its own container is an open
 question.
 
-### Setup reuse
+### Layered snapshots
 
-`ci.setup({ snapshot: true })` runs setup once, snapshots the container, and starts later nodes
-from it. Snapshots are limited to 20 GB and kept 30 days
-(developers.cloudflare.com/containers/platform/limits, checked 2026-09-30). Whether one
-container can start from a snapshot another took is a Phase 0 spike. The fallback is a
-lockfile-keyed package-store cache ([assets](./assets.md)).
+Snapshots are layered, like Docker layers, so a source-only change doesn't invalidate the
+toolchain or dependency install:
+
+```ts
+const toolchain = ci.snapshot("toolchain", {
+  files: ["mise.toml", "mise.lock"],
+  run: "mise install",
+});
+const deps = ci.snapshot("deps", {
+  from: toolchain,
+  files: ["**/package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"],
+  run: "pnpm install --frozen-lockfile",
+});
+```
+
+Each layer is keyed by a hash of `(parent key, copied files, commands)`. A node sets
+`snapshot: deps` (the property is named `snapshot`; its value is a snapshot task, not a boolean)
+to start from that layer's filesystem. Layers are long-lived across runs — reused whenever their
+key is unchanged, not rebuilt per run — so a source-only commit reuses both the `toolchain` and
+`deps` layers and only pays for copying source into the per-task containers. Layers are limited
+to 20 GB and kept 30 days (developers.cloudflare.com/containers/platform/limits, checked
+2026-09-30). Whether one container can start from a snapshot another took, and cross-container
+restore speed versus a cold install, are Phase 0 spikes; the fallback is a lockfile-keyed
+package-store cache ([assets](./assets.md)).
 
 ### GitHub status checks
 
-Checks are created by the script with stable names, not derived from node names:
+Checks are opt-in: nothing is created unless the script asks for it, and names are chosen by the
+script, not derived from node or task names.
 
-- `ci.check(name, { required })` creates the check run immediately (`queued`), so branch protection
-  sees it before any work starts. Nodes attach to it; its conclusion is the worst of its attached
-  nodes, with cached counting as success. A check with no attached nodes when the script ends
-  concludes `success` with "no matching tasks", or `failure` if the script itself failed.
-- Nodes with `check: null` report no check run; they still appear in the PR comment and
-  dashboard.
-- The aggregate `cloud-ci` check is always reported and always safe to require.
+- `ci.check(name, { required })` creates the check run immediately (`queued`), so branch
+  protection sees it before any work starts. Nodes attach to it via `check: build` on
+  `ci.container`; its conclusion is the worst of its attached nodes, with cached counting as
+  success. A check with no attached nodes when the script ends concludes `success` with "no
+  matching tasks", or `failure` if the script itself failed.
+- Nodes with `check: null` (or omitted) report no check run; they still appear in the PR comment
+  and dashboard — this is how a noisy check stays hidden without losing visibility elsewhere.
+- One aggregate check, default name `cloud-ci`, rolls every check a pipeline creates up into a
+  single status. Its name is configurable, and it can be disabled entirely, per repo, in
+  [settings.yml](./settings.md); when enabled it's the recommended branch-protection target
+  instead of naming individual pipeline checks.
+- Check name templates (e.g. `"{pipeline} / {check}"`) are configurable in settings.yml so names
+  stay stable across pipeline-file renames.
 
 Naming a required check after a discovered task is unsafe: if the task leaves the graph, GitHub
 waits forever for it. `required` only drives documentation and dashboard warnings; GitHub branch
@@ -270,7 +359,7 @@ protection does the enforcing.
 | Nodes per run | 2,000 | Coordinator state and UI |
 | Workflow steps per run | Under the Workflows default of 10,000, configurable to 25,000 (developers.cloudflare.com/workflows/build/workers-api, checked 2026-10-01) | Each node costs about 2 steps |
 | Script bundle | 1 MiB | Loaded on every replay |
-| Concurrent containers | Repo policy, default 32 | Account-level container limits |
+| Concurrent containers | Repo policy in [settings.yml](./settings.md), default 32; a script's own `ci.limit`/`concurrencyGroup` can only lower this per call, never raise it | Account-level container limits |
 
 ## Data model
 
@@ -282,6 +371,11 @@ protection does the enforcing.
 | D1 `node_history` | `(repo_id, node_id)` | p50/p95 duration, cache hit rate; feeds `runner: "auto"` and grouping |
 | R2 `cloud-ci-assets` | `runs/{run_id}/script.js` | Bundled script as executed, for replay and audit |
 | R2 `cloud-ci-cache` | `turbo/{repo_id}/{hash}` | turbo cache artifacts |
+
+A commit that triggers two pipeline files (e.g. `ci.ts` on `pull_request` and `deploy.ts` on
+`push`) creates two independent `run_id`s with the same `sha` but different `script_path`; they
+are not coordinated with each other beyond sharing the PR comment's run list
+([pr-comment](./pr-comment.md)).
 
 ## Reruns
 
@@ -295,11 +389,15 @@ protection does the enforcing.
 
 - Scripts come from the PR head, including forks. They run in a host-loaded Dynamic Worker with
   egress blocked and no bindings except the `ci` API. The Phase 0 spike must confirm this
-  isolation. If it cannot, script support stays disabled and only `pipeline.yml` runs.
+  isolation; if it cannot, this design does not ship (see
+  [ADR 0009](../adr/0009-typescript-pipeline-workflows.md)).
 - Workflow instance metadata is readable by the Dynamic Worker, so it carries only ids, never
   tokens (per the caution in the Dynamic Workflows docs above).
 - Secrets are requested by name in `ci.container({ secrets })` and granted by the coordinator
-  per admin policy; fork PRs get none unless an admin approves the run.
+  per admin policy, narrowed per pipeline by [settings.yml](./settings.md); fork PRs get none
+  unless an admin approves the run.
+- Credentials for non-default executors (AWS keys, kubeconfig) live in Secrets Store and are
+  never passed to scripts or jobs — see [ADR 0010](../adr/0010-pluggable-executors.md).
 - Container commands come from repo code, as in any CI; the isolation boundary for them is the
   container, not the script sandbox.
 
@@ -331,3 +429,4 @@ protection does the enforcing.
 | Script runs inside a long-lived "orchestrator" container | Pays a container for the whole run; a crash loses orchestration state without hand-written checkpointing |
 | Our own replay journal in `RunCoordinator` instead of Workflows | Re-implements durable execution that Workflows already provides |
 | Starlark or Lua scripts | Neither runs in Dynamic Workflows; we would host and sandbox an interpreter ourselves |
+| Built-in `parallel:`/sharding engine feature (previous draft) | Same reasoning as every other engine feature: `ci.shard` keeps split strategy, runner choice, and merge logic in script code and reuses the `cloud-ci split` algorithm, rather than adding a second, YAML-only sharding config |

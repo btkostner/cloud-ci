@@ -4,7 +4,7 @@ Status: Proposed
 
 > The default model, token budgets, pricing, and GitHub API limits below are dated research notes and proposed defaults, not architecture invariants; re-check them at implementation time.
 
-Related: [../architecture.md](../architecture.md), [./pr-comment.md](./pr-comment.md), [./analytics.md](./analytics.md), [./auth.md](./auth.md), [./pipeline-config.md](./pipeline-config.md), [./parallelization.md](./parallelization.md), [./byo-ci.md](./byo-ci.md), [./assets.md](./assets.md)
+Related: [../architecture.md](../architecture.md), [./pr-comment.md](./pr-comment.md), [./analytics.md](./analytics.md), [./auth.md](./auth.md), [./settings.md](./settings.md), [./parallelization.md](./parallelization.md), [./byo-ci.md](./byo-ci.md), [./assets.md](./assets.md)
 
 ## Summary
 
@@ -12,7 +12,7 @@ cloud-ci uses Workers AI, through the `AI` binding in `cloud-ci-worker`, for fou
 
 1. **Failure summaries.** A short explanation of why a job or shard failed. It is built from the failing test output, the tail of the failing step's log, and the PR diff, and it is rendered in the PR comment and the dashboard.
 2. **Flaky root-cause hints.** A classification plus explanation for tests that [./analytics.md](./analytics.md) has already marked flaky.
-3. **Performance suggestions.** Deterministic rules over analytics rollups detect each issue. The model only explains and prioritizes the findings and proposes `.cloud-ci/pipeline.yml` edits.
+3. **Performance suggestions.** Deterministic rules over analytics rollups detect each issue. The model only explains and prioritizes the findings and proposes script edits (`ci.container`/`ci.shard` option changes).
 4. **Autofix (optional).** A proposed patch, published as a suggested-changes review or as a separate fix PR. It is opt-in per repo, it requires a human trigger from someone with write permission, it never touches protected branches, and it never pushes to the PR branch unless the repo explicitly opts in.
 
 All inference runs in the deployer's own Cloudflare account, through an optional AI Gateway in that same account. No third-party model provider is involved. The model is configurable. The default is `@cf/openai/gpt-oss-120b`.
@@ -37,7 +37,7 @@ All inference runs in the deployer's own Cloudflare account, through an optional
 
 ### Enabling
 
-AI is off by default for every repo. An admin (see [./auth.md](./auth.md): GitHub admin/maintain, or the mapped Access group) enables it in the dashboard under repo Settings > AI. The settings are stored in D1 (`repo_ai_settings`). The repo's `.cloud-ci/pipeline.yml` can only narrow what the admin enabled, never widen it. Without this rule, a PR from any contributor could switch on autofix or push mode by editing a YAML file.
+AI is off by default for every repo. An admin (see [./auth.md](./auth.md): GitHub admin/maintain) enables it in the dashboard under repo Settings > AI. The settings are stored in D1 (`repo_ai_settings`). The repo's `.cloud-ci/settings.yml` can only narrow what the admin enabled, never widen it. Without this rule, a PR from any contributor could switch on autofix or push mode by editing a settings file.
 
 | Setting (D1, admin only) | Values | Default |
 | --- | --- | --- |
@@ -51,7 +51,7 @@ AI is off by default for every repo. An admin (see [./auth.md](./auth.md): GitHu
 | `daily_neuron_cap` | integer | `20000` |
 | `model_summary` / `model_flaky` / `model_perf` / `model_autofix` | Workers AI model id | see Model selection |
 
-Repo-level narrowing in `.cloud-ci/pipeline.yml`, read from the run's commit (schema in [./pipeline-config.md](./pipeline-config.md)):
+Repo-level narrowing in `.cloud-ci/settings.yml`, read from the base branch for fork PRs (schema in [./settings.md](./settings.md)):
 
 ```yaml
 ai:
@@ -92,6 +92,8 @@ These are `issue_comment` commands, parsed by the worker. The permission is deri
 | `/cloud-ci autofix push` | Push to the PR branch; works only if `autofix_allow_push_to_pr_branch` | operator (write) |
 
 The dashboard exposes the same actions as buttons on a failed job, gated the same way.
+
+The PR comment's task-list checkboxes ([./pr-comment.md](./pr-comment.md)) offer the same actions without typing a command: checking `- [ ] Autofix` triggers autofix in the repo's configured mode, detected via the `issue_comment.edited` webhook with the same permission check, and the checkbox is reset once handled.
 
 ## Design
 
@@ -191,14 +193,14 @@ The weekly cron runs a deterministic rule set over the D1 rollups from [./analyt
 | Critical-path step | `lint` sits on the critical path for 31% of the wall time, with no `needs` dependents |
 | Queue time | p95 queue time 94s at concurrency limit 4; 38% of runs waited |
 
-The model receives only the findings (budget of 6,000 tokens) and the current `.cloud-ci/pipeline.yml` (budget of 4,000 tokens). It ranks them, explains them, and proposes YAML edits. Every number in the model's output must appear verbatim in the findings. Any sentence that contains a number not in the input is removed. This keeps invented metrics out of the output. The suggestions show up in the dashboard's Insights tab. When a PR modifies `.cloud-ci/pipeline.yml`, they are also listed in that PR's comment.
+The model receives only the findings (budget of 6,000 tokens) and the current pipeline script source (the specific `.ts` file under `.cloud-ci/pipelines/`, budget of 4,000 tokens). It ranks them, explains them, and proposes script edits (`ci.container`/`ci.shard` option changes). Every number in the model's output must appear verbatim in the findings. Any sentence that contains a number not in the input is removed. This keeps invented metrics out of the output. The suggestions show up in the dashboard's Insights tab. When a PR modifies a pipeline script under `.cloud-ci/pipelines/`, they are also listed in that PR's comment.
 
 ### Autofix
 
 Autofix requires all of the following:
 
-1. Repo `autofix != off` (admin, D1), and not lowered to `off` by `pipeline.yml`.
-2. A human trigger: a `/cloud-ci autofix` comment or a dashboard button press from a user whose GitHub permission is write or higher. This also covers a user mapped to operator via Access ([./auth.md](./auth.md)), but only when their GitHub login is linked, so the request can be attributed. Autofix is never triggered automatically in v1.
+1. Repo `autofix != off` (admin, D1), and not lowered to `off` by `settings.yml`.
+2. A human trigger: a `/cloud-ci autofix` comment, the PR comment's `- [ ] Autofix` checkbox ([./pr-comment.md](./pr-comment.md)), or a dashboard button press, from a user whose GitHub permission is write or higher ([./auth.md](./auth.md)). Autofix is never triggered automatically in v1.
 3. A failure summary with `confidence != low` exists for the run.
 4. The repo's daily neuron cap has room.
 5. Loop guard: the PR head commit does not carry the trailer `Cloud-CI-Autofix:`, and no autofix with the same failure fingerprint exists for this PR.
@@ -359,11 +361,11 @@ The "Inputs" link in the PR comment points to a dashboard view of `prompt.json`.
 | Untrusted content impersonates instructions | Untrusted inputs are wrapped in delimiters carrying a per-call random nonce (`<untrusted id="k9f2...">`). The system prompt states that delimited content is data. This lowers success rates; it does not prevent injection. Everything else assumes injection succeeds. |
 | Injection steers autofix into a malicious patch | No AI action happens without a human trigger. Patches are path-restricted (no `.cloud-ci/**`, `.github/**`, lockfiles, or excluded paths). Size is capped. Patches are verified in an isolated container with only the job's existing secrets. Publication is always as a reviewable suggestion or PR, unless push opt-in is set. A human must merge. |
 | Fork PR author triggers spend | Commands require write permission. Summaries on fork PRs still count against the repo's cap. |
-| Secrets in logs reach the model | The log tail is taken from the already-masked log stream (the agent masks secret values; see [./pipeline-config.md](./pipeline-config.md)). A second redaction pass removes high-entropy tokens and known patterns (`ghp_`, `ghs_`, `AKIA`, PEM blocks, JWTs) before the prompt is assembled. |
+| Secrets in logs reach the model | The log tail is taken from the already-masked log stream (the agent masks secret values; see [./settings.md](./settings.md)). A second redaction pass removes high-entropy tokens and known patterns (`ghp_`, `ghs_`, `AKIA`, PEM blocks, JWTs) before the prompt is assembled. |
 
 **Tooling.** No model call is given tools or function calling in v1. The model cannot fetch URLs or read files beyond what the context builder chose.
 
-**Permission gates.** All settings that enable spending or writing are admin-only and live in D1. `pipeline.yml` can only narrow them. Every autofix request records `requested_by` and, for push mode, the head sha at trigger time.
+**Permission gates.** All settings that enable spending or writing are admin-only and live in D1. `settings.yml` can only narrow them. Every autofix request records `requested_by` and, for push mode, the head sha at trigger time.
 
 **Protected branches.** These are checked through the API before every write. The default branch is never written. Branch protection rulesets on the repo still apply to the App's token as defense in depth.
 
@@ -398,6 +400,6 @@ The "Inputs" link in the PR comment points to a dashboard view of `prompt.json`.
 | Let the model detect perf problems from raw analytics | Rejected. It produces plausible but invented numbers. Deterministic rules detect, the model explains, and the numeric-claim filter enforces this. |
 | Automatic autofix on every failure | Rejected. It costs spend on every red run, invites injection-driven commits, and creates noise. A human trigger is required. |
 | Agentic autofix loop (model plus tools in a container) | Deferred. Single-shot generation plus verification is predictable in cost and easier to audit. |
-| Autofix config in `pipeline.yml` only | Rejected. Any PR could enable it. D1 admin settings are the authority, and YAML can only narrow. |
+| Autofix config in `settings.yml` only | Rejected. Any PR could enable it. D1 admin settings are the authority, and settings.yml can only narrow. |
 | Rely on AI Gateway exact-match caching alone | Insufficient. Inputs differ slightly between shards. The D1 fingerprint cache plus a custom `cacheKey` dedupes semantically identical failures. |
 | Run open models in Cloudflare Containers | Rejected. The container instance types listed in [../architecture.md](../architecture.md) are CPU-only, and a 4 vCPU/12 GiB instance cannot serve a useful code model at acceptable latency. `[unverified: GPU availability in Containers]` |

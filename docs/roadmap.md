@@ -16,11 +16,11 @@ Every phase ends with something deployable.
 
 ## Phase 1 — Contract and BYO CI
 
-Packages: `cloud-ci-proto`, `cloud-ci-proto-rust`, `cloud-ci-core`, `cloud-ci-worker`,
-`cloud-ci-cli`.
+Packages: `cloud-ci-proto`, `cloud-ci-proto-rust`, `cloud-ci-core`, `cloud-ci-reports`,
+`cloud-ci-worker`, `cloud-ci-cli`.
 
-- Ingest RPCs, external runs, JUnit/Vitest/Playwright/lcov parsing.
-- GitHub App + Check Runs + single PR comment.
+- Ingest RPCs, external runs, JUnit/Vitest/Playwright/lcov parsing (`cloud-ci-reports`).
+- GitHub App + optional Check Runs + optional single PR comment.
 - Auth: GitHub Actions OIDC and API tokens; GitHub OAuth for humans.
 - Artifact upload and isolated HTML site hosting.
 
@@ -31,7 +31,9 @@ later feature consumes ([ADR 0007](./adr/0007-one-upload-path.md)).
 
 Packages: `cloud-ci-runner-image`, `cloud-ci-proto-typescript`, `cloud-ci-pipeline-sdk`.
 
-- `pipeline.yml` parsing, pipeline scripts as Dynamic Workflows, `turbo` helpers, named checks, `RepoState`/`RunCoordinator`, container execution, log streaming.
+- `.cloud-ci/settings.yml` parsing, `.cloud-ci/pipelines/*.ts` scripts as Dynamic Workflows,
+  `turbo` helpers, named checks created from scripts, `RepoState`/`RunCoordinator`, Containers
+  execution (default `Executor`), log streaming.
 - Caches, secrets, cancel-superseded.
 
 ## Phase 3 — Parallelization
@@ -49,8 +51,12 @@ Packages: `cloud-ci-web`.
 ## Phase 5 — AI
 
 - Failure summaries in the PR comment, performance suggestions, opt-in autofix.
-- Cloudflare Access auth mode.
 
-## Phase 6 — Distribution
+## Phase 6 — Executors beyond Containers
+
+- Additional `Executor` implementations per [ADR 0010](./adr/0010-pluggable-executors.md): AWS
+  EC2, AWS Lambda, Kubernetes Jobs, self-hosted machines. Named runner pools in admin settings.
+
+## Phase 7 — Distribution
 
 - Deploy-to-Cloudflare button, setup wizard, upgrade/migration story, public docs site.

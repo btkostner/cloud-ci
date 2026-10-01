@@ -6,17 +6,17 @@ build. Per-feature mechanics live in [`design/`](./design/), decisions and their
 
 ## What cloud-ci is
 
-A CI system you deploy into **your own Cloudflare account**. One deployment serves one GitHub
-organization (or user) across any number of repositories. It does three jobs:
+A CI system you deploy into **your own Cloudflare account**. One deployment can serve one or
+more GitHub organizations (multiple App installations belonging to one company) across any
+number of repositories ([ADR 0003](./adr/0003-single-tenant-deployment.md)). It does three jobs:
 
-1. **Runs CI** on Cloudflare Containers, driven by TypeScript scripts in `.cloud-ci/pipelines/` (durable
-   workflows that can run a Turborepo or mise graph node by node) or the static
-   `.cloud-ci/pipeline.yml` in each repo
-   (*managed runs*).
+1. **Runs CI** on Cloudflare Containers, driven by TypeScript pipeline scripts in
+   `.cloud-ci/pipelines/*.ts` (durable workflows that can run a Turborepo or mise graph node by
+   node) (*managed runs*).
 2. **Accepts CI results from anywhere else** — GitHub Actions, Buildkite, a laptop — through an
    ingest API and the `cloud-ci` CLI (*external runs*).
-3. **Turns both into one view**: a single PR comment, GitHub Check Runs, hosted HTML reports,
-   analytics, runner rightsizing, and AI-assisted failure analysis.
+3. **Turns both into one view**: an optional single PR comment, optional named GitHub Check
+   Runs, hosted HTML reports, analytics, runner rightsizing, and AI-assisted failure analysis.
 
 Managed and external runs share one data model. Everything downstream of ingestion (comment,
 analytics, AI, asset hosting) does not know or care which kind of run produced the data.
@@ -35,26 +35,25 @@ flowchart LR
       RC[RunCoordinator DO<br/>one per run]
       RS[RepoState DO<br/>one per repo]
       PR[PullRequestState DO<br/>one per PR]
-      C[Containers<br/>cloud-ci agent]
+      EX[Executor<br/>Containers default]
       D1[(D1<br/>metadata + rollups)]
       R2[(R2<br/>logs, artifacts, sites, caches)]
       AE[(Analytics Engine<br/>raw samples)]
       AI[Workers AI]
-      ACC[Access<br/>optional]
     end
 
     GH -->|webhook| W
     BYO -->|ingest RPC| W
-    U -->|dashboard / assets| ACC --> W
+    U -->|dashboard / assets, GitHub OAuth| W
     W --> Q --> W
     W --> RS --> RC
-    RC -->|start, instance size| C
-    C -->|cloud-ci agent: logs, reports, artifacts| W
+    RC -->|start, instance size| EX
+    EX -->|cloud-ci agent: logs, reports, artifacts| W
     W --> D1 & R2 & AE
     W --> AI
     RC -->|run events| PR
-    PR -->|sticky comment| GH
-    W -->|checks, autofix| GH
+    PR -->|sticky comment, optional| GH
+    W -->|checks, optional; autofix| GH
 ```
 
 ## Packages
@@ -67,16 +66,23 @@ None exist yet; [roadmap](./roadmap.md) says when each arrives.
 | `cloud-ci-proto` | protobuf | API contract source of truth: run/job/step/test/artifact model, ingest, query |
 | `cloud-ci-proto-rust` | Rust | Generated bindings, imported as `cloud_ci_proto` |
 | `cloud-ci-proto-typescript` | TypeScript | Generated bindings for the dashboard and pipeline SDK |
-| `cloud-ci-pipeline-sdk` | TypeScript | `@cloud-ci/pipeline`: typed `ci` API and Turborepo/mise helpers for pipeline scripts |
-| `cloud-ci-core` | Rust (no `worker` dep) | Report parsers, merging, splitter, rightsizer — shared by Worker and CLI, tested natively |
+| `cloud-ci-pipeline-sdk` | TypeScript | `@cloud-ci/pipeline`: typed `ci` API, `turbo`/`mise` helper modules for pipeline scripts |
+| `cloud-ci-core` | Rust (no `worker` dep) | Splitter, rightsizer, shared domain logic — used by Worker and CLI, tested natively |
+| `cloud-ci-reports` | Rust (no `worker` dep) | Third-party report parsing + merging: JUnit, Vitest, Playwright, lcov, cobertura, bench, timing — split out from `cloud-ci-core` since this surface is expected to grow; used by Worker and CLI ([ADR 0010](./adr/0010-pluggable-executors.md) context: D5) |
 | `cloud-ci-worker` | Rust → wasm32 | HTTP front door, webhooks, ingest, asset serving, queue consumers, Durable Objects, cron |
 | `cloud-ci-cli` | Rust (native) | `cloud-ci` binary: `upload`, `split`, `merge`, `login`, `agent` |
 | `cloud-ci-runner-image` | Dockerfile | Base container image that runs `cloud-ci agent` |
 | `cloud-ci-web` | Svelte | Dashboard, served as Worker static assets |
 
-The `agent` subcommand that executes jobs inside our containers uploads through **the same code
-path** as `cloud-ci upload` in someone else's CI. That is deliberate: if BYO-CI ingestion
-regresses, our own runs regress with it, so it cannot silently rot.
+The `agent` subcommand that executes jobs inside our containers (or any other
+[executor](#extension-boundary)) uploads through **the same code path** as `cloud-ci upload` in
+someone else's CI. That is deliberate: if BYO-CI ingestion regresses, our own runs regress with
+it, so it cannot silently rot.
+
+Repo configuration lives in `.cloud-ci/`: `pipelines/*.ts` (one file per pipeline, each with its
+own triggers — see [dynamic-pipelines](./design/dynamic-pipelines.md)) and a single static
+`settings.yml` (PR comment, check names, concurrency, runner bounds defaults, cache/retention,
+AI narrowing, secret requests, slash-command roles — see [settings](./design/settings.md)).
 
 ## Data model
 
@@ -87,7 +93,7 @@ regresses, our own runs regress with it, so it cannot silently rot.
 | Job | (run, job name) | D1 + DO |
 | Shard | (job, index, total) | D1 + DO |
 | Step | (job/shard, ordinal) | D1 |
-| Report | (job/shard, kind) — junit, vitest, playwright, lcov, cobertura, timing, bench | parsed into D1 tables; raw in R2 |
+| Report | (job/shard, kind) — junit, vitest, playwright, lcov, cobertura, timing, bench | parsed by `cloud-ci-reports`; D1 keeps per-report summaries, failed/flaky test rows, and rolling per-test aggregates (one row per (repo, test_id), updated in place) — never one row per test case per run; full per-run parsed results live in R2, compressed, keyed by run/report (see [analytics](./design/analytics.md)) |
 | Artifact / site | (run, name) | R2 under `runs/{run}/artifacts/{name}/…` |
 | Log | (job/shard, step) | R2, chunked |
 | Metric sample | (job/shard, timestamp) | Analytics Engine; rolled up into D1 by cron |
@@ -112,19 +118,20 @@ External runs skip `queued`; they go straight to `running` on first upload.
 
 1. GitHub `push`/`pull_request` webhook → Worker verifies signature, enqueues, returns 200
    immediately (GitHub's webhook timeout is short; all real work happens off the request).
-2. Queue consumer fetches `.cloud-ci/pipelines/*.ts` or `.cloud-ci/pipeline.yml` at the commit
-   sha, starts a Dynamic Workflow for each script (which then requests nodes from the run's
-   coordinator), creates the
-   run in D1, and hands it to the repo's `RepoState` DO, which applies concurrency rules
-   (cancel-superseded, per-repo limits).
+2. Queue consumer fetches every `.cloud-ci/pipelines/*.ts` whose `on:` trigger matches the event
+   at the commit sha, starts a Dynamic Workflow per matching script (which then requests nodes
+   from the run's coordinator), creates a run in D1 for each, and hands them to the repo's
+   `RepoState` DO, which applies concurrency rules (cancel-superseded, per-repo limits).
+   Multiple pipelines can run for the same commit.
 3. `RunCoordinator` DO for the run owns the job DAG. For each ready job it resolves the instance
-   size (fixed, or chosen by the rightsizer for `runner: auto`), computes shard assignments, mints
-   a short-lived job token, and starts a container.
-4. Inside the container, `cloud-ci agent` pulls its job spec, runs steps, streams logs, samples
-   cgroup CPU/memory, and uploads reports/artifacts through the ingest API.
+   size (fixed, or chosen by the rightsizer for `runner: auto`) and executor, computes shard
+   assignments, mints a short-lived job token, and starts the job via that `Executor`.
+4. The agent (`cloud-ci agent`, running wherever the executor booted it) pulls its job spec,
+   runs steps, streams logs, samples resource usage where available, and uploads
+   reports/artifacts through the public ingest API.
 5. On job completion the coordinator advances the DAG, runs merge barriers for shard groups,
-   updates Check Runs, and notifies the `PullRequestState` of every PR whose head is this sha,
-   which debounces and re-renders the sticky comment.
+   updates any Check Runs the script created, and notifies the `PullRequestState` of every PR
+   whose head is this sha, which debounces and re-renders the sticky comment (if enabled).
 6. On run completion: post-run queue → analytics write, AI analysis (if enabled), final comment.
 
 ### External run
@@ -155,21 +162,24 @@ Two traits keep vendor specifics out of core logic:
 
 | Trait | Implementations planned | Isolates |
 | --- | --- | --- |
-| `Forge` | GitHub | Webhook parsing, config fetch, checks, comments, permissions, autofix PRs |
-| `Executor` | Cloudflare Containers | Start/stop, instance size, liveness; lets local `cloud-ci agent` runs and tests use a fake |
+| `Forge` | GitHub | Webhook parsing, config fetch, checks, PR comments, permissions, autofix PRs |
+| `Executor` | Cloudflare Containers (default), AWS EC2, AWS Lambda, Kubernetes Jobs, self-hosted — see [ADR 0010](./adr/0010-pluggable-executors.md) | Booting a machine that runs `cloud-ci agent`; everything after boot (job spec, logs, uploads) goes over the public ingest API, so the coordinator never talks to executor-specific APIs beyond start/stop |
 
-GitLab/Gitea support would be a second `Forge`, not a change to the coordinator.
+GitLab/Gitea support would be a second `Forge`, not a change to the coordinator. A new backend
+(bare metal, another cloud) is a new `Executor` with a capability descriptor
+([ADR 0010](./adr/0010-pluggable-executors.md)), not a change to the agent, the ingest API, or
+anything downstream of it.
 
 ## Cross-cutting design docs
 
 | Doc | Covers |
 | --- | --- |
-| [pipeline-config](./design/pipeline-config.md) | `.cloud-ci/pipeline.yml` static format |
+| [settings](./design/settings.md) | `.cloud-ci/settings.yml` static repo config |
 | [dynamic-pipelines](./design/dynamic-pipelines.md) | TypeScript pipeline scripts as durable workflows, Turborepo/mise helpers, sidecars, named checks |
 | [pr-comment](./design/pr-comment.md) | Sticky PR comment, Check Runs, slash commands |
 | [byo-ci](./design/byo-ci.md) | Ingest API, `cloud-ci upload`, external runs |
 | [parallelization](./design/parallelization.md) | Sharding, test splitting, merging |
 | [analytics](./design/analytics.md) | Metrics, insights, rightsizing/autoscaling |
 | [ai](./design/ai.md) | Workers AI summaries, suggestions, autofix |
-| [auth](./design/auth.md) | Access / GitHub OAuth, roles, machine tokens, GitHub App |
+| [auth](./design/auth.md) | GitHub OAuth, roles, machine tokens, GitHub App |
 | [assets](./design/assets.md) | R2 artifact and HTML report hosting, caches |

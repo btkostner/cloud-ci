@@ -59,9 +59,9 @@ specifies what gets written to R2 and in what shape.
 
 ## User experience
 
-### When a pipeline config is and isn't involved
+### When a pipeline script is and isn't involved
 
-Managed runs are driven by `.cloud-ci/pipeline.yml` ([pipeline-config](./pipeline-config.md)).
+Managed runs are driven by a TypeScript pipeline script (`.cloud-ci/pipelines/*.ts`, see [dynamic-pipelines](./dynamic-pipelines.md)).
 External runs have no such file — the uploading CI system owns its own job definitions. An
 external run's job list is whatever sequence of `StartJob`/`CompleteJob` calls the uploader
 makes; there is no DAG, no `runner:` instance sizing, and no merge-barrier scheduling. (Native
@@ -71,7 +71,8 @@ report merging and framework blob merges still apply — see § Supported report
 ### `cloud-ci upload`
 
 ```
-cloud-ci upload [--job <name>] [--shard <i>/<n>]
+cloud-ci upload [--job <name>] [--shard <i>/<n>] [--scope <name>]
+                 [--check <name>]...
                  [--report <kind>:<path>]...
                  [--artifact <name>=<path>]...
                  [--site <name>=<dir>]...
@@ -87,6 +88,13 @@ cloud-ci upload finalize [--conclusion success|failure]
 spread across several (one per test command, say). Each invocation that is not a `finalize`
 opens the run if it doesn't exist yet (`BeginRun` is an upsert — see § Idempotency) and starts
 or reuses the named job.
+
+`--check <name>` (repeatable) attaches this job's result to one or more named Check Runs — the
+same named-check model managed pipelines use via `ci.check` ([dynamic-pipelines](./dynamic-pipelines.md)).
+An external run has no script to declare checks up front, so `StartJob` creates any check name it
+hasn't seen yet for this run the first time a job names it (§ Checks and scopes). `--scope <name>`
+tags the job's reports with a monorepo scope (package/app name) for grouping in the PR comment and
+full report ([pr-comment](./pr-comment.md)).
 
 Run-identity and auth flags are optional on GitHub Actions; the CLI auto-detects them from the
 environment (§ Run identity). On any other CI system they are required, or sourced from
@@ -174,10 +182,10 @@ service IngestService {
 | RPC | Key fields | Notes |
 | --- | --- | --- |
 | `BeginRun` | `repo`, `sha`, `run_key`, `attempt`, `trigger` (push/pull_request/manual), `external_url` | Upsert on `(repo_id, sha, run_key, attempt)`. Returns `run_id` + current state. |
-| `StartJob` | `run_id`, `job_name`, `shard` (`{index, total}` optional), `runner_label` (freeform, e.g. `ubuntu-latest`) | Returns `job_id`. Idempotent on `(run_id, job_name, shard)`. |
+| `StartJob` | `run_id`, `job_name`, `shard` (`{index, total}` optional), `runner_label` (freeform, e.g. `ubuntu-latest`), `check_names` (repeated, optional), `scope` (optional) | Returns `job_id`. Idempotent on `(run_id, job_name, shard)`. Unknown `check_names` are created on first use (§ Checks and scopes). |
 | `CreateUpload` | `job_id`, `kind` (report/artifact/site), `name`, `content_type`, `size_bytes`, `sha256` | Size ≤ 32 MiB → single-part, caller `PUT`s once. Larger → multipart; response includes `part_size_bytes` (fixed 32 MiB) and `part_count`. Dedupes on `(job_id, kind, name, sha256)` — see § Idempotency. |
 | `CompleteUpload` | `upload_id`, `parts: [{number, etag}]` | Calls R2's multipart complete; validates part count/sizes against what `CreateUpload` reserved. |
-| `SubmitReport` | `job_id`, `report_kind`, `name`, either `inline_data` (≤ 4 MiB) or `upload_id` | Parses the report into D1 (test cases, coverage lines, timings). Raw bytes are always kept in R2 regardless of path taken. |
+| `SubmitReport` | `job_id`, `report_kind`, `name`, either `inline_data` (≤ 4 MiB) or `upload_id` | Parses the report via `cloud-ci-reports` into D1 per-report summaries, failed/flaky test rows, and rolling per-test aggregates — never one row per test case (§ Supported report formats). Raw bytes are always kept in R2 regardless of path taken. |
 | `CompleteJob` | `job_id`, `conclusion`, `external_url` | Terminal for the job; triggers the same Check-Run-update and comment-debounce path as a managed job (§ How external runs feed...). |
 | `FinalizeRun` | `run_id`, `conclusion` (optional — inferred from job conclusions if omitted) | See § Finalize semantics. |
 | `GetRun` | `repo`, `sha`, `run_key`, `attempt` | Lets the CLI resume: look up `run_id` and which jobs/uploads already exist before re-sending anything. |
@@ -229,6 +237,24 @@ outlives it — GitHub-issued OIDC JWTs are themselves short-lived [unverified e
 documented as a fixed duration in GitHub's reference docs], so the exchange, not the original
 JWT, is what the rest of the run relies on.
 
+### Checks and scopes
+
+External jobs attach to the same named-check and report-scope model managed pipelines use:
+
+- **Checks.** `StartJob`'s optional `check_names` names the Check Run(s) this job's result rolls
+  into — the same model scripts use via `ci.check(name, opts)` ([dynamic-pipelines](./dynamic-pipelines.md)).
+  A script declares its checks before any work starts; an external run has no script, so the
+  Worker creates any check name it hasn't seen yet for this run on the first `StartJob` that
+  names it (`queued`, not required by default — the same semantics as a script-created check). A
+  job with no `check_names` reports no check run and only appears in the PR comment and
+  dashboard, exactly like a script node with `check: null`. The aggregate `cloud-ci` check still
+  rolls up every job regardless of `check_names`.
+- **Scopes.** `StartJob`'s optional `scope` tags the job's reports with a monorepo scope
+  (package/app name, matching the `scope` a script sets via turbo helpers) so the PR comment and
+  full report group test/coverage/report links by scope the same way for external and managed
+  runs ([pr-comment](./pr-comment.md)). Jobs with no `scope` fall into the default (unscoped)
+  group.
+
 ### Supported report formats
 
 | Kind | Format | Merge strategy |
@@ -243,11 +269,13 @@ JWT, is what the rest of the run relies on.
 | `PLAYWRIGHT_BLOB` | Playwright's `--reporter=blob` shard output | Framework merge: `npx playwright merge-reports --reporter=html <dir>` run by a generated merge job (verified command 2026-09-30, [Playwright: Sharding](https://playwright.dev/docs/test-sharding)) |
 | `VITEST_BLOB` | Vitest's `--reporter=blob` shard output | Framework merge: `vitest --merge-reports` over the directory of blob files (verified 2026-09-30, [Vitest: CLI](https://vitest.dev/guide/cli); blob file location changed across Vitest versions — pin the version in the generated merge job) |
 
-Native formats are parsed into D1 test-case/coverage-line rows by `cloud-ci-core`
-(`cloud-ci-worker` and `cloud-ci-cli` both depend on it, so parsing is identical on both
-paths). Blob formats are opaque to us; their merge step runs as an ordinary job (managed, or
-externally if the uploader already has a merge step) and its output is submitted the same way
-as any other report.
+Native formats are parsed by `cloud-ci-reports` (`cloud-ci-worker` and `cloud-ci-cli` both
+depend on it, so parsing is identical on both paths) into per-report summaries, failed/flaky
+test rows, and rolling per-test aggregates in D1 — never one row per test case per run; the full
+parsed result is stored as a compressed file in R2 keyed by run/report (retention:
+[assets](./assets.md)). Blob formats are opaque to us; their merge step runs as an ordinary job
+(managed, or externally if the uploader already has a merge step) and its output is submitted
+the same way as any other report.
 
 ### Upload mechanics and resumability
 
@@ -355,9 +383,9 @@ ingest-specific bookkeeping):
 | Table | Key columns | Notes |
 | --- | --- | --- |
 | `runs` | `id`, `repo_id`, `sha`, `run_key`, `attempt`, `kind` (`managed`\|`external`), `external_url`, `state`, `expect_jobs` | `UNIQUE(repo_id, sha, run_key, attempt)` backs the `BeginRun` upsert. |
-| `jobs` | `id`, `run_id`, `name`, `shard_index`, `shard_total`, `runner_label`, `state`, `external_url` | `UNIQUE(run_id, name, shard_index)`. |
+| `jobs` | `id`, `run_id`, `name`, `shard_index`, `shard_total`, `runner_label`, `check_names` (JSON array, references the shared `checks` table), `scope`, `state`, `external_url` | `UNIQUE(run_id, name, shard_index)`. |
 | `uploads` | `id`, `job_id`, `kind`, `name`, `sha256`, `size_bytes`, `state` (`pending`\|`complete`), `received_parts` (bitset/count), `r2_key` | `UNIQUE(job_id, kind, name, sha256)` backs upload dedupe; `received_parts` lets `CreateUpload` answer "which parts do you have" without R2 `ListParts`. |
-| `reports` | `id`, `job_id`, `kind`, `name`, `upload_id`, `created_at`, `is_canonical` | Newest row per `(job_id, kind, name)` flips `is_canonical`; parsed test-case/coverage rows reference the report row, not the raw upload. |
+| `reports` | `id`, `job_id`, `kind`, `name`, `upload_id`, `created_at`, `is_canonical` | Newest row per `(job_id, kind, name)` flips `is_canonical`; parsed summary and failed/flaky-test rows reference the report row, not the raw upload — the full per-run parsed result is a separate R2 object (§ Supported report formats). |
 
 R2 keys:
 
@@ -372,7 +400,7 @@ only specifies what `cloud-ci upload` writes, not how it's served.
 
 ## Security considerations
 
-- **Scope.** Ingest tokens (OIDC-exchanged or API-token-derived) carry `scope: ["ingest:write"]`
+- **Token scope.** Ingest tokens (OIDC-exchanged or API-token-derived) carry `scope: ["ingest:write"]`
   and a `repo_id` claim; the Worker rejects any call whose target `repo_id` doesn't match.
   Neither credential can read, cancel, or modify anything outside ingest for that one repo.
 - **Audience pinning.** The CLI requests a deployment-specific `aud` for its OIDC JWT rather
