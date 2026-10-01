@@ -309,6 +309,9 @@ job.
   host-orchestrated Dynamic Worker with egress blocked, no secrets, and no bindings except the
   read-only inputs we pass. The Phase 0 Dynamic Workers spike must confirm this isolation before
   managed runs depend on it.
+  If the spike cannot show that egress is blocked and no bindings or secrets leak through,
+  `pipeline.ts` support stays disabled. Managed runs then accept only `pipeline.yml`, or evaluate
+  programs in a discovery container that holds no secrets.
 - Secrets reach task containers only, under the rules already in
   [pipeline-config](./pipeline-config.md) (no secrets for fork PRs unless an admin approves).
 - The turbo cache is scoped per repo. A fork-PR run gets `cache:read` only, so it cannot poison
