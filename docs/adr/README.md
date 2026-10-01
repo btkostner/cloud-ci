@@ -13,7 +13,7 @@ deleted; a later ADR supersedes it and the old one's Status line says so.
 | [0006](./0006-own-pipeline-format.md) | Own pipeline format, not GitHub Actions syntax | Proposed (0009 would supersede) |
 | [0007](./0007-one-upload-path.md) | One upload path for managed and external runs | Proposed |
 | [0008](./0008-auth-modes.md) | Access or GitHub OAuth for humans; OIDC for machines | Proposed |
-| [0009](./0009-typescript-pipeline-programs.md) | TypeScript pipeline programs with discovered task graphs | Proposed |
+| [0009](./0009-typescript-pipeline-workflows.md) | Pipelines as durable TypeScript workflows | Proposed |
 
 ## Template
 

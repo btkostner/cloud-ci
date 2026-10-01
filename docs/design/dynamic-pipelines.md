@@ -1,351 +1,315 @@
-# Dynamic pipelines: programmable config and discovered task graphs
+# Dynamic pipelines: CI as durable TypeScript workflows
 
 Status: Proposed
 
 > Every threshold, default, and API name here is a proposed starting point. Implementation is out
 > of scope until the Phase 0 spikes in [the roadmap](../roadmap.md) land.
 
-Related: [ADR 0009](../adr/0009-typescript-pipeline-programs.md),
+Related: [ADR 0009](../adr/0009-typescript-pipeline-workflows.md),
 [pipeline-config](./pipeline-config.md), [parallelization](./parallelization.md),
 [pr-comment](./pr-comment.md), [assets](./assets.md), [analytics](./analytics.md)
 
 ## Summary
 
-Monorepos already describe their own task graph. Turborepo has `turbo.json`, mise has task
-`depends`, Nx has its project graph. Copying that graph into a hand-written CI file is
-redundant, and the copy goes stale. cloud-ci should read the repo's own graph and run each task
-(or a small group of tasks) in its own container. Nodes start as soon as their dependencies
-finish, and nodes whose result is already cached are skipped entirely.
+A pipeline is a TypeScript **script** in `.cloud-ci/pipelines/<name>.ts`. It does not return a
+static plan. It runs for the whole CI run: it starts containers, reads their results, decides
+what to do next, and loops. The script can run `turbo run --dry=json` in a container, parse the
+edges, and run each task in its own container as soon as its dependencies finish. That logic
+lives in plain code using helpers from `@cloud-ci/pipeline`, not in a fixed engine feature.
 
-That needs config that can compute things, not just declare them. Pipelines are therefore written
-as **TypeScript programs** (`.cloud-ci/pipeline.ts`). A program does not run tasks; it
-returns a **plan**, which is a task graph. Plans can be **expanded** at runtime by discovery steps
-that read Turborepo, mise, or any tool that prints our graph JSON. The existing YAML format
-stays as a static shorthand that compiles to the same plan.
+Scripts run as **Dynamic Workflows**: a Cloudflare Workflow whose code is loaded at runtime into a
+Dynamic Worker. Every side effect (starting a container, waiting for it, publishing a check) is a
+durable step. If the isolate is recycled mid-run, the script is re-executed from the top, and
+completed steps return their recorded results instead of running again
+(developers.cloudflare.com/dynamic-workers/usage/dynamic-workflows, checked 2026-10-01).
+
+`RunCoordinator` stays the single writer of run state. The script *requests* things through a
+narrow API; the coordinator enforces policy (secrets, runner limits, concurrency) and records
+facts.
+
+The static `pipeline.yml` ([pipeline-config](./pipeline-config.md)) remains available. It is
+executed by a built-in script, so there is one execution engine, not two.
 
 ## Goals
 
-- Run each node of a Turborepo or mise graph in its own container, scheduled by dependency, with
-  no hand-maintained copy of the graph.
-- Skip nodes whose output is already cached, without starting a container.
-- Let pipeline authors compute their plan with a real language: loops, conditionals, shared
-  helpers, reading changed files.
-- Per-task control over GitHub status checks: required, informational, or none.
-- Keep the plan deterministic and recorded, so a rerun or retry executes the same graph.
+- Turborepo/mise graphs executed node by node across containers, written as ordinary code.
+- Full control over steps, sidecars, retries, conditional work, and fan-out from inside the
+  script.
+- Per-check control over GitHub status reporting.
+- Crash-safe: a recycled isolate or a redeploy of `cloud-ci-worker` never re-runs finished work.
 
 ## Non-goals
 
-- Running arbitrary user code in `cloud-ci-worker`'s own isolate. `cloud-ci-worker` creates and
-  calls a Dynamic Worker sandbox (or uses a container) for pipeline programs. Whether that
-  sandbox isolates well enough is a Phase 0 spike, not an established fact.
-- Re-implementing Turborepo's hashing. We use turbo's own hashes and cache protocol.
-- A plugin system for third-party graph tools in v1. Turborepo and mise are built in; everything
-  else uses the generic graph-JSON adapter.
+- Running the script in `cloud-ci-worker`'s own isolate. It runs in a Dynamic Worker that the
+  host Worker loads; whether that sandbox isolates well enough is a Phase 0 spike.
+- Letting the script grant itself secrets or bypass admin policy.
+- Arbitrary npm imports in scripts in v1 (see [Open questions](#open-questions)).
 
 ## User experience
 
-### Turborepo repo, one container per task
+### Turborepo, one container per task
 
 ```ts
-// .cloud-ci/pipeline.ts
-import { pipeline, turbo } from "@cloud-ci/pipeline";
+// .cloud-ci/pipelines/ci.ts
+import { workflow, turbo } from "@cloud-ci/pipeline";
 
-export default pipeline({
+export default workflow({
   on: { pull_request: {}, push: { branches: ["main"] } },
-  setup: {
-    image: "node:24",
-    run: ["corepack enable", "pnpm install --frozen-lockfile"],
-  },
-  tasks: [
-    turbo({
+  async run(ci) {
+    const setup = ci.setup({
+      image: "node:24",
+      run: ["corepack enable", "pnpm install --frozen-lockfile"],
+      snapshot: true, // reuse post-install state across this run's containers
+    });
+
+    const graph = await turbo.plan(ci, {
+      setup,
       tasks: ["build", "lint", "test", "typecheck"],
-      affected: ({ event }) => event.kind === "pull_request",
+      affected: ci.event.kind === "pull_request",
+    });
+
+    const build = ci.check("ci/build", { required: true });
+    const test = ci.check("ci/test", { required: true });
+
+    await turbo.execute(ci, graph, {
+      setup,
+      concurrency: 24,
       runner: (node) => (node.task === "build" ? "standard-2" : "auto"),
-      group: "auto",
-    }),
+      check: (node) =>
+        node.task === "build" ? build : ["test", "typecheck"].includes(node.task) ? test : null,
+    });
+  },
+});
+```
+
+`turbo.execute` is ordinary library code, roughly:
+
+```ts
+export async function execute(ci, graph, opts) {
+  const done = new Map<string, Promise<NodeResult>>();
+  const runNode = (id: string): Promise<NodeResult> => {
+    if (!done.has(id)) {
+      done.set(id, (async () => {
+        const deps = await Promise.all(graph.deps(id).map(runNode));
+        if (deps.some((d) => !d.ok)) return ci.skip(id, "dependency failed");
+        if (await ci.turboCache.has(graph.node(id).hash)) return ci.cached(id);
+        return ci.container(id, {
+          setup: opts.setup,
+          runner: opts.runner(graph.node(id)),
+          run: `turbo run ${graph.node(id).task} --filter=${graph.node(id).package}`,
+          check: opts.check(graph.node(id)),
+        });
+      })());
+    }
+    return done.get(id)!;
+  };
+  await ci.limit(opts.concurrency, graph.ids().map((id) => () => runNode(id)));
+}
+```
+
+Users who need something different copy or wrap it.
+
+### Steps and sidecars
+
+```ts
+await ci.container("e2e", {
+  setup,
+  runner: "standard-3",
+  sidecars: {
+    postgres: { image: "postgres:17", env: { POSTGRES_PASSWORD: "ci" }, ready: "tcp:5432" },
+  },
+  steps: [
+    { name: "migrate", run: "pnpm db:migrate" },
+    { name: "playwright", run: "pnpm playwright test", reports: ["playwright-report/**"] },
   ],
-  checks: {
-    "ci/build": { tasks: "*#build", required: true },
-    "ci/test": { tasks: ["*#test", "*#typecheck"], required: true },
-    "ci/lint": { tasks: "*#lint" },
-  },
 });
 ```
 
-What happens on a PR:
-
-1. The program is evaluated. `turbo(...)` returns a placeholder **expansion node**.
-2. A discovery container checks out the sha, runs `setup`, and runs
-   `turbo run build lint test typecheck --affected --dry=json`.
-3. Discovery returns the graph (task ids, dependencies, hashes, outputs). The coordinator drops
-   nodes whose hash is already in the remote cache, groups the rest, and inserts them into the run.
-4. Each group runs in its own container. Upstream outputs arrive through turbo's remote cache
-   (served by cloud-ci, see below).
-5. The `ci/build`, `ci/test`, and `ci/lint` check runs report the aggregated result of the tasks
-   their selectors match.
-
-### Computing a plan by hand
+### Conditional and dynamic work
 
 ```ts
-import { pipeline, task } from "@cloud-ci/pipeline";
-
-export default pipeline({
-  tasks: async ({ changedFiles }) => {
-    const apps = ["web", "admin", "api"].filter((app) =>
-      changedFiles.some((f) => f.startsWith(`apps/${app}/`)),
-    );
-    return apps.map((app) =>
-      task(`deploy-preview:${app}`, {
-        run: `pnpm --filter ${app} deploy:preview`,
-        check: false, // no GitHub status for previews
-      }),
-    );
-  },
-});
-```
-
-### mise repo
-
-```ts
-import { pipeline, mise } from "@cloud-ci/pipeline";
-
-export default pipeline({
-  tasks: [mise({ tasks: ["check"], outputs: { "//packages/*:build": ["target/**"] } })],
-});
-```
-
-mise has no remote cache, so upstream outputs move as cloud-ci cache artifacts declared in
-`outputs` (see [Moving outputs between containers](#moving-outputs-between-containers)).
-
-### Static YAML still works
-
-`.cloud-ci/pipeline.yml` ([pipeline-config](./pipeline-config.md)) compiles to the same plan
-without a program. A repo has one of the two files; having both is a config error. YAML gains one
-key for discovery so simple turbo repos never need TypeScript:
-
-```yaml
-jobs:
-  ci:
-    turbo: { tasks: [build, lint, test], affected: true }
+if (ci.changedFiles.some((f) => f.startsWith("infra/"))) {
+  const plan = await ci.container("tf-plan", { run: "terraform plan -out plan.bin" });
+  await ci.container("tf-check", { run: "terraform show plan.bin", check: false });
+}
 ```
 
 ## Design
 
-### Plan, expansion, execution
+### Execution model
 
 ```mermaid
 sequenceDiagram
-    participant W as Worker
-    participant DW as Dynamic Worker (pipeline.ts)
+    participant W as cloud-ci-worker (host)
+    participant WF as Dynamic Workflow (ci.ts)
     participant RC as RunCoordinator
-    participant D as Discovery container
-    participant C as Task containers
-    participant R2 as R2 (turbo cache)
+    participant C as Containers
+    participant GH as GitHub
 
-    W->>DW: evaluate(event, changedFiles)
-    DW-->>W: Plan (static nodes + expansion nodes)
-    W->>RC: create run with Plan
-    RC->>D: run expansion: setup + turbo run --dry=json
-    D-->>RC: GraphFragment (nodes, deps, hashes)
-    RC->>R2: HEAD artifacts/{hash} for each node
-    RC->>RC: prune cached, group, insert nodes (append-only)
-    par ready nodes
-      RC->>C: start group (instance size per node)
-      C->>R2: restore upstream outputs via turbo remote cache
-      C->>R2: upload own outputs
-      C-->>RC: node results
+    W->>RC: create run (repo, sha, script ref)
+    W->>WF: create Workflow instance
+    WF->>RC: step.do("container:turbo-plan") -> startNode
+    RC->>C: start (policy-checked size, image, secrets)
+    C-->>RC: node finished
+    RC-->>WF: sendEvent("node:turbo-plan")
+    WF->>WF: step.waitForEvent -> graph JSON
+    loop each ready node
+      WF->>RC: step.do("container:web#build") -> startNode
+      RC-->>WF: sendEvent on completion
     end
-    RC->>W: check runs per selector, PR comment notify
+    RC->>GH: check runs, PR comment notify
 ```
 
-**Plan** is a protobuf message (`cloud_ci.v1.Plan`): nodes with id, command, image/setup,
-runner, dependencies, outputs, check settings, and optionally an `Expansion` (adapter + args +
-an optional mapping callback). It replaces the YAML-only `Pipeline` message as the contract
-`RunCoordinator` executes. `pipeline-config.md`'s YAML maps onto it field by field.
+Each `ci.container(id, spec)` call is two durable operations:
 
-**Expansion is append-only.** An expansion node resolves once into a `GraphFragment`. The
-coordinator validates it (no cycles, every dependency resolves to an existing or new node,
-node cap) and appends it. Existing nodes never change. This keeps the coordinator's rule that
-inputs record facts and the coordinator decides, and it means a retry of the run replays the
-recorded fragment instead of re-discovering a different graph.
+1. `step.do("start:" + id)` asks `RunCoordinator` to start the node. This returns quickly and is
+   idempotent on `id`.
+2. `step.waitForEvent("done:" + id)`. The coordinator sends the event when the node finishes.
 
-Fragments can contain further expansion nodes (for example, a `build` task whose output lists
-test files to shard), capped at a depth of 3 (proposed).
+Waiting in an event, rather than inside a long `step.do`, means a 40-minute test job does not hold
+a step open, and the isolate can be recycled while containers run.
 
-### Where pipeline programs run
+**Node ids are the replay key** and must be unique and stable within a run. The SDK rejects a
+duplicate id at the call site. Library helpers derive ids from turbo `taskId`s.
 
-| Option | Startup | Repo access | Sandbox | Verdict |
-| --- | --- | --- | --- | --- |
-| Dynamic Workers (Worker Loader binding) | Milliseconds | Only through APIs we pass in (changed files, file reads via GitHub API) | Cloudflare isolate, egress controllable | **Default** for evaluating `pipeline.ts` |
-| Discovery container | Container cold start + checkout + setup | Full checkout, can run `turbo`/`mise` | Container | **Required** for graph discovery |
-| Inside `cloud-ci-worker` | None | Same as Dynamic Worker | None; user code shares our secrets | Rejected |
+### Determinism
 
-Dynamic Workers have been in open beta since 2026-03-24 and execute code supplied at runtime in a
-sandboxed isolate, with outbound network access that the host Worker can block or intercept
-(developers.cloudflare.com/changelog/post/2026-03-24-dynamic-workers-open-beta and
-developers.cloudflare.com/dynamic-workers/usage/egress-control, checked 2026-10-01). Whether the
-Worker Loader binding is callable from workers-rs is `[unverified]`; if not, a small TypeScript
-module in `cloud-ci-worker` owns that one call, the same fallback ADR 0005 uses for containers.
+On replay the script re-executes from the top, and completed steps return recorded values. Code
+*between* steps must therefore make the same calls in the same order. Safe inputs are `ci.event`,
+`ci.changedFiles`, `ci.readFile()` (at the run's sha), and step results. `Date.now()`,
+`Math.random()`, and `fetch` (egress is blocked) are the hazards. The SDK lints for them, and the
+coordinator detects divergence: a replayed start for an id it has never seen, after a completed
+id was skipped, fails the run with `nondeterministic script`.
 
-The program is bundled (esbuild, in the Worker or ahead of time by `cloud-ci plan` locally) from
-`.cloud-ci/` only. Imports outside `.cloud-ci/` and npm imports other than `@cloud-ci/pipeline`
-are config errors in v1. Without that rule, evaluating the plan would require a package install.
+### Why the coordinator stays
 
-**Determinism.** Egress is blocked; the program receives everything it may depend on as input
-(`event`, `repo`, `sha`, `changedFiles`, `readFile(path)` backed by the GitHub contents API at
-the sha). The evaluated plan is stored in R2 with the run, and reruns use the stored plan.
-`Date.now()` and `Math.random()` are not removed but are documented as making plans
-non-reproducible.
+The script decides *what* to run. `RunCoordinator` still:
 
-**Limits (proposed).** 50 ms CPU and 128 MiB per evaluation; 2,000 nodes per run after
-expansion; plan message ≤ 4 MiB.
+- owns run/node state and is its only writer (D1 projection, Check Runs, PR comment notify);
+- enforces policy the script cannot override: secret grants (none for fork PRs), runner min/max
+  per repo, max concurrent containers, max nodes per run;
+- starts and stops containers, mints per-node tokens, and receives agent uploads.
 
-### Graph adapters
+Without this split, a PR could edit its own script to request a production secret or 500
+`standard-4` containers.
 
-| Adapter | Discovery command | Node identity | Cache-hit pruning | Output transfer |
-| --- | --- | --- | --- | --- |
-| `turbo` | `turbo run <tasks> [--affected] [--filter …] --dry=json` | `taskId` (`pkg#task`) | Yes: turbo `hash` vs cloud-ci's turbo cache | turbo remote cache |
-| `mise` | `mise tasks deps --json` or equivalent `[unverified: exact command and JSON shape]` | `//path:task` | Only if the task declares `sources`/`outputs` and we hash them `[unverified]` | cloud-ci cache artifacts from declared `outputs` |
-| `graph` (generic) | Any command printing `GraphFragment` JSON to stdout | Caller-defined | If the caller supplies `hash` | Declared `outputs` |
+### Graph helpers
 
-The `--dry=json` fields used are `taskId`, `task`, `package`, `hash`, `command`, `outputs`,
-`dependencies`, and `dependents`, as documented at turborepo.dev/docs/reference/run (checked
-2026-10-01). Each adapter also accepts a `map(node) => node | null` callback, evaluated in a
-second Dynamic Worker call with the discovered graph as input, to set `runner`, `check`,
-`group`, or drop nodes.
-
-### Turborepo remote cache served by cloud-ci
-
-`cloud-ci-worker` implements Turborepo's Remote Cache API (OpenAPI spec at
-turborepo.dev/docs/openapi, checked 2026-10-01), backed by the `cloud-ci-cache` R2 bucket under
-`turbo/{repo_id}/{hash}`. Task containers get `TURBO_API` pointed at the deployment and
-`TURBO_TOKEN` set to their job token. That gives us three things:
-
-1. **Pruning.** Before scheduling, the coordinator checks which node hashes already exist. Cached
-   nodes are marked `cached` and never start a container.
-2. **Output transfer.** A node runs `turbo run <task> --filter=<pkg>` *without* `--only`. turbo
-   resolves its upstream tasks, finds them in the remote cache (they finished earlier in this run
-   or a previous one), restores their outputs, and runs only this task. turbo's own `--only` flag
-   would skip the restore, so it is not used (turborepo.dev/docs/reference/run, `--only`,
-   checked 2026-10-01).
-3. **Local developer speedup** as a side effect: developers can point `TURBO_API` at the same
-   deployment with an API token scoped `cache:read`.
-
-If an upstream node's cache entry is missing when a dependent runs, turbo rebuilds it inside the
-dependent's container. The result is still correct but slower. The agent reads turbo's run
-summary, records an `unexpected_cache_miss` event, and [analytics](./analytics.md) surfaces it.
-The usual cause is an environment variable difference between containers.
-
-### Grouping: how many containers
-
-One container per node maximizes parallelism, but each container pays startup, checkout, and
-`setup` (dependency install) time. Grouping strategies:
-
-| `group` | Behavior |
+| Helper | Does |
 | --- | --- |
-| `node` | One container per node |
-| `package` | All selected tasks of one package in one container, run by turbo in its own order |
-| `auto` (default) | Per node, except nodes whose historical p50 duration is below the measured per-container overhead for this repo. Those are bin-packed together along dependency chains, so a group never waits on a node outside itself mid-run |
-| `{ by: (node) => string }` | Custom key from the program |
+| `turbo.plan(ci, opts)` | Runs `turbo run <tasks> --dry=json` in a container; returns a graph of `taskId`, `package`, `task`, `hash`, `outputs`, `dependencies` (fields per turborepo.dev/docs/reference/run, checked 2026-10-01) |
+| `turbo.execute(ci, graph, opts)` | Dependency-ordered fan-out with cache-hit skipping and bounded concurrency (above) |
+| `mise.plan(ci, opts)` | Same for mise tasks `[unverified: mise's machine-readable graph command and format]` |
+| `graph.fromJson(json)` | Any tool's output in our graph JSON |
+| `ci.limit(n, thunks)` | Concurrency limiter that is replay-safe (ordering is by call, not completion) |
+| `ci.group(ids, spec)` | Run several nodes in one container to save startup cost |
 
-Overhead is measured per repo from analytics (container start → setup done). Until history
-exists, `auto` behaves like `package`.
+Upstream outputs move through cloud-ci's Turborepo remote cache. Each node runs
+`turbo run <task> --filter=<pkg>` without `--only`, so turbo restores upstream outputs from the
+cache and runs just this task. `--only` would skip that restore (turborepo.dev/docs/reference/run,
+checked 2026-10-01). Serving turbo's Remote Cache API (turborepo.dev/docs/openapi) from R2 is its
+own compatibility project: auth, per-repo isolation, and read-only access for fork PRs so a PR
+cannot poison artifacts that `main` trusts. Until it exists, the helpers fall back to cloud-ci
+cache artifacts from declared `outputs`.
 
-**Setup reuse.** Paying `pnpm install` in 40 containers is the main cost of fan-out. Two
-mitigations, both proposed:
+### Sidecars
 
-- Restore the package-manager store from a cache keyed by lockfile hash (already in
-  [assets](./assets.md) caching).
-- Container snapshots taken after `setup`, keyed by `(image, setup hash, lockfile hash)`, and
-  restored for every node of the run. Snapshots are limited to 20 GB and retained 30 days
-  (developers.cloudflare.com/containers/platform/limits, checked 2026-09-30). Whether a
-  coordinator can start a container from a snapshot taken by another container is
-  `[unverified]` and is a Phase 0 spike.
+Cloudflare Containers run one container per Durable Object instance. Whether two containers can
+reach each other over a private network is `[unverified]`. v1 therefore runs sidecars as extra
+processes inside the job's container: the agent starts them from their images' entrypoints
+(image layers pulled into the job image at build time, or a multi-image runner image), waits for
+`ready`, and tears them down after the steps. A sidecar that needs its own container is an open
+question.
+
+### Setup reuse
+
+`ci.setup({ snapshot: true })` runs setup once, snapshots the container, and starts later nodes
+from it. Snapshots are limited to 20 GB and kept 30 days
+(developers.cloudflare.com/containers/platform/limits, checked 2026-09-30). Whether one
+container can start from a snapshot another took is a Phase 0 spike. The fallback is a
+lockfile-keyed package-store cache ([assets](./assets.md)).
 
 ### GitHub status checks
 
-Check runs are opt-in per node and per selector, because discovered graphs can have hundreds of
-nodes and GitHub branch protection matches required checks **by name**:
+Checks are created by the script with stable names, not derived from node names:
 
-- A required check named after a discovered task becomes a trap. If the task disappears from
-  the graph (renamed, or not affected by this PR), the check is never reported and the PR blocks
-  forever. If a different task takes the name, it passes vacuously.
-- **Selector checks** fix this. A `checks` entry has a stable name and a task selector (glob over
-  node ids). It is always reported for every run, even when it matches nothing, in which case it
-  is `success` with summary "no matching tasks". Its conclusion is the worst conclusion among
-  matched nodes, with `cached` counting as success.
+- `ci.check(name, { required })` creates the check run immediately (`queued`), so branch protection
+  sees it before any work starts. Nodes attach to it; its conclusion is the worst of its attached
+  nodes, with cached counting as success. A check with no attached nodes when the script ends
+  concludes `success` with "no matching tasks", or `failure` if the script itself failed.
+- Nodes with `check: null` report no check run; they still appear in the PR comment and
+  dashboard.
+- The aggregate `cloud-ci` check is always reported and always safe to require.
 
-| Node/selector setting | GitHub effect |
-| --- | --- |
-| `checks: { name: { tasks, required: true } }` | One check run per run; listed in docs as safe for branch protection |
-| `checks: { name: { tasks } }` | Same check run, documented as informational |
-| node `check: true` | One check run named after the node; never recommended for branch protection |
-| node `check: false` (default for discovered nodes) | No check run; still in the PR comment and dashboard |
-| `checks: false` at pipeline level | Only the always-on `cloud-ci` aggregate check |
+Naming a required check after a discovered task is unsafe: if the task leaves the graph, GitHub
+waits forever for it. `required` only drives documentation and dashboard warnings; GitHub branch
+protection does the enforcing.
 
-"Required" is not enforced by us. GitHub branch protection enforces it. The flag controls
-documentation, dashboard warnings when a required selector matches nothing for many runs, and
-whether the check is created before discovery finishes (`queued`) so that branch protection sees
-it immediately.
+### Limits (proposed)
 
-The single `cloud-ci` aggregate check stays always-on as the one name that is always safe to
-require. This adjusts [pr-comment](./pr-comment.md), which currently assumes one check run per
-job.
+| Limit | Value | Reason |
+| --- | --- | --- |
+| Nodes per run | 2,000 | Coordinator state and UI |
+| Workflow steps per run | Under the Workflows default of 10,000, configurable to 25,000 (developers.cloudflare.com/workflows/build/workers-api, checked 2026-10-01) | Each node costs about 2 steps |
+| Script bundle | 1 MiB | Loaded on every replay |
+| Concurrent containers | Repo policy, default 32 | Account-level container limits |
 
 ## Data model
 
 | Store | Key | Contents |
 | --- | --- | --- |
-| R2 `cloud-ci-assets` | `runs/{run_id}/plan.pb` | Evaluated plan as initially returned |
-| R2 `cloud-ci-assets` | `runs/{run_id}/fragments/{expansion_id}.pb` | Each recorded `GraphFragment` |
+| D1 `runs` | `run_id` | adds `script_path`, `script_blob_sha`, `workflow_instance_id` |
+| D1 `nodes` | `(run_id, node_id)` | status (`pending`, `cached`, `running`, `succeeded`, `failed`, `skipped`), spec hash, check name, timings |
+| D1 `checks` | `(run_id, name)` | required flag, check run id, conclusion |
+| D1 `node_history` | `(repo_id, node_id)` | p50/p95 duration, cache hit rate; feeds `runner: "auto"` and grouping |
+| R2 `cloud-ci-assets` | `runs/{run_id}/script.js` | Bundled script as executed, for replay and audit |
 | R2 `cloud-ci-cache` | `turbo/{repo_id}/{hash}` | turbo cache artifacts |
-| D1 `nodes` | `(run_id, node_id)` | status (`pending`, `cached`, `running`, `succeeded`, `failed`, `skipped`), group id, hash, timings |
-| D1 `node_history` | `(repo_id, node_id)` | rolling p50/p95 duration, cache hit rate; feeds `group: auto` and runner sizing |
-| D1 `check_selectors` | `(run_id, name)` | selector, required flag, check run id, conclusion |
+
+## Reruns
+
+| Action | Behavior |
+| --- | --- |
+| Rerun run | New Workflow instance at the same sha; turbo cache makes completed nodes cheap or skipped |
+| Rerun failed nodes | New instance with the previous run's succeeded node results injected; `ci.container` returns them without starting containers |
+| Retry inside a run | Script-controlled (`retries` on `ci.container`); OOM retry one size up stays a coordinator policy |
 
 ## Security considerations
 
-- `pipeline.ts` comes from the PR head, including fork PRs. It is intended to run only in a
-  host-orchestrated Dynamic Worker with egress blocked, no secrets, and no bindings except the
-  read-only inputs we pass. The Phase 0 Dynamic Workers spike must confirm this isolation before
-  managed runs depend on it.
-  If the spike cannot show that egress is blocked and no bindings or secrets leak through,
-  `pipeline.ts` support stays disabled. Managed runs then accept only `pipeline.yml`, or evaluate
-  programs in a discovery container that holds no secrets.
-- Secrets reach task containers only, under the rules already in
-  [pipeline-config](./pipeline-config.md) (no secrets for fork PRs unless an admin approves).
-- The turbo cache is scoped per repo. A fork-PR run gets `cache:read` only, so it cannot poison
-  artifacts that trusted runs restore. Without that rule, a malicious PR could upload a tampered
-  `build` output under a hash that main later trusts.
-- Discovery output is untrusted input. It is validated against size and node caps, and command
-  strings from turbo are executed only inside that repo's containers.
+- Scripts come from the PR head, including forks. They run in a host-loaded Dynamic Worker with
+  egress blocked and no bindings except the `ci` API. The Phase 0 spike must confirm this
+  isolation. If it cannot, script support stays disabled and only `pipeline.yml` runs.
+- Workflow instance metadata is readable by the Dynamic Worker, so it carries only ids, never
+  tokens (per the caution in the Dynamic Workflows docs above).
+- Secrets are requested by name in `ci.container({ secrets })` and granted by the coordinator
+  per admin policy; fork PRs get none unless an admin approves the run.
+- Container commands come from repo code, as in any CI; the isolation boundary for them is the
+  container, not the script sandbox.
 
 ## Failure modes
 
 | Failure | Behavior |
 | --- | --- |
-| Program throws or exceeds limits | `cloud-ci / config` check fails with the stack trace or limit; no containers start |
-| Discovery container fails | Expansion node fails. Dependents are `skipped`; selector checks matching nothing report failure, not vacuous success, when their expansion failed |
-| Discovered graph has a cycle or exceeds caps | Expansion fails with the offending ids |
-| Upstream cache entry missing | Dependent rebuilds it (correct, slower) and an `unexpected_cache_miss` is recorded |
-| Node hash collision across repos | Impossible by key layout (`repo_id` prefix) |
+| Script throws | Run `failed`; running nodes are cancelled; `cloud-ci / script` check shows the stack trace |
+| Nondeterministic replay | Run `failed` with the first diverging call |
+| Isolate recycled or Worker redeployed | Workflow resumes; finished steps are not repeated |
+| Container lost | Coordinator marks the node failed and sends its event; the script decides whether to retry |
+| Script never awaits a started node | At script end, the coordinator cancels orphaned nodes |
 
 ## Open questions
 
-1. Can workers-rs call the Worker Loader binding, or does it need a TypeScript shim?
-2. Can a container start from another container's snapshot, and how fast is restore compared with
-   a cold `pnpm install`?
-3. What is mise's machine-readable graph output today, and is it stable?
-4. Should `pipeline.ts` be allowed npm dependencies (resolved from the repo's lockfile during
-   discovery), or does the v1 rule hold?
-5. Lua or Starlark as a second program language: worth it only if users ask (see ADR 0009).
+1. Can workers-rs host the Worker Loader and Workflow bindings, or is the host side a small
+   TypeScript module? `@cloudflare/dynamic-workflows` is a JS library, so a TS host is likely.
+2. Container-to-container networking for real sidecars.
+3. Cross-container snapshot restore and its speed compared with a cold install.
+4. npm imports in scripts: resolve from the repo lockfile at plan time, or keep v1 to
+   `@cloud-ci/pipeline` only?
+5. Step pricing and latency of Workflows for runs with about 1,000 nodes.
 
 ## Alternatives considered
 
 | Alternative | Why not |
 | --- | --- |
-| Run each turbo task with `--only` and ship outputs as cloud-ci artifacts | Duplicates turbo's cache protocol and its output-glob semantics; the remote cache already does this |
-| One container per package regardless of task size | Loses most of the parallelism a large graph offers |
-| Re-discover the graph on every retry | A retry could run a different graph than the one that failed |
-| Evaluate `pipeline.ts` in the discovery container only | Adds a container cold start before every run, including runs that need no discovery |
-| Per-node check runs by default | Unsafe for branch protection (see above) and noisy on large graphs |
+| Static plan returned by `pipeline.ts`, expanded by adapters (previous draft) | Every new behavior (sidecars, conditional fan-out, custom retry) becomes an engine feature and a config key |
+| Script runs inside a long-lived "orchestrator" container | Pays a container for the whole run; a crash loses orchestration state without hand-written checkpointing |
+| Our own replay journal in `RunCoordinator` instead of Workflows | Re-implements durable execution that Workflows already provides |
+| Starlark or Lua scripts | Neither runs in Dynamic Workflows; we would host and sandbox an interpreter ourselves |

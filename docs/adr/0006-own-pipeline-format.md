@@ -1,6 +1,6 @@
 # 0006: Own pipeline format, not GitHub Actions syntax
 
-- Status: Proposed; would be superseded by [0009](./0009-typescript-pipeline-programs.md) if that is accepted
+- Status: Proposed; would be superseded by [0009](./0009-typescript-pipeline-workflows.md) if that is accepted
 - Date: 2026-09-30
 
 ## Context

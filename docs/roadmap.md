@@ -10,7 +10,7 @@ Every phase ends with something deployable.
 | Containers from Rust | Can workers-rs start/stop a container with a runtime instance size, or do we need a TS shim DO? | A Worker starts `standard-1` and `basic` containers on demand and reads their exit status |
 | buffa on wasm32 | Do generated bindings compile and stay small on `wasm32-unknown-unknown`? | Hand-routed Connect unary call round-trips JSON and binary |
 | Cold start | How long from webhook to first step output? | Measured p50/p95 recorded in docs |
-| Dynamic Workers | Can the Worker evaluate `pipeline.ts` in a Worker Loader sandbox (from Rust or a TS shim) with egress blocked? | A plan proto returned from a sandboxed program in < 100 ms |
+| Dynamic Workflows | Can a host Worker run a PR-supplied script as a Dynamic Workflow with egress blocked, start containers from steps, and resume after an isolate recycle? | A script runs 3 dependent containers, survives a forced recycle, and cannot reach the network |
 | Container snapshots | Can a run's task containers start from a snapshot taken after `setup`? | Restore time measured against cold `pnpm install` |
 | GitHub App JWT | RS256 signing via WebCrypto from Rust | Installation token fetched from a deployed Worker |
 
@@ -31,13 +31,12 @@ later feature consumes ([ADR 0007](./adr/0007-one-upload-path.md)).
 
 Packages: `cloud-ci-runner-image`, `cloud-ci-proto-typescript`, `cloud-ci-pipeline-sdk`.
 
-- `pipeline.yml` parsing, `pipeline.ts` evaluation, Turborepo adapter and turbo remote cache,
-  selector checks, `RepoState`/`RunCoordinator`, container execution, log streaming.
+- `pipeline.yml` parsing, pipeline scripts as Dynamic Workflows, `turbo` helpers, named checks, `RepoState`/`RunCoordinator`, container execution, log streaming.
 - Caches, secrets, cancel-superseded.
 
 ## Phase 3 — Parallelization
 
-- mise and generic graph adapters, `group: auto`.
+- `mise` helpers, `ci.group`, turbo remote cache, sidecars.
 - `parallel:`, `cloud-ci split` (count → file → timing), merge barriers, native junit/coverage
   merges, Playwright/Vitest blob merge jobs.
 
