@@ -172,6 +172,24 @@ a step open, and the isolate can be recycled while containers run.
 **Node ids are the replay key** and must be unique and stable within a run. The SDK rejects a
 duplicate id at the call site. Library helpers derive ids from turbo `taskId`s.
 
+**Steps are retried, so effects must be idempotent.** Workflows persists a step's result once it
+succeeds, but a step that fails or times out is retried, and its side effect may already have
+happened. The coordinator therefore treats `(run_id, node_id)` as an idempotency key:
+
+| Situation | Coordinator behavior |
+| --- | --- |
+| `startNode` retried after the container already started | Returns the existing node; never starts a second container |
+| `startNode` with the same id but a different spec hash | Rejected as nondeterministic; run fails |
+| Completion event delivered twice | Workflows' `waitForEvent` consumes the first; the coordinator re-sends until the node is acknowledged, and the duplicate is harmless |
+| Event arrives before the script waits for it | Supported by the protocol `[unverified: Workflows buffering of events sent before waitForEvent]`; if not, the coordinator re-sends on a timer until acknowledged |
+| Run cancelled | Coordinator stops containers, marks nodes `cancelled`, and terminates the Workflow instance; late completion events for cancelled nodes are dropped |
+| `waitForEvent` timeout (default: node timeout + 10 min) | Script sees a failed node with `timed out`; coordinator stops the container |
+
+Step params and results must be RPC-serializable (per the Workflows API), so `ci.container`
+returns a plain result object (status, exit code, durations, report and artifact ids), never a
+live handle. Each node costs two steps, so the 10,000-step default allows about 5,000 nodes
+minus `ci.check` and helper steps. The 2,000-node cap below keeps well clear of that.
+
 ### Determinism
 
 On replay the script re-executes from the top, and completed steps return recorded values. Code
