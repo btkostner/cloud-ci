@@ -194,6 +194,9 @@ sequenceDiagram
   `.cloud-ci/pipelines/` or `.cloud-ci/settings.yml`; it concludes `failure` with annotations on
   error, `success` otherwise. This is the one signal that exists independent of any pipeline, so
   a typo cannot fail silently with zero checks on the commit.
+  It is an infrastructure signal, not a gate: docs recommend against requiring it in branch
+  protection unless a repo opts in, since a deployment-side fetch failure would otherwise block
+  merges.
 
 ### Schedules
 
