@@ -15,6 +15,7 @@ deleted; a later ADR supersedes it and the old one's Status line says so.
 | [0008](./0008-auth-modes.md) | GitHub OAuth for humans; OIDC and tokens for machines | Accepted |
 | [0009](./0009-typescript-pipeline-workflows.md) | Pipelines as durable TypeScript workflows | Accepted |
 | [0010](./0010-pluggable-executors.md) | Pluggable executors behind a pull-model agent | Proposed |
+| [0011](./0011-patching-third-party-crates.md) | Patching third-party crates via a `[patch.crates-io]` fork, not a vendored copy | Accepted |
 
 ## Template
 
