@@ -168,7 +168,10 @@ sequenceDiagram
   stripped, same toolchain [dynamic-pipelines](./dynamic-pipelines.md) uses for execution) and
   loaded into a Dynamic Worker with `globalOutbound: null`, which blocks `fetch`/`connect`
   entirely (developers.cloudflare.com/dynamic-workers/usage/egress-control, checked 2026-10-01).
-  The consumer imports the module and reads `export default`'s `on` field — the object literal
+  The consumer (`cloud-ci-worker`, Rust) cannot load this itself — `workers-rs` has no Worker
+  Loader binding (spike, 2026-10-02) — so it calls a sibling TS host Worker over a service
+  binding; that TS Worker holds the Worker Loader binding, loads the module, and reads
+  `export default`'s `on` field — the object literal
   passed to `workflow({ on, run })` — without invoking `run`. `on` must be plain,
   JSON-serializable data (no closures, no calls to `ci.*`); a value that is not is a discovery
   error for that file, annotated on the commit. This sandbox is the same one

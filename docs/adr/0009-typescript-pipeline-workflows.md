@@ -45,8 +45,12 @@ Details: [dynamic-pipelines](../design/dynamic-pipelines.md).
 
 ## Consequences
 
-- The host side of script execution is likely TypeScript (`@cloudflare/dynamic-workflows` is a JS
-  library), alongside the Rust Worker. The boundary is the coordinator RPC.
+- The host side of script execution is TypeScript, confirmed necessary (spike, 2026-10-02):
+  reading the vendored `worker` crate source shows `workers-rs` has no Worker Loader or Workflows
+  binding, so a sibling TS Worker holds `@cloudflare/dynamic-workflows` and is reached from the
+  Rust `cloud-ci-worker` over an ordinary service binding (`Env::service()`, already stable in
+  `workers-rs`) — confirmed working end-to-end, including egress-blocked isolation, in local
+  `wrangler dev`. That TS host Worker is itself an RPC client of `RunCoordinator`.
 - `cloud-ci-proto-typescript` and the `@cloud-ci/pipeline-sdk` SDK move to Phase 2.
 - Script authors must keep code between steps deterministic.
 - Managed runs depend on Dynamic Workers and Workflows, both newer Cloudflare products.

@@ -54,8 +54,11 @@ facts.
 
 ## Non-goals
 
-- Running the script in `cloud-ci-worker`'s own isolate. It runs in a Dynamic Worker that the
-  host Worker loads; whether that sandbox isolates well enough is a Phase 0 spike.
+- Running the script in `cloud-ci-worker`'s own isolate. It runs in a Dynamic Worker loaded by a
+  sibling TypeScript Worker (`cloud-ci-worker` reaches it over an ordinary service binding); the
+  Phase 0 spike confirmed this isolation (egress-blocked `fetch`/`connect` both throw) end-to-end
+  through the real Rust → service-binding → TS-host → Dynamic Worker chain (spike, 2026-10-02; see
+  [Security considerations](#security-considerations)).
 - Letting the script grant itself secrets or bypass admin policy.
 - Arbitrary npm imports in scripts in v1 (see [Open questions](#open-questions)).
 
@@ -559,9 +562,15 @@ are not coordinated with each other beyond sharing the PR comment's run list
 
 ## Security considerations
 
-- Scripts come from the PR head, including forks. They run in a host-loaded Dynamic Worker with
-  egress blocked and no bindings except the `ci` API. The Phase 0 spike must confirm this
-  isolation; if it cannot, this design does not ship (see
+- Scripts come from the PR head, including forks. They run in a Dynamic Worker loaded by a
+  sibling TS host Worker, with egress blocked and no bindings except the `ci` API. The Phase 0
+  spike confirmed this specific isolation claim: `globalOutbound: null` genuinely blocks `fetch()`
+  and `connect()` end-to-end through a real Rust → service-binding → TS-host → Worker-Loader →
+  Dynamic Worker chain in local `wrangler dev` (spike, 2026-10-02). The roadmap's full exit
+  criterion for this row — 3 dependent containers, survival of a forced isolate recycle — remains
+  unverified: it depends on the separate, not-yet-run Containers-from-Rust spike
+  ([roadmap](../roadmap.md)) and on actually wiring `@cloudflare/dynamic-workflows`'s
+  `WorkflowEntrypoint`/`step.do()` (see
   [ADR 0009](../adr/0009-typescript-pipeline-workflows.md)).
 - Workflow instance metadata is readable by the Dynamic Worker, so it carries only ids, never
   tokens (per the caution in the Dynamic Workflows docs above).
@@ -585,8 +594,14 @@ are not coordinated with each other beyond sharing the PR comment's run list
 
 ## Open questions
 
-1. Can workers-rs host the Worker Loader and Workflow bindings, or is the host side a small
-   TypeScript module? `@cloudflare/dynamic-workflows` is a JS library, so a TS host is likely.
+1. ~~Can workers-rs host the Worker Loader and Workflow bindings, or is the host side a small
+   TypeScript module?~~ **Resolved (spike, 2026-10-02):** no — reading the vendored `worker` crate
+   0.8.7 / `worker-sys` 0.8.7 source confirms neither exposes a Worker Loader or Workflows
+   binding. A sibling TypeScript Worker is required to hold `worker_loaders`/`WorkflowEntrypoint`
+   and is confirmed working: a compiled wasm32 `cloud-ci-worker`-style Rust Worker called it over
+   an ordinary `[[services]]` binding (the `worker` crate's existing `Env::service()` API, nothing
+   new) and got a real HTTP response in local `wrangler dev`; egress-blocking was verified
+   end-to-end through that same chain.
 2. Container-to-container networking for real sidecars.
 3. Cross-container snapshot restore and its speed compared with a cold install.
 4. npm imports in scripts: resolve from the repo lockfile at plan time, or keep v1 to

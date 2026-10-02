@@ -10,7 +10,7 @@ Every phase ends with something deployable.
 | Containers from Rust | Can workers-rs start/stop a container with a runtime instance size, or do we need a TS shim DO? | A Worker starts `standard-1` and `basic` containers on demand and reads their exit status |
 | buffa on wasm32 | Do generated bindings compile and stay small on `wasm32-unknown-unknown`? | Hand-routed Connect unary call round-trips JSON and binary |
 | Cold start | How long from webhook to first step output? | Measured p50/p95 recorded in docs |
-| Dynamic Workflows | Can a host Worker run a PR-supplied script as a Dynamic Workflow with egress blocked, start containers from steps, and resume after an isolate recycle? | A script runs 3 dependent containers, survives a forced recycle, and cannot reach the network |
+| Dynamic Workflows | Can a host Worker run a PR-supplied script as a Dynamic Workflow with egress blocked, start containers from steps, and resume after an isolate recycle? | A script runs 3 dependent containers, survives a forced recycle, and cannot reach the network (architecture + egress isolation confirmed 2026-10-02 via a sibling TS host Worker reached by service binding; containers-from-steps and forced-recycle survival remain unverified, pending the Containers from Rust spike and `@cloudflare/dynamic-workflows` wiring) |
 | Container snapshots | Can a run's task containers start from a snapshot taken after `setup`? | Restore time measured against cold `pnpm install` |
 | GitHub App JWT | RS256 signing via WebCrypto from Rust | Installation token fetched from a deployed Worker |
 
