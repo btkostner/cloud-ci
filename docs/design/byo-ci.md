@@ -154,6 +154,10 @@ calls the API. Each matched file becomes one report, and the CLI sets its scope 
   turbo's package name as the scope. The field names in turbo's dry-run JSON are `[unverified]`
   until implementation. Use this when turbo's package set differs from the manifests on disk.
 
+`--site <name>=<dir-glob>` and `--artifact <name>=<path-glob>` follow the same rules. When the
+glob matches more than one path, each match becomes its own site or artifact with its own scope,
+named `<name>/<scope>`, so several packages can share one `--site` flag.
+
 A `deployment` upload has no file; its scope comes from `--scope`, else from the nearest
 manifest above the current working directory.
 
@@ -259,6 +263,69 @@ A matrix or sharded suite calls `cloud-ci upload` once per leg with the same `--
 No job gated on `needs:` all legs is necessary. The `e2e` job is complete when shard 4 of 4 has
 uploaded; a shard that never uploads is marked `missing` when the run closes. See
 [parallelization](./parallelization.md) for the matrix and split pattern.
+
+A single large runner can also run many Playwright suites at once. In this example a 32-core
+self-hosted runner runs `turbo run e2e`, which starts the Playwright suites of 8 packages spread
+across `apps/` and `packages/`. One upload sends all 8 results:
+
+```yaml
+  e2e:
+    runs-on: [self-hosted, linux, x64, 32-core]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cloud-ci CLI
+        run: curl -fsSL https://<your-deployment>/install.sh | sh
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Run every package's e2e suite
+        run: npx turbo run e2e --concurrency=8 --continue
+
+      - name: Upload e2e results
+        if: always()
+        run: |
+          cloud-ci upload --job e2e \
+            --report playwright:'apps/*/test-results/e2e.json' \
+            --report playwright:'packages/*/test-results/e2e.json' \
+            --site e2e-report='apps/*/playwright-report' \
+            --site e2e-report='packages/*/playwright-report' \
+            --check e2e \
+            --conclusion ${{ job.status }}
+```
+
+Each package's `playwright.config.ts` sets its reporters to write a JSON file and an HTML report
+into the package directory, and limits its own workers so the 8 suites share the 32 cores:
+
+```ts
+export default defineConfig({
+  workers: 4,
+  reporter: [
+    ["json", { outputFile: "test-results/e2e.json" }],
+    ["html", { outputFolder: "playwright-report", open: "never" }],
+  ],
+});
+```
+
+What happens:
+
+- `--concurrency=8` with `workers: 4` gives about 32 Playwright workers at once. `--continue`
+  makes turbo run every package's suite even after one fails, so the upload has all 8 results.
+- The two `--report` globs match 8 JSON files. The CLI gives each file the scope of its nearest
+  `package.json` (for example `apps/web/test-results/e2e.json` becomes `@acme/web`). A package
+  whose suite did not run, because turbo had a cache hit, has no new file; see the note below.
+- Each `--site` glob match becomes one hosted HTML report with the same scope as its JSON file,
+  so the PR comment links to the right report for each package
+  ([assets](./assets.md)). Sites from a glob are named `<name>/<scope>`, for example
+  `e2e-report/@acme/web`.
+- `--check e2e` posts one `e2e` Check Run for the job. The PR comment and the full report group
+  the tests by package and expand only the packages that failed.
+- The job has one shard (`1/1`), so this one command completes it. It runs once, on one machine,
+  so it is not sharded even though 8 suites ran in parallel.
+
+Turbo cache hits replay a task's logs but restore its outputs only if `test-results/**` and
+`playwright-report/**` are listed in the task's `outputs` in `turbo.json`. List them, so a cache
+hit still leaves a result file for the upload to find.
 
 ## Design
 
