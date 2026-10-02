@@ -47,7 +47,7 @@
 //! Matching on the dedicated ID claims sidesteps branching on which `sub`
 //! shape a given repo uses.
 //!
-//! # JWKS discovery and caching — documented placeholder
+//! # JWKS discovery and caching
 //!
 //! `fetch_jwks` discovers the JWKS URI from the issuer's
 //! `/.well-known/openid-configuration` document (`jwks_uri` field) rather
@@ -55,20 +55,39 @@
 //! document docs/design/byo-ci.md cites for `claims_supported`, so one
 //! fetch pattern covers both facts this module depends on.
 //!
-//! There is no Durable Object or KV binding designated for a JWKS cache
-//! yet, and adding one is a design decision beyond this round's scope.
-//! [`fetch_jwks`] therefore fetches fresh on every call — no
-//! request-lifetime or cross-request caching at all. The "cached,
-//! refetched on `kid` miss" behavior docs/design/byo-ci.md's Auth row
-//! describes is architecturally where [`verify`]'s `kid`-miss retry lives
-//! ([`verify`] calls `fetch_jwks` again if the first fetch's JWKS has no
-//! matching `kid`), but there is intentionally no cache in front of either
-//! call yet. Real caching (most likely reusing an existing or new Durable
-//! Object) is deferred to whichever later round wires this module into a
-//! live request path, where the caching tradeoffs (TTL, eviction,
-//! concurrent-request de-duplication) can be weighed against that path's
-//! actual request volume. This round proves the verification mechanics
-//! are correct, not the caching strategy.
+//! There is still no Durable Object or KV binding for a JWKS cache, but
+//! none is needed: the standard Cloudflare Workers
+//! [`worker::Cache`] API (`caches.default` in JS terms — see
+//! `worker-0.8.7/src/cache.rs`, exported unconditionally from the crate
+//! root with no feature flag or `wrangler.toml` binding, unlike D1/R2/DO)
+//! is always available in a Worker and is exactly the "keyed, TTL'd HTTP
+//! response cache" shape this module needs. [`fetch_jwks`] checks the
+//! default cache (keyed by the real resource URL — the discovery
+//! document's own URL, and separately the discovered `jwks_uri`) before
+//! making either network request, and stores each response back into the
+//! cache with a `Cache-Control: max-age=<JWKS_CACHE_TTL_SECONDS>` header
+//! (the Cache API's documented way to express TTL — `worker::Cache::put`'s
+//! docs: "The Response should include a cache-control header with max-age
+//! or s-maxage directives, otherwise the Cache API will not cache the
+//! response"). See [`JWKS_CACHE_TTL_SECONDS`] for the TTL value and
+//! reasoning. Both the discovery document and the JWKS are cached, not
+//! just the JWKS: caching only the JWKS would still leave a network round
+//! trip (the discovery fetch) on every call, defeating most of the latency
+//! win, for a document that changes even less often than the JWKS itself.
+//!
+//! The "cached, refetched on `kid` miss" behavior docs/design/byo-ci.md's
+//! Auth row describes maps directly onto [`fetch_jwks`] (cache-first) and
+//! [`fetch_jwks_bypassing_cache`] (network-first, cache-updating) —
+//! [`verify`]'s `kid`-miss retry calls the latter, so a key rotated after
+//! the cache was populated is still found on retry instead of being masked
+//! by a stale cache entry for up to the full TTL.
+//!
+//! Cache reads/writes are best-effort: any Cache API failure, or a cached
+//! body that doesn't parse, is treated as a cache miss (fall through to a
+//! real fetch) or silently dropped (fall through to no caching), never
+//! surfaced as a request failure — the cache is a latency optimization
+//! over the network fetch, not a dependency this module's correctness
+//! relies on.
 
 use serde::{Deserialize, Serialize};
 
@@ -105,7 +124,7 @@ pub struct Jwk {
     pub e: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Jwks {
     pub keys: Vec<Jwk>,
 }
@@ -258,7 +277,7 @@ fn validate_claims(
 /// The issuer's OIDC Discovery document's one field this module needs:
 /// `jwks_uri`. Other fields (`issuer`, `claims_supported`, etc.) are
 /// ignored.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct OpenIdConfiguration {
     jwks_uri: String,
 }
@@ -267,29 +286,113 @@ fn openid_configuration_url(issuer: &str) -> String {
     format!("{issuer}/.well-known/openid-configuration")
 }
 
+/// `max-age` seconds applied to cached OIDC Discovery documents and JWKS
+/// responses (module docs "JWKS discovery and caching"): 15 minutes.
+/// GitHub does not publish a signing-key rotation cadence for
+/// `token.actions.githubusercontent.com`, so this isn't tuned against a
+/// confirmed number — it's a conservative default for a key set that in
+/// practice rotates on the order of weeks/months, not minutes: long enough
+/// that `verify` almost never pays the network-fetch cost, short enough
+/// that a rotated key is picked up well within the same working session
+/// even without the `kid`-miss retry. The retry
+/// ([`fetch_jwks_bypassing_cache`], wired into [`verify`]) is what actually
+/// guarantees correctness across a rotation mid-TTL — this constant only
+/// controls the common-case cache hit rate, not whether a rotated key is
+/// ever found.
+const JWKS_CACHE_TTL_SECONDS: u32 = 900;
+
+/// Reads a cached JSON document for `url` from the Workers default cache,
+/// if present. A cache miss, a Cache API failure, or a cached body that
+/// fails to parse as `T` are all treated identically — `None` — per module
+/// docs: the cache is a latency optimization over a real fetch, never a
+/// dependency whose failure should surface to the caller.
+async fn cached_json<T: serde::de::DeserializeOwned>(
+    cache: &worker::Cache,
+    url: &str,
+) -> Option<T> {
+    let mut response = cache.get(url, false).await.ok().flatten()?;
+    response.json::<T>().await.ok()
+}
+
+/// Stores `value` as JSON in the Workers default cache under `url`, with a
+/// `Cache-Control: max-age=JWKS_CACHE_TTL_SECONDS` header — the Cache API
+/// only caches responses that carry a `max-age`/`s-maxage` directive (see
+/// `worker::Cache::put` docs). Best-effort: any failure to build or store
+/// the cached response is silently dropped, same reasoning as
+/// [`cached_json`].
+async fn cache_put_json<T: Serialize>(cache: &worker::Cache, url: &str, value: &T) {
+    let Ok(response) = worker::Response::from_json(value) else {
+        return;
+    };
+    if response
+        .headers()
+        .set(
+            "Cache-Control",
+            &format!("max-age={JWKS_CACHE_TTL_SECONDS}"),
+        )
+        .is_err()
+    {
+        return;
+    }
+    let _ = cache.put(url, response).await;
+}
+
 /// Fetches GitHub's JWKS, discovering the exact `jwks_uri` from the
 /// issuer's `/.well-known/openid-configuration` document first (OIDC
-/// Discovery) rather than hardcoding `/.well-known/jwks`. No caching — see
-/// module docs "JWKS discovery and caching" for why that's an honest
-/// placeholder this round, not the real caching strategy.
+/// Discovery) rather than hardcoding `/.well-known/jwks`. Checks the
+/// Workers default cache first for both the discovery document and the
+/// JWKS, only reaching the network on a cache miss — see module docs
+/// "JWKS discovery and caching". Use [`fetch_jwks_bypassing_cache`] when a
+/// stale cache entry must not be trusted.
 pub async fn fetch_jwks(issuer: &str) -> Result<Jwks, OidcError> {
+    fetch_jwks_impl(issuer, true).await
+}
+
+/// Same as [`fetch_jwks`], but skips the cache read for both the discovery
+/// document and the JWKS, always fetching fresh from the network — the
+/// network-first half of the "cached, refetched on `kid` miss" behavior
+/// (module docs). The fresh result is still written back to the cache
+/// afterward, healing a stale entry for the next cache-first call.
+pub async fn fetch_jwks_bypassing_cache(issuer: &str) -> Result<Jwks, OidcError> {
+    fetch_jwks_impl(issuer, false).await
+}
+
+async fn fetch_jwks_impl(issuer: &str, use_cache: bool) -> Result<Jwks, OidcError> {
+    let cache = worker::Cache::default();
     let config_url = openid_configuration_url(issuer);
-    let config_request = worker::Request::new(&config_url, worker::Method::Get)
-        .map_err(|e| OidcError(format!("cannot build OIDC discovery request: {e}")))?;
-    let mut config_response = worker::Fetch::Request(config_request)
-        .send()
-        .await
-        .map_err(|e| OidcError(format!("OIDC discovery request failed: {e}")))?;
-    if config_response.status_code() != 200 {
-        return Err(OidcError(format!(
-            "OIDC discovery request failed: status {}",
-            config_response.status_code()
-        )));
+
+    let cached_config = if use_cache {
+        cached_json::<OpenIdConfiguration>(&cache, &config_url).await
+    } else {
+        None
+    };
+    let config = match cached_config {
+        Some(config) => config,
+        None => {
+            let config_request = worker::Request::new(&config_url, worker::Method::Get)
+                .map_err(|e| OidcError(format!("cannot build OIDC discovery request: {e}")))?;
+            let mut config_response = worker::Fetch::Request(config_request)
+                .send()
+                .await
+                .map_err(|e| OidcError(format!("OIDC discovery request failed: {e}")))?;
+            if config_response.status_code() != 200 {
+                return Err(OidcError(format!(
+                    "OIDC discovery request failed: status {}",
+                    config_response.status_code()
+                )));
+            }
+            let config: OpenIdConfiguration = config_response
+                .json()
+                .await
+                .map_err(|e| OidcError(format!("cannot decode OIDC discovery document: {e}")))?;
+            cache_put_json(&cache, &config_url, &config).await;
+            config
+        }
+    };
+
+    if use_cache && let Some(jwks) = cached_json::<Jwks>(&cache, &config.jwks_uri).await {
+        return Ok(jwks);
     }
-    let config: OpenIdConfiguration = config_response
-        .json()
-        .await
-        .map_err(|e| OidcError(format!("cannot decode OIDC discovery document: {e}")))?;
 
     let jwks_request = worker::Request::new(&config.jwks_uri, worker::Method::Get)
         .map_err(|e| OidcError(format!("cannot build JWKS request: {e}")))?;
@@ -303,10 +406,12 @@ pub async fn fetch_jwks(issuer: &str) -> Result<Jwks, OidcError> {
             jwks_response.status_code()
         )));
     }
-    jwks_response
+    let jwks: Jwks = jwks_response
         .json()
         .await
-        .map_err(|e| OidcError(format!("cannot decode JWKS: {e}")))
+        .map_err(|e| OidcError(format!("cannot decode JWKS: {e}")))?;
+    cache_put_json(&cache, &config.jwks_uri, &jwks).await;
+    Ok(jwks)
 }
 
 /// Verifies `jwt`'s RS256 signature against `jwk` (an RSA public key, `n`
@@ -401,13 +506,15 @@ fn set_prop(obj: &worker::js_sys::Object, key: &str, value: &str) -> Result<(), 
     .map_err(|e| OidcError(format!("cannot build WebCrypto JWK object: {e:?}")))
 }
 
-/// Full verification: fetches the issuer's JWKS, finds the key named by
-/// the JWT's `kid` (refetching once if the first fetch's JWKS doesn't have
-/// it — "cached, refetched on `kid` miss" per docs/design/byo-ci.md § Auth,
-/// modulo this round's no-cache placeholder, see module docs), verifies
-/// the RS256 signature, and validates `iss`/`aud`/`exp`/`nbf`. Returns the
-/// typed claims on success — the caller is responsible for the final
-/// allowlist-membership check (module docs).
+/// Full verification: fetches the issuer's JWKS (cache-first, module
+/// docs), finds the key named by the JWT's `kid`, and — "cached, refetched
+/// on `kid` miss" per docs/design/byo-ci.md § Auth — refetches once via
+/// [`fetch_jwks_bypassing_cache`] if the cached/first fetch's JWKS doesn't
+/// have it, so a key rotated after the cache was populated is still found.
+/// Then verifies the RS256 signature and validates
+/// `iss`/`aud`/`exp`/`nbf`. Returns the typed claims on success — the
+/// caller is responsible for the final allowlist-membership check (module
+/// docs).
 pub async fn verify(
     jwt: &str,
     expected_audience: &str,
@@ -418,7 +525,7 @@ pub async fn verify(
     let mut jwks = fetch_jwks(GITHUB_OIDC_ISSUER).await?;
     let mut jwk = jwks.keys.iter().find(|k| k.kid == kid);
     if jwk.is_none() {
-        jwks = fetch_jwks(GITHUB_OIDC_ISSUER).await?;
+        jwks = fetch_jwks_bypassing_cache(GITHUB_OIDC_ISSUER).await?;
         jwk = jwks.keys.iter().find(|k| k.kid == kid);
     }
     let jwk = jwk.ok_or_else(|| OidcError(format!("no JWKS key found for kid {kid}")))?;
