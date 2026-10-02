@@ -343,6 +343,36 @@ fn base64_url_encode(bytes: &[u8]) -> String {
 /// accessed 2026-10-01).
 const GITHUB_API_VERSION: &str = "2022-11-28";
 
+/// `User-Agent` GitHub requires on every REST API request
+/// (docs.github.com/en/rest/using-the-rest-api/troubleshooting-the-rest-api#user-agent-required,
+/// accessed 2026-10-02: "Requests without a valid `User-Agent` header
+/// will be rejected. You should use your username or the name of your
+/// application for the `User-Agent` value."). Confirmed live: before
+/// this header existed, [`list_installations`] under `wrangler dev
+/// --test-scheduled` got a `403` whose body was GitHub's own "Please
+/// make sure your request has a User-Agent header" text, not any other
+/// failure — adding this header is what turns that into a GitHub-shaped
+/// auth failure instead (confirmed: the same call now gets a `401`).
+const USER_AGENT: &str = "cloud-ci-worker";
+
+/// The four headers every `/app/*` endpoint in this module needs: an
+/// App-level JWT ([`mint_app_jwt`]) bearer token, the recommended
+/// `Accept`, the pinned [`GITHUB_API_VERSION`], and the [`USER_AGENT`]
+/// GitHub requires on every REST API request. [`fetch_installation_token`],
+/// [`delete_installation`], and [`list_installations`] all send exactly
+/// this set — GitHub's docs specify the same auth/version headers for
+/// each endpoint, with nothing endpoint-specific among them — so they
+/// share one header-construction function rather than three
+/// near-identical copies.
+fn app_jwt_headers(app_jwt: &str) -> [(&'static str, String); 4] {
+    [
+        ("authorization", format!("Bearer {app_jwt}")),
+        ("accept", "application/vnd.github+json".to_string()),
+        ("x-github-api-version", GITHUB_API_VERSION.to_string()),
+        ("user-agent", USER_AGENT.to_string()),
+    ]
+}
+
 /// An installation access token — docs.github.com/en/rest/apps/apps#create-an-installation-access-token-for-an-app
 /// (accessed 2026-10-01) returns more fields (e.g. `permissions`), but
 /// `token` and `expires_at` are the only two callers in this codebase
@@ -358,17 +388,6 @@ pub struct InstallationToken {
 /// Workers runtime.
 fn installation_access_token_url(installation_id: u64) -> String {
     format!("https://api.github.com/app/installations/{installation_id}/access_tokens")
-}
-
-/// The three headers GitHub's docs specify for this endpoint
-/// (`Authorization: Bearer <app jwt>`, `Accept`, `X-GitHub-Api-Version`) —
-/// pure construction, unit-testable without the Workers runtime.
-fn installation_access_token_headers(app_jwt: &str) -> [(&'static str, String); 3] {
-    [
-        ("authorization", format!("Bearer {app_jwt}")),
-        ("accept", "application/vnd.github+json".to_string()),
-        ("x-github-api-version", GITHUB_API_VERSION.to_string()),
-    ]
 }
 
 /// Exchanges a signed App JWT ([`sign_rs256`]'s output) for an
@@ -389,7 +408,7 @@ pub async fn fetch_installation_token(
 ) -> Result<InstallationToken, GithubAppError> {
     let url = installation_access_token_url(installation_id);
     let headers = worker::Headers::new();
-    for (name, value) in installation_access_token_headers(app_jwt) {
+    for (name, value) in app_jwt_headers(app_jwt) {
         headers
             .set(name, &value)
             .map_err(|e| GithubAppError(format!("cannot set {name} header: {e}")))?;
@@ -428,18 +447,6 @@ fn uninstall_installation_url(installation_id: u64) -> String {
     format!("https://api.github.com/app/installations/{installation_id}")
 }
 
-/// Same three headers as [`installation_access_token_headers`] — this
-/// endpoint also authenticates with an App-level JWT, not an installation
-/// token (docs.github.com/en/rest/apps/apps#delete-an-installation-for-the-authenticated-app,
-/// accessed 2026-10-02).
-fn uninstall_installation_headers(app_jwt: &str) -> [(&'static str, String); 3] {
-    [
-        ("authorization", format!("Bearer {app_jwt}")),
-        ("accept", "application/vnd.github+json".to_string()),
-        ("x-github-api-version", GITHUB_API_VERSION.to_string()),
-    ]
-}
-
 /// `DELETE /app/installations/{installation_id}`
 /// (docs.github.com/en/rest/apps/apps#delete-an-installation-for-the-authenticated-app,
 /// accessed 2026-10-02): uninstalls the App from `installation_id`, called
@@ -457,7 +464,7 @@ pub async fn delete_installation(
 ) -> Result<(), GithubAppError> {
     let url = uninstall_installation_url(installation_id);
     let headers = worker::Headers::new();
-    for (name, value) in uninstall_installation_headers(app_jwt) {
+    for (name, value) in app_jwt_headers(app_jwt) {
         headers
             .set(name, &value)
             .map_err(|e| GithubAppError(format!("cannot set {name} header: {e}")))?;
@@ -512,17 +519,6 @@ fn list_installations_url(page: u32) -> String {
     )
 }
 
-/// Same three headers as [`uninstall_installation_headers`] — this
-/// endpoint also authenticates with an App-level JWT, not an installation
-/// token ("You must use a JWT to access this endpoint" — same doc).
-fn list_installations_headers(app_jwt: &str) -> [(&'static str, String); 3] {
-    [
-        ("authorization", format!("Bearer {app_jwt}")),
-        ("accept", "application/vnd.github+json".to_string()),
-        ("x-github-api-version", GITHUB_API_VERSION.to_string()),
-    ]
-}
-
 /// `installation.account` per
 /// docs.github.com/en/rest/apps/apps#list-installations-for-the-authenticated-app
 /// (accessed 2026-10-02): only `id`/`login`/`type` are needed here — the
@@ -572,7 +568,7 @@ pub async fn list_installations(app_jwt: &str) -> Result<Vec<ListedInstallation>
     loop {
         let url = list_installations_url(page);
         let headers = worker::Headers::new();
-        for (name, value) in list_installations_headers(app_jwt) {
+        for (name, value) in app_jwt_headers(app_jwt) {
             headers
                 .set(name, &value)
                 .map_err(|e| GithubAppError(format!("cannot set {name} header: {e}")))?;
@@ -737,23 +733,6 @@ mod tests {
     }
 
     #[test]
-    fn installation_token_headers_carry_bearer_jwt_and_api_version() {
-        let headers = installation_access_token_headers("my.jwt.value");
-        assert_eq!(
-            headers[0],
-            ("authorization", "Bearer my.jwt.value".to_string())
-        );
-        assert_eq!(
-            headers[1],
-            ("accept", "application/vnd.github+json".to_string())
-        );
-        assert_eq!(
-            headers[2],
-            ("x-github-api-version", GITHUB_API_VERSION.to_string())
-        );
-    }
-
-    #[test]
     fn installation_token_response_parses_documented_shape() -> Result<(), serde_json::Error> {
         // Realistic shape per docs.github.com/en/rest/apps/apps
         // #create-an-installation-access-token-for-an-app (extra fields
@@ -780,8 +759,8 @@ mod tests {
     }
 
     #[test]
-    fn uninstall_headers_carry_bearer_jwt_and_api_version() {
-        let headers = uninstall_installation_headers("my.jwt.value");
+    fn app_jwt_headers_carry_bearer_jwt_api_version_and_user_agent() {
+        let headers = app_jwt_headers("my.jwt.value");
         assert_eq!(
             headers[0],
             ("authorization", "Bearer my.jwt.value".to_string())
@@ -794,6 +773,7 @@ mod tests {
             headers[2],
             ("x-github-api-version", GITHUB_API_VERSION.to_string())
         );
+        assert_eq!(headers[3], ("user-agent", USER_AGENT.to_string()));
     }
 
     #[test]
@@ -805,23 +785,6 @@ mod tests {
         assert_eq!(
             list_installations_url(3),
             "https://api.github.com/app/installations?per_page=100&page=3"
-        );
-    }
-
-    #[test]
-    fn list_installations_headers_carry_bearer_jwt_and_api_version() {
-        let headers = list_installations_headers("my.jwt.value");
-        assert_eq!(
-            headers[0],
-            ("authorization", "Bearer my.jwt.value".to_string())
-        );
-        assert_eq!(
-            headers[1],
-            ("accept", "application/vnd.github+json".to_string())
-        );
-        assert_eq!(
-            headers[2],
-            ("x-github-api-version", GITHUB_API_VERSION.to_string())
         );
     }
 
