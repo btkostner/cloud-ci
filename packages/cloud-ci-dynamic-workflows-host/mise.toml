@@ -1,0 +1,46 @@
+#:schema https://mise.jdx.dev/schema/mise.json
+#
+# This package is this repo's first TypeScript Worker package
+# (packages/cloud-ci-worker is Rust). Tool versions are pinned two ways,
+# matching the convention `cloud-ci-worker/mise.toml` already uses for its
+# own Node/wrangler needs: `node` here in `[tools]` (the actual runtime a
+# task invokes), and everything else (wrangler, vitest, biome, typescript)
+# as `package.json` `devDependencies` resolved through `package-lock.json`
+# — npm's own pinning mechanism, since those are invoked via `npx`/`npm
+# run` against this package's own `node_modules`, not as global binaries.
+
+[tools]
+node = "24"
+
+[tasks.install]
+description = "Install npm dependencies"
+run = "npm install"
+
+[tasks.lint]
+description = "Run biome checks"
+depends = ["install"]
+run = "npm run lint"
+
+[tasks.typecheck]
+description = "Run tsc --noEmit"
+depends = ["install"]
+run = "npm run typecheck"
+
+[tasks.test]
+description = "Run vitest unit tests"
+depends = ["install"]
+run = "npm run test"
+
+[tasks.check]
+description = "Run every check"
+depends = ["lint", "typecheck", "test"]
+
+[tasks.fix]
+description = "Fix formatting/lint issues"
+depends = ["install"]
+run = "npm run fix"
+
+[tasks.dev]
+description = "Run the Worker Loader locally alongside cloud-ci-worker (real service binding, real Docker-backed containers)"
+depends = ["install", "//packages/cloud-ci-worker:build"]
+run = "npm run dev"

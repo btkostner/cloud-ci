@@ -1,0 +1,28 @@
+name = "cloud-ci-dynamic-workflows-host"
+main = "src/index.ts"
+compatibility_date = "2026-10-02"
+
+# Worker Loader: loads a given TypeScript pipeline script string into a
+# Dynamic Worker at runtime (developers.cloudflare.com/dynamic-workers/usage/dynamic-workflows,
+# checked 2026-10-02). Config shape matches that guide's example exactly.
+[[worker_loaders]]
+binding = "LOADER"
+
+# The `DynamicWorkflow` entrypoint `@cloudflare/dynamic-workflows` builds
+# (src/index.ts): the Workflows engine calls into this class, which loads
+# the right Dynamic Worker for a given instance via `LOADER` above.
+[[workflows]]
+name = "cloud-ci-dynamic-workflow"
+binding = "WORKFLOWS"
+class_name = "DynamicWorkflow"
+
+# Ordinary service binding to the Rust `cloud-ci-worker` (ADR 0009's
+# proven Rust-caller pattern, used here in reverse: this TS host calls
+# back into the Rust Worker's `ContainerProbe` Durable Object, since
+# `ctx.container` only exists on a `DurableObject` subclass — see
+# docs/design/dynamic-pipelines.md's "Execution model" section and
+# src/container_probe.rs's module docs in the `cloud-ci-worker` package
+# for why a Workflow step cannot reach a container directly).
+[[services]]
+binding = "CONTAINER_WORKER"
+service = "cloud-ci"
