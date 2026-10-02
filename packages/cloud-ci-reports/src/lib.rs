@@ -1,10 +1,11 @@
 //! Domain model for third-party CI report parsing.
 //!
-//! Only JUnit XML is in scope for this pass; other report kinds named in
-//! `docs/architecture.md`'s package table (Vitest, Playwright, lcov, ...) are later work and
+//! JUnit XML and Vitest's JSON reporter are in scope so far; other report kinds named in
+//! `docs/architecture.md`'s package table (Playwright, lcov, cobertura, ...) are later work and
 //! intentionally have no surface here yet.
 
 pub mod junit;
+pub mod vitest;
 
 /// A parsed `<testsuites>` document: zero or more [`TestSuite`]s.
 ///
@@ -43,7 +44,8 @@ pub struct TestCase {
     pub classname: Option<String>,
     /// `file` attribute: the source file the test is defined in. Emitted by writers that
     /// follow xUnit's legacy `testcase` attribute family (e.g. pytest's `--junitxml` output);
-    /// not part of every writer's output.
+    /// not part of every writer's output. [`vitest::parse`] also populates this, from the
+    /// enclosing test file's path.
     pub file: Option<String>,
     /// `line` attribute: the line in `file` the test is defined at. Same provenance as `file`.
     pub line: Option<u32>,
