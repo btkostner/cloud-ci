@@ -1,0 +1,55 @@
+#:schema https://mise.jdx.dev/schema/mise.json
+#
+# The repository root owns shared tooling and orchestration. Each directory
+# under packages/ owns its language tools, dependency providers, and tasks.
+# Root tasks compose package tasks with `depends`; add each package here as it
+# is created (see docs/roadmap.md for the planned set).
+
+monorepo_root = true
+
+[env]
+CARGO_TARGET_DIR = "{{ config_root }}/target"
+HK_MISE = 1
+_.file = { path = ".env.local", redact = true }
+
+[hooks]
+postinstall = ["hk install --mise"]
+
+[monorepo]
+config_roots = ["packages/*"]
+lockfile = true
+
+[settings]
+experimental = true
+lockfile = true
+task.source_freshness_hash_contents = true
+
+[tasks.check]
+description = "Run every repo-wide check"
+run = """
+hk check --all \
+  --step taplo \
+  --step actionlint \
+  --step typos \
+  --step trailing_whitespace \
+  --step mixed_line_ending
+"""
+
+[tasks.fix]
+description = "Fix every repo-wide check"
+run = """
+hk fix --all \
+  --step taplo \
+  --step actionlint \
+  --step typos \
+  --step trailing_whitespace \
+  --step mixed_line_ending
+"""
+
+[tools]
+actionlint = "1.7.12"
+hk = "2.0.0"
+pkl = "0.30.0"
+shellcheck = "0.11.0"
+taplo = "0.10.0"
+typos = "1.49.0"

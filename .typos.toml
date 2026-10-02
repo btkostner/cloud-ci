@@ -1,0 +1,7 @@
+# Spell-checking is for prose and code we write, not machine-written files.
+[files]
+extend-exclude = [
+  "*.lock",
+  "**/generated/**",
+  "**/pnpm-lock.yaml",
+]

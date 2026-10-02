@@ -1,0 +1,15 @@
+amends "package://github.com/jdx/hk/releases/download/v2.0.0/hk@2.0.0#/Config.pkl"
+import "package://github.com/jdx/hk/releases/download/v2.0.0/hk@2.0.0#/Builtins.pkl"
+
+subprojects = List("packages/*")
+
+steps {
+    ["actionlint"] = Builtins.actionlint
+    ["check_added_large_files"] = Builtins.check_added_large_files
+    ["check_merge_conflict"] = Builtins.check_merge_conflict
+    ["detect_private_key"] = Builtins.detect_private_key
+    ["mixed_line_ending"] = Builtins.mixed_line_ending
+    ["taplo"] = Builtins.taplo
+    ["trailing_whitespace"] = Builtins.trailing_whitespace
+    ["typos"] = Builtins.typos
+}
