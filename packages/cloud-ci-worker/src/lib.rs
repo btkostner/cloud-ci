@@ -541,12 +541,35 @@ async fn handle_installation_event(raw_body: &[u8], env: &Env) -> Result<Respons
                 .await?;
             } else {
                 // No row is ever created for a disallowed account
-                // (auth.md: "never creates rows for it"). The uninstall
-                // call is best-effort: against a synthetic or
-                // already-removed installation it 404s, which does not
-                // block the webhook ack — GitHub only needs the 200,
-                // not a successful uninstall, to stop retrying this
-                // delivery.
+                // (auth.md: "never creates rows for it") — that is the
+                // security-critical invariant and it holds unconditionally
+                // here, regardless of whether the uninstall call below
+                // succeeds. The uninstall call itself is best-effort and
+                // intentionally NOT the sole enforcement mechanism: against
+                // a synthetic or already-removed installation it 404s, and
+                // more generally it can fail for reasons unrelated to
+                // this delivery (bad/rotated credentials, GitHub outage).
+                // auth.md's Failure modes table names the durable backstop
+                // for exactly this case — "The periodic `GET
+                // /app/installations` reconcile job ... catches it on its
+                // next pass and uninstalls it then, rather than depending
+                // on the webhook alone" — which is not built yet (separate,
+                // later infrastructure, same as everything else deferred
+                // this round). Until it exists, a failed uninstall here
+                // means the disallowed account stays installed on GitHub's
+                // side with no usable row on ours, which is an acceptable
+                // gap this round, not a silent security hole: no data is
+                // ever created for it.
+                //
+                // Returning a non-200 to force a GitHub webhook retry
+                // would be the wrong fix: webhook retry exists for
+                // delivery failures, not as a substitute for the reconcile
+                // job, and retrying the same delivery against a
+                // persistently-failing uninstall (e.g. bad credentials)
+                // would not help — it would just retry-storm this
+                // deployment for an error retrying can't fix. The ack
+                // stays 200; the uninstall attempt is logged on failure
+                // for operator visibility, nothing more.
                 if let Err(e) = uninstall_disallowed_installation(env, installation_id).await {
                     worker::console_log!(
                         "uninstall of disallowed installation {installation_id} failed: {e}"
