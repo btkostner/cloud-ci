@@ -99,6 +99,25 @@ image = "./container_probe/Dockerfile"
 name = "CONTAINER_PROBE"
 class_name = "ContainerProbe"
 
+# `durable_object`-scheduling-policy Container application backing
+# `NodeContainer` (src/node_container.rs): `RunCoordinator::handle_start_node`'s real
+# per-node container, one instance per `node_id`. Unlike `ContainerProbe` above
+# (`default` policy, one fixed image from `wrangler.toml`), `durable_object` policy
+# moves the image choice into the Durable Object's own code
+# (`ContainerStartupOptions::set_image`, ADR 0011) — exactly what a pipeline node's
+# per-node `image` needs and `default` policy cannot express. No `images` map here:
+# the patched `worker` crate's `set_image` takes an arbitrary image reference string
+# at call time, not one of a fixed, pre-declared set. `durable_object` policy does
+# not support `max_instances` (developers.cloudflare.com/containers/configuration/scheduling-policy/,
+# checked 2026-10-02).
+[[containers]]
+class_name = "NodeContainer"
+scheduling_policy = "durable_object"
+
+[[durable_objects.bindings]]
+name = "NODE_CONTAINER"
+class_name = "NodeContainer"
+
 # new_sqlite_classes, not new_classes: RunCoordinator uses
 # state.storage().sql(), which only exists on SQLite-backed objects. Never
 # rewrite this entry — migrations are append-only.
@@ -127,6 +146,15 @@ new_sqlite_classes = ["RepoState"]
 [[migrations]]
 tag = "v4"
 new_sqlite_classes = ["ContainerProbe"]
+
+# Picks up NodeContainer, this round's real per-node container DO
+# (src/node_container.rs). Not SQLite-backed by its own logic (no
+# state.storage().sql() call), but uses new_sqlite_classes anyway, same
+# reasoning as ContainerProbe's v4 entry above. Migrations are
+# append-only — never rewrite v1-v4 above to add this class to them.
+[[migrations]]
+tag = "v5"
+new_sqlite_classes = ["NodeContainer"]
 
 # Installation reconcile job (docs/design/auth.md § "Multiple orgs and
 # installations", "Discovery" paragraph): calls `GET /app/installations`

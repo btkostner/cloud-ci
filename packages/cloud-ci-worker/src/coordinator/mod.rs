@@ -64,27 +64,36 @@
 //!   best-effort side channel, the same degrade-and-log posture
 //!   `reconcile.rs`'s uninstall-of-disallowed-org already uses.
 
-//! ## Nodes (node identity/idempotency, ahead of its full caller)
+//! ## Nodes (node identity/idempotency, real container execution)
 //!
 //! docs/design/dynamic-pipelines.md's "### Execution model" describes
 //! `ci.container`'s two-step protocol — `step.do("start:" + id)` then
 //! `step.waitForEvent("done:" + id)` — and the idempotency table a
 //! Dynamic Workflow's retried steps need `RunCoordinator` to enforce
-//! around `(run_id, node_id)`. This round builds exactly that table as
-//! new `RunCoordinator` RPCs — [`RunCoordinator::handle_start_node`],
+//! around `(run_id, node_id)`. An earlier round built that table as
+//! `RunCoordinator` RPCs — [`RunCoordinator::handle_start_node`],
 //! [`RunCoordinator::handle_complete_node`],
 //! [`RunCoordinator::handle_ack_node`],
-//! [`RunCoordinator::handle_cancel_run`] — and nothing else. **It does
-//! not build:**
+//! [`RunCoordinator::handle_cancel_run`] — without starting any real
+//! container (`startNode` only created/returned a `node` row). This
+//! round closes exactly that gap:
+//! [`RunCoordinator::handle_start_node`] now starts a real,
+//! per-`node_id` container via a DO-to-DO call into `NodeContainer`
+//! (`crate::node_container`'s own doc comment covers that DO's
+//! synchronous-start/asynchronous-`exec()` split and why it is safe
+//! under `step.do`'s "returns quickly" contract),
+//! [`RunCoordinator::handle_complete_node`] now also receives that real
+//! exit code as `NodeContainer`'s own completion callback (the same
+//! wire shape a caller-supplied completion already used, so no change
+//! to that handler was needed), and
+//! [`RunCoordinator::handle_cancel_run`] now actually stops that
+//! container rather than only flipping a DB flag. **Still not built:**
 //!
 //! - Any Dynamic Workflow integration, Cloudflare Workflows binding, or
 //!   `step.do`/`step.waitForEvent` wiring. That is a separate, much
 //!   larger round; these RPCs are the foundation a future caller would
 //!   use, same "foundation ahead of its full caller" pattern as
 //!   `repo_state`'s and `pull_request_state`'s rounds.
-//! - Any actual container starting. No Executor exists yet; `startNode`
-//!   only creates/returns a `node` row, never a real container.
-//! - Script execution of any kind.
 //! - A redelivery timer. The doc's "the coordinator tracks delivery per
 //!   `(run_id, node_id)` and keeps re-sending until the script
 //!   acknowledges it" needs a DO alarm, similar to this DO's existing
@@ -229,14 +238,39 @@ pub struct CloseRunOutcome {
     pub status: RunStatus,
 }
 
-/// `startNode(run_id, node_id, spec_hash)`'s request (module docs'
-/// Nodes section). `check_name` is carried through to the `node` row
-/// for the future caller's own bookkeeping — this round never creates a
-/// Check Run from it.
+/// `startNode(run_id, node_id, spec_hash, image, command)`'s request
+/// (module docs' Nodes section). `check_name` is carried through to the
+/// `node` row for the future caller's own bookkeeping — this round
+/// never creates a Check Run from it.
+///
+/// **`image`/`command`.** Every node this round is a real container
+/// node (module docs' Nodes section): `image` is the
+/// `durable_object`-scheduling-policy image reference `NodeContainer`
+/// passes to `ContainerStartupOptions::set_image` (`node_container.rs`),
+/// and `command` is the executable followed by its arguments, matching
+/// `Container::exec`'s own `cmd: &[&str]` shape exactly — no shell is
+/// started, so shell syntax is never interpreted.
+///
+/// **`spec_hash` stays caller-supplied, not derived from `image`/
+/// `command`.** `resolve_start_node`'s nondeterministic-replay check
+/// exists to catch a retried `step.do("start:" + id)` whose *entire*
+/// spec changed underneath it (dynamic-pipelines.md: "the SDK rejects a
+/// duplicate id at the call site" for the easy case; this is the harder
+/// "script took a different branch on replay" case) — the eventual
+/// `@cloud-ci/pipeline-sdk` caller's own spec can include fields this
+/// round's RPC does not carry at all yet (secrets requested, runner
+/// size, sidecars). Deriving `spec_hash` here from only `image`/
+/// `command` would silently narrow that check to a subset of what
+/// "spec" means, missing a real replay divergence in any field this
+/// struct doesn't carry. The caller computing and supplying its own
+/// hash over its full spec is the semantics `resolve_start_node`'s doc
+/// comment already assumes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StartNodeRequest {
     pub node_id: String,
     pub spec_hash: String,
+    pub image: String,
+    pub command: Vec<String>,
     #[serde(default)]
     pub check_name: Option<String>,
 }
@@ -375,6 +409,10 @@ struct NodeRow {
     started_at: i64,
     completed_at: Option<i64>,
     acked: i64,
+    image: String,
+    /// JSON-encoded `Vec<String>` (`StartNodeRequest.command`'s on-disk
+    /// form, matching `check_names`' existing JSON-column convention).
+    command: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1493,10 +1531,22 @@ impl RunCoordinator {
         Ok(())
     }
 
-    /// `startNode(run_id, node_id, spec_hash)` — module docs' Nodes
-    /// section, dynamic-pipelines.md's idempotency table's first two
-    /// rows. This round never starts a real container ([`logic::StartNodeDecision::Started`]'s
-    /// doc comment): the "start" here is entirely the `node` row itself.
+    /// `startNode(run_id, node_id, spec_hash, image, command)` — module
+    /// docs' Nodes section, dynamic-pipelines.md's idempotency table's
+    /// first two rows. The node row is created first (so a crash after
+    /// the row write but before the container call still leaves a
+    /// `running` row a redelivered `startNode` can find via
+    /// `StartNodeDecision::AlreadyStarted` — that guard is what stops a
+    /// redelivery from ever calling [`Self::start_node_container`] a
+    /// second time, not a check here), then the real container is
+    /// started via a DO-to-DO call into `NodeContainer`
+    /// (`node_container.rs`). A synchronous container-start failure (bad
+    /// image, scheduling rejection — see that module's `handle_start`)
+    /// is mapped straight to this node's own `failed` status via the
+    /// same [`update_node_status`] `handle_complete_node` itself uses,
+    /// never surfaced as an unhandled 500: the caller's `startNode`
+    /// still returns 200, with `status: "failed"` and a `result`
+    /// explaining why, exactly like any other terminal node outcome.
     async fn handle_start_node(
         &self,
         sql: &SqlStorage,
@@ -1521,6 +1571,11 @@ impl RunCoordinator {
                 "nondeterministic_replay",
             ),
             Ok(logic::StartNodeDecision::AlreadyStarted { status }) => {
+                // Redelivery: never calls `start_node_container` again
+                // (module docs' "Who fails..." note above) — the
+                // existing row and whatever container `NodeContainer`
+                // already started (or already finished) for this
+                // `node_id` are untouched.
                 Response::from_json(&StartNodeOutcome {
                     node_id: req.node_id,
                     started: false,
@@ -1529,15 +1584,34 @@ impl RunCoordinator {
             }
             Ok(logic::StartNodeDecision::Started) => {
                 let now_ms = worker::Date::now().as_millis() as i64;
+                let command_json = serde_json::to_string(&req.command)
+                    .map_err(|e| worker::Error::RustError(format!("cannot encode command: {e}")))?;
                 insert_node(
                     sql,
                     &req.node_id,
                     &req.spec_hash,
                     req.check_name.as_deref(),
+                    &req.image,
+                    &command_json,
                     now_ms,
                 )?;
-                let row = require_node(sql, &req.node_id)?;
                 let run_row = require_run(sql)?;
+
+                if let Err(start_err) = self
+                    .start_node_container(&run_row, &req.node_id, &req.image, &req.command)
+                    .await
+                {
+                    let now_ms = worker::Date::now().as_millis() as i64;
+                    let result = serde_json::json!({ "error": start_err }).to_string();
+                    update_node_status(
+                        sql,
+                        &req.node_id,
+                        logic::NodeState::Failed.as_db_str(),
+                        Some(&result),
+                        now_ms,
+                    )?;
+                }
+                let row = require_node(sql, &req.node_id)?;
                 self.project_node_to_d1(&run_row.id, &row).await?;
                 Response::from_json(&StartNodeOutcome {
                     node_id: req.node_id,
@@ -1631,9 +1705,11 @@ impl RunCoordinator {
     }
 
     /// Minimal run-cancellation hook (module docs' "Run cancellation"):
-    /// moves the run to `RunState::Cancelled` and marks every
-    /// non-terminal node `Cancelled`. No RPC set a run to `Cancelled`
-    /// before this round existed to need it.
+    /// moves the run to `RunState::Cancelled`, marks every non-terminal
+    /// node `Cancelled`, and actually stops that node's real container
+    /// via [`Self::stop_node_container`] — "Coordinator stops
+    /// containers, marks nodes `cancelled`...", not just a DB flag flip
+    /// while a real container keeps running unsupervised.
     async fn handle_cancel_run(&self, sql: &SqlStorage) -> worker::Result<Response> {
         let Some(run_row) = read_run(sql)? else {
             return error_response(404, "run not found");
@@ -1656,6 +1732,7 @@ impl RunCoordinator {
 
         let now_ms = worker::Date::now().as_millis() as i64;
         for node_id in &to_cancel {
+            self.stop_node_container(node_id).await;
             mark_node_cancelled(sql, node_id, now_ms)?;
             let row = require_node(sql, node_id)?;
             self.project_node_to_d1(&run_row.id, &row).await?;
@@ -1670,6 +1747,99 @@ impl RunCoordinator {
             run_id: run_row.id,
             cancelled_nodes: to_cancel,
         })
+    }
+
+    /// Starts `node_id`'s real container via a DO-to-DO call into
+    /// `NodeContainer` (`node_container.rs`), addressed by `node_id` so
+    /// a redelivered start naturally lands on the same container-backed
+    /// instance (defense in depth alongside this DO's own
+    /// `StartNodeDecision::AlreadyStarted` guard, which already stops a
+    /// second call from ever reaching this function). `NodeContainer`'s
+    /// own `/start` only *starts* the container and returns; the real
+    /// `exec()` and its exit code are reported back asynchronously to
+    /// `/complete-node` (see that module's doc comment for why this is
+    /// a background task, not a synchronous wait, matching
+    /// dynamic-pipelines.md's "step.do ... returns quickly" contract).
+    /// `Err` here means the container itself failed to *start* (bad
+    /// image, Docker/runtime error) — a real failure
+    /// [`Self::handle_start_node`] maps straight to the node's own
+    /// `failed` status, never an unhandled 500.
+    async fn start_node_container(
+        &self,
+        run_row: &RunRow,
+        node_id: &str,
+        image: &str,
+        command: &[String],
+    ) -> Result<(), String> {
+        let run_do_name = do_name(
+            run_row.repo_id as u64,
+            &run_row.sha,
+            &run_row.run_key,
+            run_row.attempt as u32,
+        );
+        let namespace = self
+            .env
+            .durable_object(crate::node_container::NODE_CONTAINER_BINDING)
+            .map_err(|e| format!("node container namespace unavailable: {e}"))?;
+        let id = namespace
+            .id_from_name(node_id)
+            .map_err(|e| format!("node container id error: {e}"))?;
+        let stub = id
+            .get_stub()
+            .map_err(|e| format!("node container stub error: {e}"))?;
+
+        let encoded = serde_json::to_string(&serde_json::json!({
+            "run_do_name": run_do_name,
+            "node_id": node_id,
+            "image": image,
+            "command": command,
+        }))
+        .map_err(|e| format!("cannot encode node-container start request: {e}"))?;
+        let mut init = RequestInit::new();
+        init.with_method(Method::Post)
+            .with_body(Some(JsValue::from_str(&encoded)));
+        let request =
+            Request::new_with_init("https://node-container.cloud-ci.internal/start", &init)
+                .map_err(|e| format!("cannot build node-container start request: {e}"))?;
+        let mut response = stub
+            .fetch_with_request(request)
+            .await
+            .map_err(|e| format!("node container fetch failed: {e}"))?;
+        match response.status_code() {
+            200..=299 => Ok(()),
+            status => {
+                let detail = response.text().await.unwrap_or_default();
+                Err(format!("node container rejected start: {status} {detail}"))
+            }
+        }
+    }
+
+    /// Stops `node_id`'s real container via a DO-to-DO call into
+    /// `NodeContainer`'s `/stop` — [`Self::handle_cancel_run`]'s only
+    /// caller. Best-effort, degrade-and-log on any failure (unreachable
+    /// DO, container already gone): blocking the whole run's
+    /// cancellation on one node's container failing to stop would leave
+    /// the run stuck cancelling forever, the same degrade-and-log
+    /// posture `check_run_auth`'s callers already use for GitHub API
+    /// failures.
+    async fn stop_node_container(&self, node_id: &str) {
+        let result: worker::Result<()> = async {
+            let namespace = self
+                .env
+                .durable_object(crate::node_container::NODE_CONTAINER_BINDING)?;
+            let id = namespace.id_from_name(node_id)?;
+            let stub = id.get_stub()?;
+            let mut init = RequestInit::new();
+            init.with_method(Method::Post);
+            let request =
+                Request::new_with_init("https://node-container.cloud-ci.internal/stop", &init)?;
+            stub.fetch_with_request(request).await?;
+            Ok(())
+        }
+        .await;
+        if let Err(e) = result {
+            worker::console_log!("cancel_run: stop container for node {node_id} failed: {e}");
+        }
     }
 
     async fn project_run_to_d1(&self, row: &RunRow) -> worker::Result<()> {
@@ -1890,8 +2060,8 @@ impl RunCoordinator {
     async fn project_node_to_d1(&self, run_id: &str, row: &NodeRow) -> worker::Result<()> {
         let db = self.env.d1("DB")?;
         db.prepare(
-            "INSERT INTO nodes (run_id, node_id, spec_hash, status, check_name, result, started_at, completed_at, acked) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+            "INSERT INTO nodes (run_id, node_id, spec_hash, status, check_name, result, started_at, completed_at, acked, image, command) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
              ON CONFLICT (run_id, node_id) DO UPDATE SET \
                status = excluded.status, \
                result = excluded.result, \
@@ -1913,6 +2083,8 @@ impl RunCoordinator {
             row.completed_at
                 .map_or(JsValue::NULL, |v| JsValue::from_f64(v as f64)),
             JsValue::from_f64(row.acked as f64),
+            JsValue::from_str(&row.image),
+            JsValue::from_str(&row.command),
         ])?
         .run()
         .await?;
@@ -2304,7 +2476,9 @@ fn ensure_schema(sql: &SqlStorage) -> worker::Result<()> {
             result TEXT, \
             started_at INTEGER NOT NULL, \
             completed_at INTEGER, \
-            acked INTEGER NOT NULL DEFAULT 0 \
+            acked INTEGER NOT NULL DEFAULT 0, \
+            image TEXT NOT NULL DEFAULT '', \
+            command TEXT NOT NULL DEFAULT '[]' \
         )",
         None,
     )?;
@@ -2934,8 +3108,7 @@ fn update_check_run_state(
 // Nodes (`startNode`/completion/`ack`, module docs' Nodes section)
 // ---------------------------------------------------------------------------
 
-const NODE_COLUMNS: &str =
-    "node_id, spec_hash, status, check_name, result, started_at, completed_at, acked";
+const NODE_COLUMNS: &str = "node_id, spec_hash, status, check_name, result, started_at, completed_at, acked, image, command";
 
 fn read_node(sql: &SqlStorage, node_id: &str) -> worker::Result<Option<NodeRow>> {
     let rows: Vec<NodeRow> = sql
@@ -2959,21 +3132,26 @@ fn read_all_nodes(sql: &SqlStorage) -> worker::Result<Vec<NodeRow>> {
         .to_array()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn insert_node(
     sql: &SqlStorage,
     node_id: &str,
     spec_hash: &str,
     check_name: Option<&str>,
+    image: &str,
+    command_json: &str,
     started_at_ms: i64,
 ) -> worker::Result<()> {
     sql.exec(
-        "INSERT INTO node (node_id, spec_hash, status, check_name, started_at) \
-         VALUES (?1, ?2, 'running', ?3, ?4)",
+        "INSERT INTO node (node_id, spec_hash, status, check_name, started_at, image, command) \
+         VALUES (?1, ?2, 'running', ?3, ?4, ?5, ?6)",
         vec![
             SqlStorageValue::from(node_id),
             SqlStorageValue::from(spec_hash),
             SqlStorageValue::from(check_name.map(str::to_string)),
             SqlStorageValue::try_from_i64(started_at_ms)?,
+            SqlStorageValue::from(image),
+            SqlStorageValue::from(command_json),
         ],
     )?;
     Ok(())

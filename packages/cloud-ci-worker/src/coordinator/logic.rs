@@ -666,14 +666,15 @@ pub struct ExistingNode {
 /// been looked up by `node_id`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartNodeDecision {
-    /// No row existed for this `node_id` yet: create one and start the
-    /// node for real. (This round: just the row — see module docs.)
+    /// No row existed for this `node_id` yet: create the row and start
+    /// the node's real container (`coordinator::mod`'s
+    /// `start_node_container`, backed by `node_container.rs`).
     Started,
     /// A row already exists with the same spec hash: per
     /// "`startNode` retried after the container already started ->
     /// returns the existing node; never starts a second container",
-    /// this is the idempotent replay path. Never starts anything a
-    /// second time, including this round's row-only "start".
+    /// this is the idempotent replay path. The caller never calls
+    /// `start_node_container` again for this decision.
     AlreadyStarted { status: NodeState },
 }
 
@@ -787,6 +788,22 @@ pub fn nodes_to_cancel(nodes: &[(String, NodeState)]) -> Vec<String> {
         .filter(|(_, status)| !status.is_terminal())
         .map(|(id, _)| id.clone())
         .collect()
+}
+
+/// Maps a real container's exit code to the node's terminal status —
+/// `node_container.rs`'s `run_and_report` uses this to decide
+/// `completeNode`'s `status` once `exec()` resolves: `0` is
+/// `Succeeded`, anything else is `Failed`. A container that fails to
+/// even *start* (bad image, Docker/runtime error) never reaches this
+/// function at all — that is `start_node_container`'s own `Err` path,
+/// mapped to `Failed` directly (`coordinator::mod`'s `handle_start_node`),
+/// since there is no exit code to map in that case.
+pub fn node_status_for_exit_code(exit_code: u32) -> NodeState {
+    if exit_code == 0 {
+        NodeState::Succeeded
+    } else {
+        NodeState::Failed
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1635,6 +1652,18 @@ mod tests {
             nodes_to_cancel(&nodes),
             vec!["pending-node".to_string(), "running-node".to_string()]
         );
+    }
+
+    #[test]
+    fn node_status_for_exit_code_maps_zero_to_succeeded() {
+        assert_eq!(node_status_for_exit_code(0), NodeState::Succeeded);
+    }
+
+    #[test]
+    fn node_status_for_exit_code_maps_any_nonzero_to_failed() {
+        for code in [1, 2, 127, 255] {
+            assert_eq!(node_status_for_exit_code(code), NodeState::Failed);
+        }
     }
 
     #[test]

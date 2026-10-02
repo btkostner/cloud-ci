@@ -6,6 +6,7 @@ pub mod github_app;
 pub mod github_checks;
 pub mod ingest_token;
 pub mod installations;
+pub mod node_container;
 pub mod oauth;
 pub mod oidc;
 pub mod pr_comment;
