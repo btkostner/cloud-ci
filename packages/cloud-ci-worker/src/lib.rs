@@ -2,6 +2,7 @@ pub mod connect;
 pub mod coordinator;
 pub mod github_app;
 pub mod ingest_token;
+pub mod oidc;
 pub mod ulid;
 pub mod webhook;
 
