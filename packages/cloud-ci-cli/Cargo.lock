@@ -193,6 +193,7 @@ dependencies = [
  "clap",
  "cloud-ci-core",
  "cloud-ci-proto",
+ "getrandom",
  "glob",
  "serde",
  "serde_json",

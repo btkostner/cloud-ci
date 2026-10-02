@@ -59,13 +59,13 @@ pub struct Cli {
 }
 
 /// `cloud-ci setup allowed-orgs --add <login> | --remove <login> [--file
-/// <path>] [--deploy]`, per `docs/design/auth.md`'s "Org allowlist
-/// changes" paragraph. This is the only `setup` subcommand this round:
-/// `setup github-app` (architecture.md's package table lists it alongside
-/// `setup allowed-orgs`) needs a real browser + GitHub App manifest flow
-/// that does not exist yet, so it is intentionally omitted rather than
-/// stubbed — a `Setup` variant with only one working leaf is simpler than
-/// a `Setup` variant with a leaf that errors out on use.
+/// <path>] [--deploy]` and `cloud-ci setup github-app --allowed-orgs
+/// <logins> --deployment-url <url> [--public] --cloudflare-account-id
+/// <id> --secrets-store-id <id> [--deploy]`, per `docs/design/auth.md`'s
+/// "Org allowlist changes" paragraph and "### GitHub App setup" sequence
+/// diagram respectively. See `GithubAppArgs`' doc comment for the one
+/// piece of that diagram this CLI cannot drive (a human approving app
+/// creation in a real browser).
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Upload reports/sites for one job/shard of an external (BYO) CI run.
@@ -84,14 +84,18 @@ pub enum Command {
     Setup(SetupCommand),
 }
 
-/// `cloud-ci setup <subcommand>`. Only `allowed-orgs` exists this round —
-/// see `AllowedOrgsArgs`' doc comment for why `setup github-app` is not
-/// here yet.
+/// `cloud-ci setup <subcommand>`: `allowed-orgs` (above) and `github-app`
+/// (below).
 #[derive(Debug, Subcommand)]
 pub enum SetupCommand {
     /// Add or remove a login from the deployed `GITHUB_ALLOWED_ORGS`
     /// allowlist in `wrangler.toml`.
     AllowedOrgs(AllowedOrgsArgs),
+    /// Register this deployment's GitHub App via the manifest flow and
+    /// write its credentials/config to `wrangler.toml`. See
+    /// `GithubAppArgs`' doc comment for the full flow and its one
+    /// un-drivable step.
+    GithubApp(GithubAppArgs),
 }
 
 /// `cloud-ci setup allowed-orgs (--add <login> | --remove <login>)
@@ -151,6 +155,107 @@ pub struct AllowedOrgsArgs {
     /// every invoker to already be running from the repo root, same as
     /// `--file`'s own default below) after a successful file edit. Off
     /// by default; see `AllowedOrgsArgs`' doc comment for why.
+    #[arg(long)]
+    pub deploy: bool,
+}
+
+/// `cloud-ci setup github-app --name <app-name> --allowed-orgs <logins>
+/// --deployment-url <url> [--public] [--port <port>]
+/// [--timeout-secs <secs>] --cloudflare-account-id <id>
+/// --secrets-store-id <id> [--file <path>] [--deploy]`, per
+/// `docs/design/auth.md`'s "### GitHub App setup" sequence diagram.
+///
+/// # One genuinely un-drivable step
+///
+/// Every step of that diagram runs for real from this command *except*
+/// `Op->>GH: confirm app creation` — a human clicking "Create GitHub App"
+/// on a real `github.com` page, in their own authenticated browser
+/// session. This command opens that page (`--deployment-url`'s manifest,
+/// auto-submitted via a local HTML form — see
+/// `crate::setup_github_app::build_manifest_form_html`) and then blocks
+/// on its own loopback listener for GitHub's redirect; nothing after the
+/// browser opens is observable or testable from this process until that
+/// redirect arrives.
+///
+/// # `--public` is the operator's own call, never auto-detected
+///
+/// auth.md's "Multiple orgs and installations" section: a private App
+/// "can only be installed on the account that owns the app", so serving
+/// orgs that are not all under one GitHub Enterprise account requires
+/// making the App public. This command has no way to know whether the
+/// deployer's orgs share one Enterprise account, so it never guesses —
+/// `public` in the manifest is `false` unless `--public` is passed
+/// explicitly.
+///
+/// # `--deploy` is opt-in, same convention as `AllowedOrgsArgs::deploy`
+///
+/// See that field's doc comment for the reasoning; this command follows
+/// it identically.
+///
+/// # Cloudflare credentials
+///
+/// `--cloudflare-account-id`/`--secrets-store-id` name an *existing*
+/// account and Secrets Store (`wrangler secrets-store store create`
+/// creates the store itself — out of scope here, auth.md's diagram only
+/// has this command create secrets *inside* one). The Cloudflare API
+/// token itself is read from the `CLOUDFLARE_API_TOKEN` environment
+/// variable — the same credential `wrangler` itself already uses — never
+/// a CLI flag, so it never ends up in shell history or a process list.
+#[derive(Debug, Parser)]
+pub struct GithubAppArgs {
+    /// The GitHub App's display name, passed through to the manifest's
+    /// `name` field verbatim (auth.md's example: `"cloud-ci (acme)"`).
+    #[arg(long)]
+    pub name: String,
+
+    /// Comma-separated GitHub org (or user account) logins allowed to
+    /// install this App, written to `GITHUB_ALLOWED_ORGS` before the
+    /// manifest is ever sent — auth.md: "the allowlist check on
+    /// `installation.created` needs it in place from the deployment that
+    /// first registers the App".
+    #[arg(long)]
+    pub allowed_orgs: String,
+
+    /// This deployment's public URL — the manifest's `url` field, and
+    /// `hook_attributes.url` with `/webhooks/github` appended.
+    #[arg(long)]
+    pub deployment_url: String,
+
+    /// Flip the manifest's `public` field to `true`. See this struct's
+    /// doc comment for why this is never inferred.
+    #[arg(long)]
+    pub public: bool,
+
+    /// Port for the loopback listener that receives GitHub's
+    /// manifest-flow redirect. Defaults to an OS-assigned ephemeral port.
+    #[arg(long)]
+    pub port: Option<u16>,
+
+    /// How long to wait for the operator to confirm app creation in their
+    /// browser before giving up. GitHub's own window is one hour
+    /// (auth.md: "All three steps must complete within one hour of the
+    /// manifest POST"), but a CLI session blocking for up to an hour by
+    /// default is impractical; this defaults to 10 minutes.
+    #[arg(long, default_value_t = 600)]
+    pub timeout_secs: u64,
+
+    /// Cloudflare account id owning the Secrets Store the four secrets
+    /// are created in.
+    #[arg(long)]
+    pub cloudflare_account_id: String,
+
+    /// Id of an existing Cloudflare Secrets Store to create the four
+    /// secrets in.
+    #[arg(long)]
+    pub secrets_store_id: String,
+
+    /// Path to the `wrangler.toml` to edit. Same default/reasoning as
+    /// `AllowedOrgsArgs::file`.
+    #[arg(long, default_value = "packages/cloud-ci-worker/wrangler.toml")]
+    pub file: std::path::PathBuf,
+
+    /// Run `wrangler deploy --config <file>` after writing
+    /// `wrangler.toml`. Off by default; see this struct's doc comment.
     #[arg(long)]
     pub deploy: bool,
 }

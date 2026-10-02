@@ -5,6 +5,7 @@ mod identity;
 mod lint;
 mod scope;
 mod setup;
+mod setup_github_app;
 mod split;
 mod upload;
 
@@ -54,5 +55,14 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Command::Setup(SetupCommand::GithubApp(args)) => {
+            match setup_github_app::run_github_app(&args) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    eprintln!("cloud-ci setup github-app: {err}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
     }
 }
