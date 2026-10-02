@@ -79,6 +79,55 @@ pub fn mint(
     Ok(format!("{payload_b64}.{signature_b64}"))
 }
 
+/// Claims extracted from a successfully verified ingest token — only what
+/// callers outside this module need (docs/design/byo-ci.md "Security
+/// considerations": "a part PUT without a valid token for the owning run's
+/// `repo_id` is rejected before touching R2").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedClaims {
+    pub repo_id: u64,
+    pub run_id: String,
+}
+
+/// Verifies an ingest token minted by [`mint`]: re-derives the HMAC over the
+/// payload segment (constant-time compare), checks `typ`/`scope`, and
+/// rejects an expired token. `now_unix_s` is a parameter for the same
+/// determinism/testability reason as [`mint`]'s.
+pub fn verify(secret: &[u8], token: &str, now_unix_s: u64) -> Result<VerifiedClaims, TokenError> {
+    let (payload_b64, signature_b64) = token
+        .split_once('.')
+        .ok_or_else(|| TokenError("malformed ingest token".to_string()))?;
+
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret)
+        .map_err(|e| TokenError(format!("invalid HMAC key: {e}")))?;
+    mac.update(payload_b64.as_bytes());
+    let expected_signature_b64 = base64_url_encode(&mac.finalize().into_bytes());
+    if expected_signature_b64 != signature_b64 {
+        return Err(TokenError("ingest token signature mismatch".to_string()));
+    }
+
+    use base64::Engine as _;
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_b64)
+        .map_err(|e| TokenError(format!("cannot decode ingest token payload: {e}")))?;
+    let claims: IngestClaims = serde_json::from_slice(&payload)
+        .map_err(|e| TokenError(format!("cannot decode ingest token claims: {e}")))?;
+
+    if claims.typ != "ingest" || !claims.scope.iter().any(|s| s == "ingest:write") {
+        return Err(TokenError(
+            "ingest token missing ingest:write scope".to_string(),
+        ));
+    }
+    if claims.exp <= now_unix_s {
+        return Err(TokenError("ingest token expired".to_string()));
+    }
+
+    Ok(VerifiedClaims {
+        repo_id: claims.repo_id,
+        run_id: claims.run_id,
+    })
+}
+
 fn base64_url_encode(bytes: &[u8]) -> String {
     use base64::Engine as _;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
@@ -132,5 +181,50 @@ mod tests {
         assert_eq!(claims.run_id, "run-x");
         assert_eq!(claims.exp, 1_000 + INGEST_TOKEN_TTL_SECONDS);
         Ok(())
+    }
+
+    #[test]
+    fn verify_accepts_a_freshly_minted_token() -> Result<(), TokenError> {
+        let token = mint(b"test-secret", 42, "run-x", 1_000)?;
+        let claims = verify(b"test-secret", &token, 1_000)?;
+        assert_eq!(
+            claims,
+            VerifiedClaims {
+                repo_id: 42,
+                run_id: "run-x".to_string(),
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn verify_rejects_wrong_secret() -> Result<(), TokenError> {
+        let token = mint(b"test-secret", 42, "run-x", 1_000)?;
+        assert!(verify(b"wrong-secret", &token, 1_000).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn verify_rejects_expired_token() -> Result<(), TokenError> {
+        let token = mint(b"test-secret", 42, "run-x", 1_000)?;
+        let after_expiry = 1_000 + INGEST_TOKEN_TTL_SECONDS + 1;
+        assert!(verify(b"test-secret", &token, after_expiry).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn verify_rejects_tampered_payload() -> Result<(), TokenError> {
+        let token = mint(b"test-secret", 42, "run-x", 1_000)?;
+        let (_, sig) = token
+            .split_once('.')
+            .ok_or(TokenError("bad token".to_string()))?;
+        let tampered = format!("{}.{sig}", base64_url_encode(b"{\"typ\":\"ingest\"}"));
+        assert!(verify(b"test-secret", &tampered, 1_000).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn verify_rejects_malformed_token_with_no_dot() {
+        assert!(verify(b"test-secret", "not-a-token", 1_000).is_err());
     }
 }

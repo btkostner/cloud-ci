@@ -296,10 +296,7 @@ pub fn worst_conclusion(a: Conclusion, b: Conclusion) -> Conclusion {
 /// never happens in practice — `shard_total` is always at least 1 — but is
 /// expressed rather than panicking on an empty slice.
 pub fn job_conclusion_from_shards(shard_conclusions: &[Conclusion]) -> Option<Conclusion> {
-    shard_conclusions
-        .iter()
-        .copied()
-        .reduce(worst_conclusion)
+    shard_conclusions.iter().copied().reduce(worst_conclusion)
 }
 
 #[cfg(test)]
