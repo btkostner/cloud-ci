@@ -59,7 +59,7 @@ await ci.shard("test", {
   check: test,
   files: "tests/**/*.spec.ts",
   failFast: false,                // cancel remaining shards on first failure
-  run: 'npx playwright test --shard={{ shard.index }}/{{ shard.total }} --reporter=blob',
+  run: ({ shard, shards }) => `npx playwright test --shard=${shard}/${shards} --reporter=blob`,
   reports: [{ type: "playwright-blob", path: "blob-report/", merge: "html" }],
   merge: { runner: "basic" },     // instance type for the generated merge node; default basic
 });
@@ -71,7 +71,7 @@ await ci.shard("test", {
 | --- | --- | --- | --- |
 | `split` | `"timing"` \| `"file"` \| `"count"` | required | strategy `cloud-ci split` uses |
 | `count` | int `1..64`, or `{ min, max, target }` | required | fixed shard count, or an auto-sizing spec (`min`/`max` bounds, `target` wall-time duration); no global default, every call sets its own |
-| `files` | glob or glob[] | required when `split` is `"file"` or `"timing"` | universe of files to divide; exposed to every shard's `run` as `{{ files }}` |
+| `files` | glob or glob[] | required when `split` is `"file"` or `"timing"` | universe of files to divide; each shard's `run` function receives its share as `files` |
 | `failFast` | bool | `false` | cancel the remaining shards in the group on the first shard failure |
 | `runner` | same shapes as `ci.container`'s `runner` ([dynamic-pipelines](./dynamic-pipelines.md), [ADR 0010](../adr/0010-pluggable-executors.md)) | settings.yml `runners.default` | runner for each shard container |
 | `check` | a `ci.check(...)` result, or `null` | `null` | check every shard attaches to; `null` means no check run ([dynamic-pipelines](./dynamic-pipelines.md)'s GitHub status checks model: checks are opt-in, not always-on) |
@@ -80,26 +80,27 @@ await ci.shard("test", {
 | `merge.command` | string | generated | overrides the generated merge command entirely |
 
 The engine always computes the split behind the scenes — a managed shard's `run` command never
-calls `cloud-ci split` or shells out to assemble its own file list. Instead, `run` is rendered as a
-MiniJinja template (the same `{{ }}` syntax used for check names and upload paths elsewhere) with
-`{{ shard.index }}` (1-based), `{{ shard.total }}`, and `{{ files }}` (this shard's assigned file
-list) in scope, in addition to the usual job env.
+calls `cloud-ci split` or shells out to assemble its own file list. Instead, `run` is a function
+`({ shard, shards, files }) => string` that the engine calls once per shard: `shard` is the
+1-based index, `shards` is the total, and `files` is this shard's assigned file list. The job env
+still applies to the command it returns. A plain string is also accepted when the command does
+not depend on the shard.
 
 For frameworks with native sharding (Playwright, Vitest), `split: "file"` with
-`--shard={{ shard.index }}/{{ shard.total }}` is equivalent to cloud-ci computing a round-robin
-file assignment — the worker still computes `{{ files }}` for the shard, but the command can
-ignore it and use the native flag instead.
+`--shard=${shard}/${shards}` is equivalent to cloud-ci computing a round-robin file assignment —
+the engine still computes `files` for the shard, but the command can ignore it and use the native
+flag instead.
 
 `split: "timing"` and `split: "count"` matter most for frameworks without native sharding
 (`go test`, `cargo test`, `mocha`) or when a framework's native sharding doesn't account for
-historical duration. In that case the shard's `run` command uses `{{ files }}` directly:
+historical duration. In that case the shard's `run` function uses `files` directly:
 
 ```ts
 await ci.shard("unit", {
   split: "timing",
   count: { min: 2, max: 8, target: "5m" },
   files: ["**/*_test.go"],
-  run: 'cargo nextest run {{ files | join(" ") }}',
+  run: ({ files }) => `cargo nextest run ${files.join(" ")}`,
 });
 ```
 
@@ -332,7 +333,7 @@ explicitly-configured JSON/JUnit reporter output is re-uploaded for history.
   automatic retry path. A shard that fails for any other reason (non-zero exit, assertion failure,
   timeout) is terminal immediately — cloud-ci does not retry flaky test failures on its own.
 - An OOM retry reuses the exact same `shard_plan` entry for that index (same file/test list) and
-  the same `{{ shard.index }}`/`{{ shard.total }}` values — only the instance size changes.
+  the same `shard`/`shards` arguments to `run` — only the instance size changes.
   `shard_state.attempt` becomes `2` to record that it happened.
 - If the retried shard OOMs again at the new size, it fails for good, reporting the configured
   `max` and measured peak, exactly as a non-sharded `runner: "auto"` node would
@@ -474,12 +475,12 @@ sequenceDiagram
     RC->>RC: compute shard_plan (LPT bin-pack or fallback)
     RC->>D1: persist shard_plan, shard_state (queued)
     par Shard 1
-        RC->>S1: dispatch (shard.index=1, files templated into run, token scoped to shards/1/*)
+        RC->>S1: dispatch (shard=1, run({ shard, shards, files }), token scoped to shards/1/*)
         S1->>R2: upload shards/1/report (blob or native)
         S1->>Worker: ingest terminal status
         Worker->>RC: shard 1 terminal
     and Shard 2
-        RC->>S2: dispatch (shard.index=2, files templated into run, token scoped to shards/2/*)
+        RC->>S2: dispatch (shard=2, run({ shard, shards, files }), token scoped to shards/2/*)
         S2->>R2: upload shards/2/report
         S2->>Worker: ingest terminal status
         Worker->>RC: shard 2 terminal

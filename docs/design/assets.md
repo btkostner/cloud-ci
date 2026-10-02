@@ -309,7 +309,7 @@ report.
 
 **URLs and aliases.** The report is a normal `site` from the serving path's point of view:
 pinned per-run URL (`https://s-<artifact id>.assets.example.com/` or `/s/<artifact_id>/` on the
-shared host) and alias rows in `asset_aliases` with the reserved label `cloud-ci-run:{{ pipeline }}`
+shared host) and alias rows in `asset_aliases` with the reserved label `cloud-ci-run:<pipeline>`
 for the latest report of a pipeline on a PR or branch. Alias rows point at the artifact, not at a
 generation, so a regeneration does not need an alias update.
 

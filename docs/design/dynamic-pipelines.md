@@ -165,7 +165,7 @@ per task, using the `turbo.checkPerTask` helper:
 ```ts
 const packageTests = turbo.checkPerTask(ci, graph, {
   task: "test",
-  name: "{{ package }}#test",
+  name: ({ package: pkg }) => `${pkg}#test`,
   required: true,
 });
 
@@ -177,8 +177,8 @@ await turbo.execute(ci, graph, {
 ```
 
 `turbo.checkPerTask` walks `graph` for nodes matching `task`, creates one `ci.check` per distinct
-package the first time it sees that package (named by filling the `{{ package }}` MiniJinja
-template, e.g. `package1#test`, `package2#test`), and returns a lookup function that
+package the first time it sees that package (named by calling `name` with the node, e.g.
+`package1#test`, `package2#test`), and returns a lookup function that
 `turbo.execute`'s `check` callback uses to map each node to its package's check. Because `graph` is
 already resolved by `turbo.plan`, the full set of packages — and so the full set of checks — is
 known up front. `turbo.checkPerTask` can call `check.seal()` on each check after it attaches that
@@ -216,8 +216,8 @@ Sharding is a library helper, not a core primitive — it reuses the same determ
 algorithm as `cloud-ci split` ([parallelization](./parallelization.md)). `ci.shard` takes a
 required `split` strategy (`"timing"`, `"file"`, or `"count"`) and a required count spec (a plain
 integer, or `{ min, max, target }`); the engine resolves the actual shard count and per-shard file
-assignment and gives each shard container a `{{ files }}` template variable (a list), plus
-`{{ shard.index }}` and `{{ shard.total }}` — no shell glue in `run`, just MiniJinja templating.
+assignment, then calls the `run` function once per shard with `{ shard, shards, files }` — no
+shell glue and no template syntax in `run`, just a TypeScript function that returns the command.
 
 A migration-backed suite only needs to migrate the database once. Run the migration as a plain
 `ci.container` with its own `postgres` sidecar, snapshot that sidecar's data volume once the
@@ -248,7 +248,7 @@ const shards = await ci.shard("e2e", {
   sidecars: {
     postgres: { image: "postgres:17", from: pgSnapshot, ready: "tcp:5432" },
   },
-  run: 'npx playwright test {{ files | join(" ") }} --reporter=blob',
+  run: ({ files }) => `npx playwright test ${files.join(" ")} --reporter=blob`,
   reports: [{ type: "playwright-blob", merge: "html" }],
   check: test,
 });
@@ -360,7 +360,7 @@ Without this split, a PR could edit its own script to request a production secre
 | --- | --- |
 | `turbo.plan(ci, opts)` | Runs `turbo run <tasks> --dry=json` in a container; returns a graph of `taskId`, `package`, `task`, `hash`, `outputs`, `dependencies` (fields per turborepo.dev/docs/reference/run, checked 2026-10-01) |
 | `turbo.execute(ci, graph, opts)` | Dependency-ordered fan-out with cache-hit skipping and bounded concurrency (above) |
-| `turbo.checkPerTask(ci, graph, opts)` | Creates and memoizes one `ci.check` per distinct value of a grouping key (default `package`) among a task's nodes, named via a MiniJinja template like `"{{ package }}#test"`; returns a lookup function for `turbo.execute`'s `check` callback (see [One check per package](#one-check-per-package)) |
+| `turbo.checkPerTask(ci, graph, opts)` | Creates and memoizes one `ci.check` per distinct value of a grouping key (default `package`) among a task's nodes, named by a `name` function like `` ({ package: pkg }) => `${pkg}#test` ``; returns a lookup function for `turbo.execute`'s `check` callback (see [One check per package](#one-check-per-package)) |
 | `mise.plan(ci, opts)` | Same for mise tasks `[unverified: mise's machine-readable graph command and format]` |
 | `graph.fromJson(nodes)` | Builds cloud-ci's generic graph from an array already in cloud-ci's own node shape (`{ id, package, task, hash, dependencies, outputs }`); the primitive `turbo.plan`/`mise.plan` call internally after parsing their own tool's output |
 | `graph.fromGraph(rawNodes, mapFn)` | Escape hatch for tools without a built-in integration module (Nx, Bazel, Pants, a custom script that prints JSON): calls `mapFn` over each of the other tool's own raw nodes to produce cloud-ci's node shape, then `graph.fromJson`s the result. Parsing the other tool's output format is the caller's job via `mapFn` — cloud-ci does not understand Nx/Bazel/Pants output itself |
@@ -442,8 +442,8 @@ checks directly.
   success.
 - Nodes with `check: null` (or omitted) report no check run; they still appear in the PR comment
   and dashboard — this is how a noisy check stays hidden without losing visibility elsewhere.
-- Check names are MiniJinja templates (e.g. `"{{ pipeline }}/build"`) rendered in pipeline
-  code; there is no settings.yml name template.
+- Check names are plain strings built in TypeScript (e.g. `` `${pipeline}/build` ``); there is no
+  template syntax and no settings.yml name template.
 
 Naming a required check after a discovered task is unsafe: if the task leaves the graph, GitHub
 waits forever for it. `required` only drives documentation and dashboard warnings; GitHub branch
@@ -504,13 +504,17 @@ A pipeline file can declare a concurrency group and whether a newer run in that 
 cancel one already in flight:
 
 ```ts
-export const concurrency = { group: "{{ ref }}", cancelSuperseded: true };
+export const concurrency = {
+  group: ({ event }) => event.ref,
+  cancelSuperseded: true,
+};
 ```
 
 Discovery reads this export the same way it reads `on` — without calling `run` — so the
 coordinator knows the group and cancellation policy before starting the Workflow instance.
-`group` is a MiniJinja template rendered against the triggering event (`{{ ref }}`,
-`{{ pull_request.number }}`, ...); two runs of the same pipeline file with the same rendered group
+`group` is a function `(ctx) => string` that gets the same read-only context as `on(ctx)` and runs
+in the same sandbox; a plain string is also accepted. Two runs of the same pipeline file with the
+same group string
 serialize, and if `cancelSuperseded` is true, a newer run cancels the older one in the group (same
 cancellation behavior as a manual [rerun](#reruns)). This is per-pipeline-file policy: it narrows
 execution within a run, never the repo-wide caps. Those caps —
