@@ -75,7 +75,7 @@
 //! not, so `SameSite=Lax` alone is the mitigation — no double-submit
 //! token adds anything a cross-site attacker could otherwise forge here.
 //!
-//! This section only claims to defeat cross-*origin* forged requests —
+//! This section only claims to defeat cross-*site* forged requests —
 //! it says nothing about, and is not a defense against, session-cookie
 //! theft (XSS, log leakage: auth.md's threat-model table row 1 covers
 //! that, via this cookie's `HttpOnly`/`Secure` attributes, both set by
