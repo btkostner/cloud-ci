@@ -1,3 +1,4 @@
+pub mod api_tokens;
 pub mod connect;
 pub mod coordinator;
 pub mod github_app;
@@ -121,19 +122,19 @@ async fn route(
     }
 }
 
-/// # Auth (docs/design/byo-ci.md § Auth)
+/// # Auth (docs/design/auth.md § "Machine auth", "Scoped API tokens")
 ///
 /// `BeginRun` is the only call that authenticates with something other
-/// than an ingest token. Two credential shapes are valid per that doc —
-/// GitHub Actions OIDC JWT, and a scoped API token for non-GitHub-Actions
-/// CI systems — but only the OIDC path is implemented; the scoped-API-
-/// token path has no `api_tokens` table or issuance flow yet. So the
-/// credential check here is intentionally partial:
+/// than an ingest token. Two credential shapes are valid — a GitHub
+/// Actions OIDC JWT, or a scoped API token for non-GitHub-Actions CI
+/// systems — and presenting one of them is now **mandatory**:
 ///
-/// - **No `Authorization` header at all**: proceeds exactly as before
-///   this round, with no identity check whatsoever. This is a real,
-///   temporary gap — unauthenticated BYO-CI ingest is possible until the
-///   scoped-API-token path exists — not something silently papered over.
+/// - **No `Authorization` header at all**: rejected with
+///   `Code::Unauthenticated` before anything else runs — no Durable
+///   Object is touched, no run is created, no token is minted. Earlier
+///   rounds proceeded unauthenticated here as a documented temporary
+///   gap; now that both credential paths exist (OIDC above, scoped API
+///   tokens via [`api_tokens`]), that gap is closed for real.
 /// - **Bearer value present and JWT-shaped** (three dot-separated
 ///   segments, [`oidc::looks_like_jwt`]): treated as a GitHub Actions
 ///   OIDC JWT and fully verified ([`oidc::verify`]: issuer/audience/
@@ -143,13 +144,19 @@ async fn route(
 ///   failure at any step rejects the whole call (`Unauthenticated` for a
 ///   bad/forged/expired token, `PermissionDenied` for a genuine token
 ///   whose claims don't match an allowlisted, non-suspended
-///   installation) — it never falls through to the unauthenticated path.
-/// - **Bearer value present but not JWT-shaped** (e.g. a future
-///   `cc_tok_...` scoped API token): falls through to the unauthenticated
-///   path too, same as no header — rejecting it would be worse than
-///   ignoring it, since there is no issuer yet to validate that token
-///   format against. Temporary, pending the scoped-API-token
-///   implementation.
+///   installation).
+/// - **Bearer value present but not JWT-shaped** (a `cc_tok_...`-style
+///   opaque scoped API token, or anything else): hashed and looked up
+///   against the `api_tokens` table ([`api_tokens::lookup_by_hash`]),
+///   then checked for revocation/expiry/`ingest:write` scope/repo
+///   allowlist membership ([`api_tokens::check_token`]). Same
+///   `Unauthenticated`-vs-`PermissionDenied` split as the OIDC path: an
+///   unknown/revoked/expired token is `Unauthenticated` (it never
+///   identified a real, live credential), a real token whose scope or
+///   allowlist doesn't cover this call is `PermissionDenied`.
+///
+/// Either branch's failure rejects the whole call — neither ever falls
+/// through to an unauthenticated success.
 async fn handle_begin_run(
     codec: Codec,
     body: &[u8],
@@ -158,15 +165,20 @@ async fn handle_begin_run(
 ) -> std::result::Result<Vec<u8>, ConnectError> {
     let req: BeginRunRequest = codec.decode(body)?;
 
-    if let Some(bearer) = bearer
-        && oidc::looks_like_jwt(bearer)
-    {
-        verify_oidc_begin_run_credential(env, bearer, req.key.repo_id).await?;
+    match bearer {
+        Some(bearer) if oidc::looks_like_jwt(bearer) => {
+            verify_oidc_begin_run_credential(env, bearer, req.key.repo_id).await?;
+        }
+        Some(bearer) => {
+            verify_scoped_api_token_begin_run_credential(env, bearer, req.key.repo_id).await?;
+        }
+        None => {
+            return Err(ConnectError::new(
+                Code::Unauthenticated,
+                "BeginRun requires a credential: GitHub Actions OIDC JWT or a scoped API token",
+            ));
+        }
     }
-    // else: no header, or an opaque non-JWT bearer value (future scoped
-    // API token) — falls through to the unauthenticated path below, see
-    // doc comment above.
-
     // Resolved before touching the Durable Object so a misconfigured
     // deployment fails the whole call up front, rather than creating/
     // updating the run and only then discovering it cannot mint a token.
@@ -248,6 +260,59 @@ async fn verify_oidc_begin_run_credential(
         };
         ConnectError::new(Code::PermissionDenied, message)
     })
+}
+
+/// Full scoped-API-token validation for `BeginRun`'s `bearer` credential
+/// (module doc comment on [`handle_begin_run`]): hashes the presented
+/// token ([`api_tokens::hash_token`]), looks up the matching
+/// `api_tokens` row ([`api_tokens::lookup_by_hash`]), and checks
+/// revocation/expiry/`ingest:write` scope/repo allowlist membership
+/// ([`api_tokens::check_token`]). Returns `Ok(())` only when the token is
+/// found and every check passes; every failure path returns an `Err`
+/// that [`handle_begin_run`] propagates as a rejected call, never
+/// falling through to the unauthenticated path. On success, best-effort
+/// updates `last_used_at` (docs/design/auth.md: "not every request needs
+/// a write" — a failure here must not fail the request, so it is logged
+/// and ignored, not propagated).
+async fn verify_scoped_api_token_begin_run_credential(
+    env: &Env,
+    presented_token: &str,
+    repo_id: u64,
+) -> std::result::Result<(), ConnectError> {
+    let hash = api_tokens::hash_token(presented_token);
+    let row = api_tokens::lookup_by_hash(env, &hash)
+        .await
+        .map_err(|e| ConnectError::new(Code::Internal, format!("api token lookup failed: {e}")))?;
+
+    let now_s = (Date::now().as_millis() / 1000) as i64;
+    api_tokens::check_token(row.as_ref(), "ingest:write", repo_id, now_s).map_err(|e| match e {
+        api_tokens::CheckError::NotFound
+        | api_tokens::CheckError::Revoked
+        | api_tokens::CheckError::Expired => ConnectError::new(
+            Code::Unauthenticated,
+            "invalid, revoked, or expired scoped API token",
+        ),
+        api_tokens::CheckError::MissingScope => ConnectError::new(
+            Code::PermissionDenied,
+            "scoped API token does not have the ingest:write scope",
+        ),
+        api_tokens::CheckError::RepoNotAllowed => ConnectError::new(
+            Code::PermissionDenied,
+            "scoped API token's repo allowlist does not include this repo",
+        ),
+    })?;
+
+    // Best-effort: see doc comment above.
+    if let Some(row) = row
+        && let Err(e) = api_tokens::touch_last_used(env, &row.id, now_s).await
+    {
+        worker::console_log!(
+            "failed to update api_tokens.last_used_at for {}: {e}",
+            row.id
+        );
+    }
+
+    Ok(())
 }
 
 /// Resolves the ingest-token HMAC signing key from the Worker's
