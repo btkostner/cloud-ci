@@ -22,6 +22,10 @@ use serde::de::DeserializeOwned;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Codec {
+    /// Binary wire format. Not yet selected by any `cloud-ci` flag (the CLI
+    /// always uses `Json` for debuggability), but a real, tested encoding
+    /// this client supports for future use.
+    #[allow(dead_code)]
     Proto,
     Json,
 }
@@ -213,6 +217,17 @@ mod tests {
             .into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn proto_codec_round_trips_requests() -> Result<(), String> {
+        let encoded = Codec::Proto
+            .encode(&sample_request())
+            .map_err(|e| e.to_string())?;
+        let decoded: BeginRunRequest = Codec::Proto.decode(&encoded).map_err(|e| e.to_string())?;
+        assert_eq!(decoded, sample_request());
+        assert_eq!(Codec::Proto.content_type(), "application/proto");
+        Ok(())
     }
 
     #[test]
