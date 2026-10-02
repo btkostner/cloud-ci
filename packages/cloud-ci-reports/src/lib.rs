@@ -41,6 +41,12 @@ pub struct TestSuite {
 pub struct TestCase {
     pub name: String,
     pub classname: Option<String>,
+    /// `file` attribute: the source file the test is defined in. Emitted by writers that
+    /// follow xUnit's legacy `testcase` attribute family (e.g. pytest's `--junitxml` output);
+    /// not part of every writer's output.
+    pub file: Option<String>,
+    /// `line` attribute: the line in `file` the test is defined at. Same provenance as `file`.
+    pub line: Option<u32>,
     /// `time` attribute in seconds.
     pub time: Option<f64>,
     pub outcome: Outcome,

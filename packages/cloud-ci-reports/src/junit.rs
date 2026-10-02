@@ -212,6 +212,8 @@ fn testcase_from_attrs(start: &BytesStart<'_>) -> Result<TestCase, ParseError> {
     Ok(TestCase {
         name: attr(start, "name")?.unwrap_or_default(),
         classname: attr(start, "classname")?,
+        file: attr(start, "file")?,
+        line: attr_u32(start, "line")?,
         time: attr_f64(start, "time")?,
         outcome: Outcome::Passed,
         system_out: None,
@@ -321,7 +323,7 @@ mod tests {
     const MULTI_SUITE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <testsuites name="full run" tests="4" failures="1" errors="1" skipped="1" time="1.234">
   <testsuite name="pkg.unit.MathTests" tests="2" failures="1" errors="0" skipped="0" time="0.045">
-    <testcase classname="pkg.unit.MathTests" name="adds_two_numbers" time="0.012"/>
+    <testcase classname="pkg.unit.MathTests" name="adds_two_numbers" file="pkg/unit/math_tests.py" line="17" time="0.012"/>
     <testcase classname="pkg.unit.MathTests" name="divides_by_zero_raises" time="0.033">
       <failure message="expected ArithmeticError, got no exception" type="AssertionError">
 Traceback (most recent call last):
@@ -377,11 +379,15 @@ math suite done</system-out>
         let passed = &parsed.suites[0].test_cases[0];
         assert_eq!(passed.name, "adds_two_numbers");
         assert_eq!(passed.classname.as_deref(), Some("pkg.unit.MathTests"));
+        assert_eq!(passed.file.as_deref(), Some("pkg/unit/math_tests.py"));
+        assert_eq!(passed.line, Some(17));
         assert_eq!(passed.time, Some(0.012));
         assert_eq!(passed.outcome, Outcome::Passed);
 
         let failed = &parsed.suites[0].test_cases[1];
         assert_eq!(failed.name, "divides_by_zero_raises");
+        assert_eq!(failed.file, None);
+        assert_eq!(failed.line, None);
         assert!(matches!(&failed.outcome, Outcome::Failed(_)));
         if let Outcome::Failed(failure) = &failed.outcome {
             assert_eq!(
@@ -463,6 +469,17 @@ math suite done</system-out>
         assert!(matches!(&err, Some(ParseError::InvalidAttribute { .. })));
         if let Some(ParseError::InvalidAttribute { attribute, value }) = err {
             assert_eq!(attribute, "tests");
+            assert_eq!(value, "not-a-number");
+        }
+    }
+
+    #[test]
+    fn non_numeric_testcase_line_attribute_returns_a_typed_error() {
+        let bad = r#"<testsuite name="x"><testcase name="y" file="y.py" line="not-a-number"/></testsuite>"#;
+        let err = parse(bad.as_bytes()).err();
+        assert!(matches!(&err, Some(ParseError::InvalidAttribute { .. })));
+        if let Some(ParseError::InvalidAttribute { attribute, value }) = err {
+            assert_eq!(attribute, "line");
             assert_eq!(value, "not-a-number");
         }
     }
