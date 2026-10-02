@@ -472,7 +472,7 @@ impl RunCoordinator {
             None => logic::ShardState::Pending,
         };
         if !logic::upload_allowed_for_shard(run_terminal, shard_state) {
-            return error_response(400, "shard is missing, or the run is already terminal");
+            return error_response(409, "shard is missing, or the run is already terminal");
         }
 
         let kind_name = req
@@ -501,11 +501,11 @@ impl RunCoordinator {
         match logic::resolve_create_upload(req.size_bytes, &req.scope, existing_for_logic.as_ref())
         {
             Err(logic::CreateUploadError::TooLarge(_)) => error_response(
-                400,
+                409,
                 "upload exceeds the 32 MiB single-part limit; multipart is out of scope",
             ),
             Err(logic::CreateUploadError::ScopeConflict) => error_response(
-                400,
+                409,
                 "this content was already accepted under a different scope",
             ),
             Ok(logic::CreateUploadDecision::ReturnExisting {
@@ -567,7 +567,7 @@ impl RunCoordinator {
         let part_numbers: Vec<u32> = req.parts.iter().map(|p| p.number).collect();
         if logic::validate_complete_upload_parts(&part_numbers).is_err() {
             return error_response(
-                400,
+                409,
                 "parts do not match the single part CreateUpload reserved",
             );
         }
@@ -593,7 +593,7 @@ impl RunCoordinator {
             None => logic::ShardState::Pending,
         };
         if !logic::upload_allowed_for_shard(run_terminal, shard_state) {
-            return error_response(400, "shard is missing, or the run is already terminal");
+            return error_response(409, "shard is missing, or the run is already terminal");
         }
 
         let (content_sha256, upload_id, bytes) = match &req.source {
@@ -736,13 +736,13 @@ impl RunCoordinator {
         ) {
             Ok(c) => c,
             Err(logic::CompleteShardError::RunTerminal) => {
-                return error_response(400, "run is already terminal");
+                return error_response(409, "run is already terminal");
             }
             Err(logic::CompleteShardError::ShardMissing) => {
-                return error_response(400, "shard was already marked missing");
+                return error_response(409, "shard was already marked missing");
             }
             Err(logic::CompleteShardError::ConflictingConclusion) => {
-                return error_response(400, "shard already concluded with a different conclusion");
+                return error_response(409, "shard already concluded with a different conclusion");
             }
         };
 
