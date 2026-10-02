@@ -674,6 +674,23 @@ mod tests {
             .map_err(|_| "captured request log poisoned".to_string())?;
         assert_eq!(log.len(), 7, "expected 7 requests, got {}", log.len());
 
+        let order: Vec<(&str, &str)> = log
+            .iter()
+            .map(|r| (r.method.as_str(), r.path.as_str()))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                ("POST", "/cloud_ci.ingest.v1.IngestService/BeginRun"),
+                ("POST", "/cloud_ci.ingest.v1.IngestService/StartJob"),
+                ("POST", "/cloud_ci.ingest.v1.IngestService/CreateUpload"),
+                ("PUT", "/ingest/v1/uploads/upload-1/parts/1"),
+                ("POST", "/cloud_ci.ingest.v1.IngestService/CompleteUpload"),
+                ("POST", "/cloud_ci.ingest.v1.IngestService/SubmitReport"),
+                ("POST", "/cloud_ci.ingest.v1.IngestService/CompleteShard"),
+            ],
+            "RPCs must fire in the documented BeginRun..CompleteShard order"
+        );
         // BeginRun authenticates with the original --token; every later call
         // must switch to the run-scoped ingest_token BeginRun returned.
         let put = log
@@ -721,6 +738,24 @@ mod tests {
             parts[0].get("etag").and_then(|v| v.as_str()),
             Some(FIXTURE_ETAG),
             "CompleteUpload must forward the exact ETag the PUT response returned, not a hardcoded placeholder"
+        );
+
+        // upload_one's returned upload_id must flow, unmodified, into
+        // SubmitReport's `source` oneof. buffa serializes the oneof with
+        // #[serde(flatten)], and its UploadId variant as a bare `uploadId`
+        // map entry (see cloud_ci_proto::ingest::v1::__buffa::oneof::
+        // submit_report_request::Source's Serialize impl), so it appears as
+        // a top-level field on the request body, not nested under "source".
+        let submit_report = log
+            .iter()
+            .find(|r| r.path == "/cloud_ci.ingest.v1.IngestService/SubmitReport")
+            .ok_or_else(|| "no SubmitReport request captured".to_string())?;
+        let submit_report_body: serde_json::Value =
+            serde_json::from_slice(&submit_report.body).map_err(|e| e.to_string())?;
+        assert_eq!(
+            submit_report_body.get("uploadId").and_then(|v| v.as_str()),
+            Some("upload-1"),
+            "SubmitReport must carry the upload_id CreateUpload returned, not a placeholder"
         );
 
         let complete_shard = log
