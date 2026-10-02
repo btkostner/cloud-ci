@@ -21,7 +21,18 @@ GITHUB_ALLOWED_ORGS = ""
 CLOUD_CI_INGEST_AUDIENCE = ""
 
 [build]
+# Relative `cwd` values resolve against the invoking `wrangler` process's
+# own cwd, not this file's directory (confirmed 2026-10-02 against a real
+# `wrangler dev -c ... -c ...` multi-config session: `cwd = "."` failed
+# with "worker-build must be run from a Rust crate directory" whenever
+# this config was loaded as an auxiliary `-c` config from a different
+# package's directory). This is repo-root-relative instead — every task
+# that invokes `wrangler dev`/`deploy` against this config (this
+# package's own `mise.toml` `dev` task, and
+# `cloud-ci-dynamic-workflows-host`'s) `cd`s to the repo root first for
+# exactly this reason.
 command = "worker-build --release"
+cwd = "packages/cloud-ci-worker"
 
 [[d1_databases]]
 binding = "DB"
@@ -63,6 +74,25 @@ class_name = "PullRequestState"
 name = "REPO_STATE"
 class_name = "RepoState"
 
+# `default`-scheduling-policy container backing `ContainerProbe`
+# (src/container_probe.rs): a Phase-0 proof fixture only, built from
+# container_probe/Dockerfile — a bare `sleep infinity` image, not this
+# repo's eventual real Containers execution image.
+[[containers]]
+max_instances = 1
+class_name = "ContainerProbe"
+image = "./container_probe/Dockerfile"
+
+# Not SQLite-backed by its own logic (no state.storage().sql() call), but
+# uses new_sqlite_classes anyway per Cloudflare's current guidance that new
+# Durable Object namespaces use the SQLite storage backend
+# (developers.cloudflare.com/durable-objects/api/sqlite-storage-api/,
+# checked 2026-10-02). Minimal, standalone proof DO — see
+# src/container_probe.rs's module docs for its scope boundary.
+[[durable_objects.bindings]]
+name = "CONTAINER_PROBE"
+class_name = "ContainerProbe"
+
 # new_sqlite_classes, not new_classes: RunCoordinator uses
 # state.storage().sql(), which only exists on SQLite-backed objects. Never
 # rewrite this entry — migrations are append-only.
@@ -84,6 +114,13 @@ new_sqlite_classes = ["PullRequestState"]
 [[migrations]]
 tag = "v3"
 new_sqlite_classes = ["RepoState"]
+
+# Picks up ContainerProbe, this round's standalone container-exec proof DO
+# (src/container_probe.rs). Migrations are append-only — never rewrite
+# v1-v3 above to add this class to them.
+[[migrations]]
+tag = "v4"
+new_sqlite_classes = ["ContainerProbe"]
 
 # Installation reconcile job (docs/design/auth.md § "Multiple orgs and
 # installations", "Discovery" paragraph): calls `GET /app/installations`

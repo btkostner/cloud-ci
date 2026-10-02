@@ -36,4 +36,8 @@ run = "worker-build --release"
 [tasks.dev]
 description = "Run the Worker locally"
 depends = ["//packages/cloud-ci-proto:generate"]
-run = "wrangler dev"
+# `cd ../..` (repo root), matching `wrangler.toml`'s `[build].cwd`
+# comment: relative `cwd` values in a custom build resolve against the
+# invoking process's cwd, and this package's own directory is two levels
+# under the repo root (`packages/<name>`).
+run = "cd ../.. && wrangler dev -c packages/cloud-ci-worker/wrangler.toml"

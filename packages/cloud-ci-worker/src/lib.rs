@@ -1,5 +1,6 @@
 pub mod api_tokens;
 pub mod connect;
+pub mod container_probe;
 pub mod coordinator;
 pub mod github_app;
 pub mod github_checks;
@@ -28,7 +29,7 @@ use cloud_ci_proto::ingest::v1::{
 };
 use connect::{Code, Codec, ConnectError, NegotiationError, negotiate};
 use coordinator::{CoordinatorError, RunCoordinatorStore};
-use worker::{Context, Date, Env, Headers, Method, Request, Response, Result, event};
+use worker::{Context, Date, Env, Headers, Method, Request, RequestInit, Response, Result, event};
 
 #[event(fetch)]
 async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
@@ -59,6 +60,20 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // rather than a bearer credential.
     if req.method() == Method::Post && req.path() == "/v1/tokens" {
         return handle_issue_token(&mut req, &env).await;
+    }
+    // Internal-only proof route for
+    // `packages/cloud-ci-dynamic-workflows-host` (docs/roadmap.md's
+    // "Dynamic Workflows" Phase 0 row): forwards the request body
+    // verbatim to the `ContainerProbe` Durable Object's `/exec`
+    // (src/container_probe.rs), which calls the patched `worker` crate's
+    // `Container::exec()`. Not a Connect RPC, not customer-facing, and
+    // not part of any production request path (`/webhooks/github` never
+    // reaches here) — same "capability ahead of its caller" posture as
+    // this round's other scope-boundary notes. No auth: this binding is
+    // reachable only over a service binding from a sibling Worker in the
+    // same account, never from the public Internet.
+    if req.method() == Method::Post && req.path() == "/internal/container-probe/exec" {
+        return handle_container_probe_exec(req, &env).await;
     }
     if req.method() != Method::Post {
         return Response::error("method not allowed", 405);
@@ -972,6 +987,22 @@ async fn handle_issue_token(req: &mut Request, env: &Env) -> Result<Response> {
 /// Connect RPC (`connect_error` is that family's equivalent).
 fn json_error(status: u16, message: &str) -> Result<Response> {
     Ok(Response::from_json(&serde_json::json!({ "error": message }))?.with_status(status))
+}
+
+/// Forwards `req`'s raw body to the singleton `ContainerProbe` Durable
+/// Object's `/exec` (src/container_probe.rs's own doc comment covers the
+/// DO itself). One DO instance total (`idFromName("probe")`) — this round
+/// proves one container round trip, not per-run/per-job addressing, so
+/// there is no identity to derive it from yet.
+async fn handle_container_probe_exec(mut req: Request, env: &Env) -> Result<Response> {
+    let body = req.bytes().await?;
+    let namespace = env.durable_object("CONTAINER_PROBE")?;
+    let id = namespace.id_from_name("probe")?;
+    let stub = id.get_stub()?;
+    let mut init = RequestInit::new();
+    init.with_method(Method::Post).with_body(Some(body.into()));
+    let fwd = Request::new_with_init("http://container-probe.internal/exec", &init)?;
+    stub.fetch_with_request(fwd).await
 }
 
 /// `POST /webhooks/github` (docs/design/auth.md § "Webhook signature
