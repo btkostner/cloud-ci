@@ -35,4 +35,13 @@ GITHUB_WEBHOOK_SECRET=local-dev-webhook-secret
 # needs to be numeric for src/github_app.rs's claim construction; it does
 # not need to match a real GitHub App for local dev.
 GITHUB_APP_ID=999999
+
+# Same [vars]-but-overridable-via-.dev.vars pattern as GITHUB_APP_ID/
+# GITHUB_ALLOWED_ORGS above. `BeginRun`'s OIDC path
+# (src/lib.rs::handle_begin_run, src/oidc.rs) matches a presented GitHub
+# Actions JWT's `aud` claim against this value exactly, so a synthetic
+# smoke-test JWT must set its `aud` to whatever this is. Any value works
+# for local dev; `cloud-ci setup` will populate the real exchange URL
+# later, same as the other not-yet-built-setup-flow vars.
+CLOUD_CI_INGEST_AUDIENCE=https://ci.example.com/exchange
 GITHUB_ALLOWED_ORGS=acme-corp

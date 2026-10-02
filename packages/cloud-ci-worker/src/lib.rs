@@ -46,8 +46,15 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         }
         Err(NegotiationError::Connect(err)) => return connect_error(&err),
     };
+    // `BeginRun`'s OIDC credential path (src/oidc.rs, handle_begin_run
+    // below) is the only caller of this; every other procedure ignores
+    // it. Extracted here, not inside `route`, because `req.headers()` is
+    // only cheap/available before `req.bytes()` consumes the request.
+    let bearer = headers
+        .get("authorization")?
+        .and_then(|v| v.strip_prefix("Bearer ").map(str::to_string));
     let body = req.bytes().await?;
-    match route(&req.path(), codec, &body, &env).await {
+    match route(&req.path(), codec, &body, &env, bearer.as_deref()).await {
         Ok(bytes) => {
             let headers = Headers::new();
             headers.set("content-type", codec.content_type())?;
@@ -64,9 +71,12 @@ async fn route(
     codec: Codec,
     body: &[u8],
     env: &Env,
+    bearer: Option<&str>,
 ) -> std::result::Result<Vec<u8>, ConnectError> {
     match path {
-        "/cloud_ci.ingest.v1.IngestService/BeginRun" => handle_begin_run(codec, body, env).await,
+        "/cloud_ci.ingest.v1.IngestService/BeginRun" => {
+            handle_begin_run(codec, body, env, bearer).await
+        }
         "/cloud_ci.ingest.v1.IngestService/StartJob" => handle_start_job(codec, body, env).await,
         "/cloud_ci.ingest.v1.IngestService/GetRun" => handle_get_run(codec, body, env).await,
         "/cloud_ci.ingest.v1.IngestService/CreateUpload" => {
@@ -88,12 +98,51 @@ async fn route(
     }
 }
 
+/// # Auth (docs/design/byo-ci.md § Auth)
+///
+/// `BeginRun` is the only call that authenticates with something other
+/// than an ingest token. Two credential shapes are valid per that doc —
+/// GitHub Actions OIDC JWT, and a scoped API token for non-GitHub-Actions
+/// CI systems — but only the OIDC path is implemented; the scoped-API-
+/// token path has no `api_tokens` table or issuance flow yet. So the
+/// credential check here is intentionally partial:
+///
+/// - **No `Authorization` header at all**: proceeds exactly as before
+///   this round, with no identity check whatsoever. This is a real,
+///   temporary gap — unauthenticated BYO-CI ingest is possible until the
+///   scoped-API-token path exists — not something silently papered over.
+/// - **Bearer value present and JWT-shaped** (three dot-separated
+///   segments, [`oidc::looks_like_jwt`]): treated as a GitHub Actions
+///   OIDC JWT and fully verified ([`oidc::verify`]: issuer/audience/
+///   signature/`exp`/`nbf`), then its `repository_id`/
+///   `repository_owner_id` claims are matched against the `repos`/
+///   `installations` D1 tables ([`installations::check_allowlist`]). Any
+///   failure at any step rejects the whole call (`Unauthenticated` for a
+///   bad/forged/expired token, `PermissionDenied` for a genuine token
+///   whose claims don't match an allowlisted, non-suspended
+///   installation) — it never falls through to the unauthenticated path.
+/// - **Bearer value present but not JWT-shaped** (e.g. a future
+///   `cc_tok_...` scoped API token): falls through to the unauthenticated
+///   path too, same as no header — rejecting it would be worse than
+///   ignoring it, since there is no issuer yet to validate that token
+///   format against. Temporary, pending the scoped-API-token
+///   implementation.
 async fn handle_begin_run(
     codec: Codec,
     body: &[u8],
     env: &Env,
+    bearer: Option<&str>,
 ) -> std::result::Result<Vec<u8>, ConnectError> {
     let req: BeginRunRequest = codec.decode(body)?;
+
+    if let Some(bearer) = bearer
+        && oidc::looks_like_jwt(bearer)
+    {
+        verify_oidc_begin_run_credential(env, bearer, req.key.repo_id).await?;
+    }
+    // else: no header, or an opaque non-JWT bearer value (future scoped
+    // API token) — falls through to the unauthenticated path below, see
+    // doc comment above.
 
     // Resolved before touching the Durable Object so a misconfigured
     // deployment fails the whole call up front, rather than creating/
@@ -120,6 +169,62 @@ async fn handle_begin_run(
         ..Default::default()
     };
     codec.encode(&resp)
+}
+
+/// Full GitHub Actions OIDC validation for `BeginRun`'s `bearer` credential
+/// (module doc comment on [`handle_begin_run`]): verifies the JWT itself
+/// ([`oidc::verify`]) against `CLOUD_CI_INGEST_AUDIENCE`, then matches its
+/// claims against the `repos`/`installations` allowlist
+/// ([`installations::check_allowlist`]). Returns `Ok(())` only when both
+/// steps succeed; every failure path returns an `Err` that
+/// [`handle_begin_run`] propagates as a rejected call, never falling
+/// through to the unauthenticated path.
+async fn verify_oidc_begin_run_credential(
+    env: &Env,
+    jwt: &str,
+    claimed_repo_id: u64,
+) -> std::result::Result<(), ConnectError> {
+    let audience = env
+        .var("CLOUD_CI_INGEST_AUDIENCE")
+        .map(|v| v.to_string())
+        .unwrap_or_default();
+    if audience.is_empty() {
+        return Err(ConnectError::new(
+            Code::Internal,
+            "CLOUD_CI_INGEST_AUDIENCE is not configured",
+        ));
+    }
+
+    let now_s = (Date::now().as_millis() / 1000) as i64;
+    let claims = oidc::verify(jwt, &audience, now_s)
+        .await
+        .map_err(|e| ConnectError::new(Code::Unauthenticated, format!("invalid OIDC JWT: {e}")))?;
+
+    if claims.repository_id != claimed_repo_id {
+        return Err(ConnectError::new(
+            Code::PermissionDenied,
+            "OIDC token's repository_id does not match the requested run's repo",
+        ));
+    }
+
+    let row = installations::lookup_repo_installation(env, claims.repository_id)
+        .await
+        .map_err(|e| ConnectError::new(Code::Internal, format!("allowlist lookup failed: {e}")))?;
+    installations::check_allowlist(claims.repository_owner_id, row).map_err(|e| {
+        let message = match e {
+            installations::AllowlistError::RepoNotFound => {
+                "repository is not registered with this deployment".to_string()
+            }
+            installations::AllowlistError::OwnerMismatch => {
+                "OIDC token's repository_owner_id does not match the installation that owns this repo"
+                    .to_string()
+            }
+            installations::AllowlistError::Suspended => {
+                "the GitHub App installation that owns this repo is suspended".to_string()
+            }
+        };
+        ConnectError::new(Code::PermissionDenied, message)
+    })
 }
 
 /// Resolves the ingest-token HMAC signing key from the Worker's
@@ -536,6 +641,7 @@ async fn handle_installation_event(raw_body: &[u8], env: &Env) -> Result<Respons
                     installation_id,
                     &event.installation.account.login,
                     &event.installation.account.account_type,
+                    event.installation.account.id,
                     now_s,
                 )
                 .await?;

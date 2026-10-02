@@ -12,6 +12,12 @@ compatibility_date = "2026-09-01"
 [vars]
 GITHUB_APP_ID = ""
 GITHUB_ALLOWED_ORGS = ""
+# Public URL identifier `BeginRun`'s OIDC path matches a GitHub Actions
+# `id-token: write` JWT's `aud` claim against (docs/design/byo-ci.md §
+# Auth row 1) — not secret, same category as GITHUB_APP_ID above.
+# Placeholder until `cloud-ci setup` (a later round) writes this
+# deployment's real exchange URL here.
+CLOUD_CI_INGEST_AUDIENCE = ""
 
 [build]
 command = "worker-build --release"

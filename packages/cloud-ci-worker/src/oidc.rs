@@ -21,15 +21,15 @@
 //!    OIDC issuer from a `cargo test` run, and this round has no
 //!    `wrangler dev` route wired to it either — see "Scope" below).
 //!
-//! [`verify`] composes all three into the full check. Nothing in `lib.rs`
-//! calls it yet: `installations`/`repos` D1 tables (populated by
-//! webhook-driven discovery, separate later work) don't exist, so the
-//! spec's final step — matching `repository_id`/`repository_owner_id`
-//! against the GitHub App installation that owns the target repo — has
-//! nothing to match against yet. This module's job ends at "this is a
-//! genuine, GitHub-issued OIDC token with these claims"; the caller (a
-//! later round) is responsible for the allowlist-membership check. Same
-//! capability-module-not-live-auth-path posture as `github_app.rs`.
+//! [`verify`] composes all three into the full check. `lib.rs`'s
+//! `handle_begin_run` calls it when a bearer credential is present and
+//! [`looks_like_jwt`]-shaped, then matches the returned claims'
+//! `repository_id`/`repository_owner_id` against the `installations`/
+//! `repos` D1 tables (`installations::check_allowlist`) — this module's
+//! job still ends at "this is a genuine, GitHub-issued OIDC token with
+//! these claims"; the allowlist-membership check itself lives in
+//! `installations.rs`, same capability-module-not-auth-decision posture
+//! as `github_app.rs`.
 //!
 //! # Why `repository_id`/`repository_owner_id`, not `sub`
 //!
@@ -196,6 +196,19 @@ fn split_jwt(jwt: &str) -> Result<(&str, &str, &str), OidcError> {
         ));
     };
     Ok((header, payload, signature))
+}
+
+/// Structural check only — "three dot-separated segments" — not a full
+/// parse: distinguishes an OIDC JWT bearer value from a future
+/// `cc_tok_...`-style opaque scoped API token (docs/design/byo-ci.md §
+/// Auth's other credential row, not implemented yet). Used by
+/// `lib.rs::handle_begin_run` to decide which credential path a bearer
+/// value is before attempting [`verify`] — deliberately cheap and
+/// forgiving (an opaque token can never accidentally contain two dots
+/// in practice for either token family actually in use), since a true
+/// parse failure is already handled by [`verify`]'s own error path.
+pub fn looks_like_jwt(bearer: &str) -> bool {
+    bearer.split('.').count() == 3
 }
 
 fn base64_url_decode(segment: &str) -> Result<Vec<u8>, OidcError> {
@@ -717,5 +730,22 @@ mod tests {
             "https://token.actions.githubusercontent.com/.well-known/jwks"
         );
         Ok(())
+    }
+
+    #[test]
+    fn looks_like_jwt_accepts_three_segments() {
+        assert!(looks_like_jwt("header.payload.signature"));
+    }
+
+    #[test]
+    fn looks_like_jwt_rejects_opaque_scoped_api_token() {
+        assert!(!looks_like_jwt("cc_tok_abcdef1234567890"));
+    }
+
+    #[test]
+    fn looks_like_jwt_rejects_wrong_segment_counts() {
+        assert!(!looks_like_jwt("a.b"));
+        assert!(!looks_like_jwt("a.b.c.d"));
+        assert!(!looks_like_jwt("noseparators"));
     }
 }
