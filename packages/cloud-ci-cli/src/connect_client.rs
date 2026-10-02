@@ -205,6 +205,39 @@ mod tests {
         Ok(format!("http://{addr}"))
     }
 
+    /// Like `serve_once`, but writes a raw binary body with an arbitrary
+    /// `Content-Type`, so a real binary (`application/proto`) response can
+    /// be proven over an actual socket instead of only through in-process
+    /// `Codec::Proto` encode/decode (`proto_codec_round_trips_requests`,
+    /// which never touches HTTP) or `Codec::Json` (every other test in this
+    /// file, and `cloud-ci-worker`'s `full_upload_sequence_executes_against_a_real_http_fixture`,
+    /// which only ever drives `Codec::Json`).
+    fn serve_once_binary(
+        status_line: &str,
+        content_type: &str,
+        body: &[u8],
+    ) -> std::io::Result<String> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let status_line = status_line.to_string();
+        let content_type = content_type.to_string();
+        let body = body.to_vec();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let header = format!(
+                    "{status_line}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+            }
+        });
+        Ok(format!("http://{addr}"))
+    }
+
     fn sample_request() -> BeginRunRequest {
         BeginRunRequest {
             key: RunKey {
@@ -263,5 +296,35 @@ mod tests {
             }
             other => Err(format!("expected CallError::MalformedError, got {other:?}")),
         }
+    }
+
+    /// Proves `Codec::Proto` round-trips a successful response over a real
+    /// socket end to end: the client sends a binary request with
+    /// `Content-Type: application/proto`, a server stand-in replies with a
+    /// binary-encoded real generated `BeginRunResponse`, and the client
+    /// decodes it correctly. `proto_codec_round_trips_requests` above only
+    /// exercises `Codec::encode`/`decode` in-process; every HTTP-backed test
+    /// in this file and in `cloud-ci-worker`'s
+    /// `full_upload_sequence_executes_against_a_real_http_fixture` only ever
+    /// uses `Codec::Json` (the CLI's actual production choice). This closes
+    /// that gap for `docs/roadmap.md`'s "buffa on wasm32" spike, which asks
+    /// for a round trip of both codecs, not just the one the CLI ships with.
+    #[test]
+    fn client_round_trips_a_successful_binary_response_over_http() -> Result<(), String> {
+        let expected = BeginRunResponse {
+            run_id: "run-1".into(),
+            ingest_token: "ingest-token-1".into(),
+            ..Default::default()
+        };
+        let body = Codec::Proto.encode(&expected).map_err(|e| e.to_string())?;
+        let base_url = serve_once_binary("HTTP/1.1 200 OK", "application/proto", &body)
+            .map_err(|e| e.to_string())?;
+        let client = Client::new(base_url, Codec::Proto, None);
+
+        let response = client
+            .call::<BeginRunRequest, BeginRunResponse>("BeginRun", &sample_request())
+            .map_err(|e| e.to_string())?;
+        assert_eq!(response, expected);
+        Ok(())
     }
 }
