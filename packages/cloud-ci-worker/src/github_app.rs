@@ -161,6 +161,21 @@ pub fn signing_input(claims: &AppClaims) -> Result<String, GithubAppError> {
     ))
 }
 
+/// Convenience wrapper combining [`build_claims`], [`signing_input`], and
+/// [`sign_rs256`] into one call: the full App-level JWT minting sequence
+/// every `/app/*` endpoint caller needs (installation token exchange,
+/// [`delete_installation`]). `now_unix_s` is a parameter for the same
+/// determinism/testability reason as `build_claims`'s.
+pub async fn mint_app_jwt(
+    private_key_pem: &str,
+    app_id: u64,
+    now_unix_s: i64,
+) -> Result<String, GithubAppError> {
+    let claims = build_claims(app_id, now_unix_s);
+    let input = signing_input(&claims)?;
+    sign_rs256(private_key_pem, &input).await
+}
+
 /// Signs `signing_input` (from [`signing_input`]) with RS256 using the
 /// Workers runtime's WebCrypto `SubtleCrypto`, returning the complete
 /// `header.payload.signature` JWT. `private_key_pem` is a PEM-formatted
@@ -401,6 +416,70 @@ pub async fn fetch_installation_token(
         .map_err(|e| GithubAppError(format!("cannot decode installation token response: {e}")))
 }
 
+/// `DELETE /app/installations/{installation_id}`'s URL, with
+/// `installation_id` interpolated — pure string construction,
+/// unit-testable without the Workers runtime.
+fn uninstall_installation_url(installation_id: u64) -> String {
+    format!("https://api.github.com/app/installations/{installation_id}")
+}
+
+/// Same three headers as [`installation_access_token_headers`] — this
+/// endpoint also authenticates with an App-level JWT, not an installation
+/// token (docs.github.com/en/rest/apps/apps#delete-an-installation-for-the-authenticated-app,
+/// accessed 2026-10-02).
+fn uninstall_installation_headers(app_jwt: &str) -> [(&'static str, String); 3] {
+    [
+        ("authorization", format!("Bearer {app_jwt}")),
+        ("accept", "application/vnd.github+json".to_string()),
+        ("x-github-api-version", GITHUB_API_VERSION.to_string()),
+    ]
+}
+
+/// `DELETE /app/installations/{installation_id}`
+/// (docs.github.com/en/rest/apps/apps#delete-an-installation-for-the-authenticated-app,
+/// accessed 2026-10-02): uninstalls the App from `installation_id`, called
+/// by `lib.rs`'s webhook handler when `installation.created` arrives for
+/// an account outside `GITHUB_ALLOWED_ORGS` (docs/design/auth.md's
+/// "Multiple orgs and installations": "immediately calls DELETE
+/// ... to uninstall itself ... and never creates rows for it"). Uses an
+/// App-level JWT ([`mint_app_jwt`]), never an installation token — GitHub
+/// documents this endpoint as App-authenticated, since an installation
+/// being uninstalled cannot be trusted to mint its own token for the
+/// call. GitHub returns `204 No Content` on success.
+pub async fn delete_installation(
+    app_jwt: &str,
+    installation_id: u64,
+) -> Result<(), GithubAppError> {
+    let url = uninstall_installation_url(installation_id);
+    let headers = worker::Headers::new();
+    for (name, value) in uninstall_installation_headers(app_jwt) {
+        headers
+            .set(name, &value)
+            .map_err(|e| GithubAppError(format!("cannot set {name} header: {e}")))?;
+    }
+
+    let mut init = worker::RequestInit::new();
+    init.with_method(worker::Method::Delete);
+    init.with_headers(headers);
+
+    let request = worker::Request::new_with_init(&url, &init)
+        .map_err(|e| GithubAppError(format!("cannot build uninstall request: {e}")))?;
+
+    let mut response = worker::Fetch::Request(request)
+        .send()
+        .await
+        .map_err(|e| GithubAppError(format!("uninstall request failed: {e}")))?;
+
+    if response.status_code() != 204 {
+        let body = response.text().await.unwrap_or_default();
+        return Err(GithubAppError(format!(
+            "uninstall failed: {} {body}",
+            response.status_code()
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -558,5 +637,30 @@ mod tests {
         assert_eq!(parsed.token, "ghs_16C7e42F292c6912E7710c838347Ae178B4a");
         assert_eq!(parsed.expires_at, "2026-10-01T12:00:00Z");
         Ok(())
+    }
+
+    #[test]
+    fn uninstall_url_interpolates_installation_id() {
+        assert_eq!(
+            uninstall_installation_url(42),
+            "https://api.github.com/app/installations/42"
+        );
+    }
+
+    #[test]
+    fn uninstall_headers_carry_bearer_jwt_and_api_version() {
+        let headers = uninstall_installation_headers("my.jwt.value");
+        assert_eq!(
+            headers[0],
+            ("authorization", "Bearer my.jwt.value".to_string())
+        );
+        assert_eq!(
+            headers[1],
+            ("accept", "application/vnd.github+json".to_string())
+        );
+        assert_eq!(
+            headers[2],
+            ("x-github-api-version", GITHUB_API_VERSION.to_string())
+        );
     }
 }

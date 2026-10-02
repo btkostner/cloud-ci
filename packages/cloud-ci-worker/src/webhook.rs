@@ -17,17 +17,13 @@
 //! constant-time under both `cargo test` and the real `wasm32` Workers
 //! runtime, so this module reuses that approach instead.
 //!
-//! This is a capability module only. There is no `/webhooks/github` route
-//! in `lib.rs` yet — no GitHub App is registered to deliver anything to
-//! it, and the `installations`/`repos` D1 tables this route will
-//! eventually need don't exist yet either. [`verify_signature`] is
-//! intentionally dead code from the router's perspective this round, same
-//! as `github_app.rs`'s `fetch_installation_token` from the prior round:
-//! it exists so the verification logic is written, tested, and ready for
-//! whenever the webhook route itself is built. Wiring the `GITHUB_WEBHOOK_SECRET`
-//! Worker secret binding to a real caller is that later round's work, not
-//! this one — `secret` here is always a parameter, never resolved from
-//! `env` in this module.
+//! `POST /webhooks/github` in `lib.rs` is the real route: it reads the raw
+//! request body first, calls [`verify_signature`] with the
+//! `GITHUB_WEBHOOK_SECRET` secret, and rejects with 401 before parsing
+//! anything or touching D1 on any `Err` — see `lib.rs`'s
+//! `handle_github_webhook` and `src/installations.rs` for the
+//! `installation`/`installation_repositories` event handling this
+//! verification gates.
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
