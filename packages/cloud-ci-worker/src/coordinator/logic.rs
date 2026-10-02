@@ -57,6 +57,16 @@ impl RunState {
             }
         }
     }
+
+    /// Whether uploads/`CompleteShard` calls for this run must be rejected
+    /// (docs/design/byo-ci.md's Failure modes: "...or for a run that is
+    /// already terminal, is also rejected (400)").
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded | Self::Failed | Self::Cancelled | Self::Abandoned
+        )
+    }
 }
 
 /// `BeginRun`'s `expect_jobs` is rejected when a later call supplies a
@@ -335,6 +345,21 @@ mod tests {
             RunState::Abandoned,
         ] {
             assert_eq!(state.to_proto_status(), RunStatus::RUN_STATUS_COMPLETED);
+        }
+    }
+
+    #[test]
+    fn is_terminal_is_true_only_for_the_four_terminal_states() {
+        for state in [
+            RunState::Succeeded,
+            RunState::Failed,
+            RunState::Cancelled,
+            RunState::Abandoned,
+        ] {
+            assert!(state.is_terminal(), "{state:?}");
+        }
+        for state in [RunState::Queued, RunState::Running, RunState::Merging] {
+            assert!(!state.is_terminal(), "{state:?}");
         }
     }
 
