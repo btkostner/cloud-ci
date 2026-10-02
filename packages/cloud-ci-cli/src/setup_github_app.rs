@@ -439,10 +439,13 @@ pub fn create_secrets_store_secret(
                 .iter()
                 .map(|e| format!("{}: {}", e.code, e.message))
                 .collect();
-            return Err(GithubAppSetupError::new(format!(
+            let formatted = format!(
                 "cloudflare secrets_store create failed: http {status}: {}",
                 messages.join(", ")
-            )));
+            );
+            return Err(GithubAppSetupError::new(
+                formatted.replace(value, "[REDACTED]"),
+            ));
         }
         return Err(GithubAppSetupError::new(format!(
             "cloudflare secrets_store create failed: http {status} (response body omitted — may contain submitted secret material)"
@@ -462,10 +465,13 @@ pub fn create_secrets_store_secret(
             .iter()
             .map(|e| format!("{}: {}", e.code, e.message))
             .collect();
-        return Err(GithubAppSetupError::new(format!(
+        let formatted = format!(
             "cloudflare secrets_store create reported failure: {}",
             messages.join(", ")
-        )));
+        );
+        return Err(GithubAppSetupError::new(
+            formatted.replace(value, "[REDACTED]"),
+        ));
     }
 
     let created = parsed
@@ -1309,6 +1315,78 @@ mod tests {
         );
         assert!(err.contains("400"), "{err}");
         assert!(err.contains("invalid value"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn create_secrets_store_secret_non_2xx_redacts_secret_embedded_in_error_message()
+    -> Result<(), String> {
+        // Here the secret value appears *inside* Cloudflare's own
+        // structured error message text itself (not just elsewhere in the
+        // raw body) — the fix must redact the fully-assembled message, not
+        // just omit the raw body.
+        const CANARY: &str = "CANARY-SECRET-VALUE-fixture-should-never-leak";
+        let body = serde_json::to_vec(&serde_json::json!({
+            "success": false,
+            "errors": [{"code": 1004, "message": format!("invalid value: {CANARY}")}],
+            "messages": [],
+            "result": null,
+        }))
+        .map_err(|e| e.to_string())?;
+        let (base_url, _) = start_single_request_fixture(400, body).map_err(|e| e.to_string())?;
+
+        let err = match create_secrets_store_secret(
+            &base_url,
+            "account-1",
+            "store-1",
+            "bad-token",
+            "github-app-private-key",
+            CANARY,
+        ) {
+            Ok(_) => return Err("expected a non-2xx failure".to_string()),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            !err.contains(CANARY),
+            "error message leaked the secret embedded in an error message: {err}"
+        );
+        assert!(err.contains("[REDACTED]"), "{err}");
+        assert!(err.contains("400"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn create_secrets_store_secret_2xx_reported_failure_redacts_secret_embedded_in_error_message()
+    -> Result<(), String> {
+        // Same leak shape as the non-2xx case above, but on the 2xx
+        // "success": false path, which builds its error message the same
+        // way and needs the same redaction.
+        const CANARY: &str = "CANARY-SECRET-VALUE-fixture-should-never-leak";
+        let body = serde_json::to_vec(&serde_json::json!({
+            "success": false,
+            "errors": [{"code": 1004, "message": format!("invalid value: {CANARY}")}],
+            "messages": [],
+            "result": null,
+        }))
+        .map_err(|e| e.to_string())?;
+        let (base_url, _) = start_single_request_fixture(200, body).map_err(|e| e.to_string())?;
+
+        let err = match create_secrets_store_secret(
+            &base_url,
+            "account-1",
+            "store-1",
+            "bad-token",
+            "github-app-private-key",
+            CANARY,
+        ) {
+            Ok(_) => return Err("expected a cloudflare-level failure".to_string()),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            !err.contains(CANARY),
+            "error message leaked the secret embedded in an error message: {err}"
+        );
+        assert!(err.contains("[REDACTED]"), "{err}");
         Ok(())
     }
 
