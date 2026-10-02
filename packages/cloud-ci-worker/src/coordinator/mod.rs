@@ -197,6 +197,7 @@ struct RunRow {
     trigger: String,
     external_url: String,
     created_at: i64,
+    timeout_s: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -320,7 +321,7 @@ fn hex_sha256(bytes: &[u8]) -> String {
 // The Durable Object
 // ---------------------------------------------------------------------------
 
-#[durable_object(fetch)]
+#[durable_object(alarm)]
 pub struct RunCoordinator {
     state: State,
     env: Env,
@@ -361,9 +362,25 @@ impl DurableObject for RunCoordinator {
                 let body: CompleteShardRequest = req.json().await?;
                 self.handle_complete_shard(&sql, body).await
             }
-            (Method::Post, "/close-run") => self.handle_close_run(&sql).await,
+            (Method::Post, "/close-run") => self.handle_close_run(&sql, false).await,
             _ => error_response(404, "unknown RunCoordinator route"),
         }
+    }
+
+    /// Fires when the DO alarm set by `handle_begin_run` (`now +
+    /// timeout_s`) reaches its scheduled time — byo-ci.md's third
+    /// completion trigger (§ Completion semantics' "Timeout" bullet).
+    /// Reuses `handle_close_run`'s own terminal-state no-op guard for
+    /// idempotency: if the run already closed via the webhook or
+    /// `--expect-jobs` in the meantime (including microseconds before
+    /// this alarm fired), this is a clean no-op, not a race. Passes
+    /// `by_timeout: true`, which forces the run's state to `Abandoned`
+    /// unconditionally rather than computing it from the jobs'
+    /// conclusions (see `logic::run_state_for_close`'s docs).
+    async fn alarm(&self) -> worker::Result<Response> {
+        let sql = self.state.storage().sql();
+        ensure_schema(&sql)?;
+        self.handle_close_run(&sql, true).await
     }
 }
 
@@ -387,6 +404,7 @@ impl RunCoordinator {
                 } else {
                     Some(req.expect_jobs.clone())
                 };
+                let timeout_s = logic::resolve_timeout_seconds(req.timeout.seconds);
                 insert_run(
                     sql,
                     &run_id,
@@ -399,7 +417,20 @@ impl RunCoordinator {
                     trigger_name,
                     &req.external_url,
                     now_ms as i64,
+                    timeout_s,
                 )?;
+                // DO alarm for `now + timeout_s`, byo-ci.md's third close
+                // trigger (§ Completion semantics' "Timeout" bullet). Only
+                // set the first time a run is created — this `None` arm
+                // runs once per `(repo_id, sha, run_key, attempt)`, since a
+                // redelivered/retried `BeginRun` for the same run always
+                // lands in the `Some(row)` arm below (`do_name` is
+                // deterministic), so a retry never pushes the timeout out
+                // or sets a second alarm.
+                self.state
+                    .storage()
+                    .set_alarm(timeout_s.saturating_mul(1000))
+                    .await?;
                 require_run(sql)?
             }
             Some(row) => {
@@ -905,7 +936,7 @@ impl RunCoordinator {
             .map(|j| (j.job_name, j.state == "concluded"))
             .collect();
         if logic::expect_jobs_satisfied(expect_jobs.as_deref(), &started) {
-            self.handle_close_run(sql).await?;
+            self.handle_close_run(sql, false).await?;
         }
         Ok(())
     }
@@ -915,20 +946,32 @@ impl RunCoordinator {
     /// missing shard), then rolls the jobs' conclusions up into the run's
     /// own and moves the run to a terminal `RunState`
     /// (docs/design/byo-ci.md's "Completion semantics": "the run's
-    /// conclusion is the worst job conclusion"). Two callers trigger this
-    /// round: `lib.rs::handle_workflow_run_event`, once it has correlated
+    /// conclusion is the worst job conclusion"). Three callers trigger
+    /// this: `lib.rs::handle_workflow_run_event`, once it has correlated
     /// an incoming `workflow_run` `completed` webhook to this run (see
-    /// the `workflow_run` module docs for the correlation strategy), and
+    /// the `workflow_run` module docs for the correlation strategy);
     /// [`Self::maybe_close_for_expect_jobs`], once every job named in a
-    /// run's declared `expect_jobs` has started and concluded. The
-    /// timeout alarm (byo-ci.md's third close trigger) is not built
-    /// either way — it needs a Durable Object alarm, separate work.
+    /// run's declared `expect_jobs` has started and concluded; and
+    /// [`DurableObject::alarm`], once the DO alarm `handle_begin_run` set
+    /// fires. The first two pass `by_timeout: false` and let
+    /// [`logic::run_state_for_close`] compute `succeeded`/`failed` from
+    /// the worst job conclusion; the alarm path passes `by_timeout:
+    /// true`, which forces `Abandoned` unconditionally, per byo-ci.md's
+    /// Failure modes row for a never-uploaded shard: "otherwise the
+    /// timeout marks it `missing` and the run moves to `abandoned`" —
+    /// not a computed conclusion.
     ///
     /// Idempotent: a run already in a terminal state is a no-op ack,
-    /// covering GitHub's at-least-once webhook redelivery without
-    /// re-running (and potentially re-emitting side effects from) the
-    /// close logic a second time.
-    async fn handle_close_run(&self, sql: &SqlStorage) -> worker::Result<Response> {
+    /// covering GitHub's at-least-once webhook redelivery, a redelivered
+    /// `--expect-jobs` satisfaction, and a DO alarm that fires after the
+    /// run already closed by another trigger microseconds earlier,
+    /// without re-running (and potentially re-emitting side effects
+    /// from) the close logic a second time.
+    async fn handle_close_run(
+        &self,
+        sql: &SqlStorage,
+        by_timeout: bool,
+    ) -> worker::Result<Response> {
         let Some(run_row) = read_run(sql)? else {
             return error_response(404, "run not found");
         };
@@ -984,8 +1027,14 @@ impl RunCoordinator {
         }
 
         let run_conclusion = logic::run_conclusion_from_jobs(&job_conclusions);
-        let next_state = logic::run_state_from_conclusion(run_conclusion);
+        let next_state = logic::run_state_for_close(by_timeout, run_conclusion);
         update_run_status(sql, &run_row.id, next_state)?;
+        // Cancels a still-pending timeout alarm once the run closes via
+        // the webhook or `--expect-jobs`, so a completed run never has a
+        // stale alarm fire later and no-op against an already-terminal
+        // run. Harmless when `by_timeout` is true (the alarm that just
+        // fired is already consumed) or when no alarm was ever set.
+        self.state.storage().delete_alarm().await?;
         let run_row = require_run(sql)?;
         self.project_run_to_d1(&run_row).await?;
         self.finalize_check_runs(sql, &run_row).await?;
@@ -1000,8 +1049,8 @@ impl RunCoordinator {
     async fn project_run_to_d1(&self, row: &RunRow) -> worker::Result<()> {
         let db = self.env.d1("DB")?;
         db.prepare(
-            "INSERT INTO runs (id, repo_id, sha, run_key, attempt, status, expect_jobs, trigger, external_url, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+            "INSERT INTO runs (id, repo_id, sha, run_key, attempt, status, expect_jobs, trigger, external_url, created_at, timeout_s) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
              ON CONFLICT (id) DO UPDATE SET \
                status = excluded.status, \
                expect_jobs = excluded.expect_jobs, \
@@ -1021,6 +1070,7 @@ impl RunCoordinator {
             JsValue::from_str(&row.trigger),
             JsValue::from_str(&row.external_url),
             JsValue::from_f64(row.created_at as f64),
+            JsValue::from_f64(row.timeout_s as f64),
         ])?
         .run()
         .await?;
@@ -1505,7 +1555,8 @@ fn ensure_schema(sql: &SqlStorage) -> worker::Result<()> {
             expect_jobs TEXT, \
             trigger TEXT NOT NULL, \
             external_url TEXT NOT NULL, \
-            created_at INTEGER NOT NULL \
+            created_at INTEGER NOT NULL, \
+            timeout_s INTEGER NOT NULL DEFAULT 1800 \
         )",
         None,
     )?;
@@ -1586,7 +1637,7 @@ fn ensure_schema(sql: &SqlStorage) -> worker::Result<()> {
 fn read_run(sql: &SqlStorage) -> worker::Result<Option<RunRow>> {
     let rows: Vec<RunRow> = sql
         .exec(
-            "SELECT id, repo_id, sha, run_key, attempt, status, expect_jobs, trigger, external_url, created_at FROM run LIMIT 1",
+            "SELECT id, repo_id, sha, run_key, attempt, status, expect_jobs, trigger, external_url, created_at, timeout_s FROM run LIMIT 1",
             None,
         )?
         .to_array()?;
@@ -1669,6 +1720,7 @@ fn insert_run(
     trigger: &str,
     external_url: &str,
     created_at_ms: i64,
+    timeout_s: i64,
 ) -> worker::Result<()> {
     let expect_jobs_json = expect_jobs
         .map(serde_json::to_string)
@@ -1676,8 +1728,8 @@ fn insert_run(
         .map_err(|e| worker::Error::RustError(format!("cannot encode expect_jobs: {e}")))?;
     let repo_id_value = SqlStorageValue::try_from_i64(repo_id as i64)?;
     sql.exec(
-        "INSERT INTO run (id, repo_id, sha, run_key, attempt, status, expect_jobs, trigger, external_url, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        "INSERT INTO run (id, repo_id, sha, run_key, attempt, status, expect_jobs, trigger, external_url, created_at, timeout_s) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         vec![
             SqlStorageValue::from(id),
             repo_id_value,
@@ -1689,6 +1741,7 @@ fn insert_run(
             SqlStorageValue::from(trigger),
             SqlStorageValue::from(external_url),
             SqlStorageValue::try_from_i64(created_at_ms)?,
+            SqlStorageValue::try_from_i64(timeout_s)?,
         ],
     )?;
     Ok(())
