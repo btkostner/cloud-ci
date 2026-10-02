@@ -46,10 +46,14 @@ flowchart LR
     BYO -->|ingest RPC| W
     U -->|dashboard / assets, GitHub OAuth| W
     W --> Q --> W
-    W --> RS --> RC
+    W -->|request admission, dedup run identity| RS
+    RS -->|initialize| RC
+    W -->|job/shard/report events| RC
+    RC -->|project run/job state| D1
+    W -->|settings/pipeline-manifest cache| D1
     RC -->|start, instance size| EX
     EX -->|cloud-ci agent: logs, reports, artifacts| W
-    W --> D1 & R2 & AE
+    W --> R2 & AE
     W --> AI
     RC -->|run events| PR
     PR -->|sticky comment, optional| GH
@@ -70,7 +74,7 @@ None exist yet; [roadmap](./roadmap.md) says when each arrives.
 | `cloud-ci-core` | Rust (no `worker` dep) | Splitter, rightsizer, shared domain logic — used by Worker and CLI, tested natively |
 | `cloud-ci-reports` | Rust (no `worker` dep) | Third-party report parsing + merging: JUnit, Vitest, Playwright, lcov, cobertura, bench, timing, oxlint, oxfmt, vite build, deployment — split out from `cloud-ci-core` since this surface is expected to grow; used by Worker and CLI ([ADR 0010](./adr/0010-pluggable-executors.md) context: D5) |
 | `cloud-ci-worker` | Rust → wasm32 | HTTP front door, webhooks, ingest, asset serving, queue consumers, Durable Objects, cron |
-| `cloud-ci-cli` | Rust (native) | `cloud-ci` binary: `upload`, `split`, `merge`, `login`, `agent` |
+| `cloud-ci-cli` | Rust (native) | `cloud-ci` binary: `upload`, `split`, `lint`, `login`, `agent`, `setup` (`setup github-app`, `setup allowed-orgs`) |
 | `cloud-ci-runner-image` | Dockerfile | Base container image that runs `cloud-ci agent` |
 | `cloud-ci-web` | Svelte | Dashboard, served as Worker static assets |
 
@@ -119,10 +123,14 @@ External runs skip `queued`; they go straight to `running` on first upload.
 1. GitHub `push`/`pull_request` webhook → Worker verifies signature, enqueues, returns 200
    immediately (GitHub's webhook timeout is short; all real work happens off the request).
 2. Queue consumer fetches every `.cloud-ci/pipelines/*.ts` whose `on:` trigger matches the event
-   at the commit sha, starts a Dynamic Workflow per matching script (which then requests nodes
-   from the run's coordinator), creates a run in D1 for each, and hands them to the repo's
-   `RepoState` DO, which applies concurrency rules (cancel-superseded, per-repo limits).
-   Multiple pipelines can run for the same commit.
+   at the commit sha. For each matching script it requests admission from the repo's `RepoState`
+   DO (concurrency rules: cancel-superseded, per-repo limits) using a stable identity —
+   `(repo, sha, run key, attempt)`, with `run key` set to the pipeline file name — so a
+   redelivered or reordered webhook can never admit a duplicate run. Once admitted, the consumer
+   requests `RunCoordinator` initialization for that identity; the coordinator projects its row
+   into D1 (the queue consumer itself never writes run or job state) and starts a Dynamic
+   Workflow instance for the script, which then requests nodes from the coordinator. Multiple
+   pipelines can run for the same commit.
 3. `RunCoordinator` DO for the run owns the job DAG. For each ready job it resolves the instance
    size (fixed, or chosen by the rightsizer for `runner: auto`) and executor, computes shard
    assignments, mints a short-lived job token, and starts the job via that `Executor`.

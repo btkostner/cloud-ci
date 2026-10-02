@@ -34,20 +34,19 @@ cloud-ci reports results to GitHub in two independent ways:
 
 ### Configuration
 
-Per D1, settings.yml — not an admin dashboard switch — is the master on/off for the comment, since posting a comment spends neither money nor secrets. settings.yml is always read from the repo's default branch (never the PR's base ref, which can differ from the default branch, and never the PR head), so no PR, forked or not, can change the template or the coverage report compared by editing settings.yml on its own branch.
+Per D1, settings.yml — not an admin dashboard switch — is the master on/off for the comment, since posting a comment spends neither money nor secrets. settings.yml is always read from the repo's default branch (never the PR's base ref, which can differ from the default branch, and never the PR head), so no PR, forked or not, can change the template by editing settings.yml on its own branch.
 
 ```yaml
 # .cloud-ci/settings.yml
 pr_comment:
   enabled: true                                  # repo default; per-PR override via /cloud-ci comment on|off
   template: .cloud-ci/templates/pr-comment.md     # optional; falls back to the built-in template
-  coverage_report: unit                           # which coverage report name to diff vs base
 commands:
   roles:
     autofix: admin                                # raises a command's min role above its default; never lowers it
 ```
 
-Full schema: [./settings.md](./settings.md#pr-comment). Which checkbox actions are offered is decided by the template, not a settings.yml list (see Checkbox actions). External-run check policy (one check per job vs. per run vs. none) is also a settings.yml field; see [./settings.md](./settings.md#checks) and [./byo-ci.md](./byo-ci.md) for its exact key and defaults.
+Full schema: [./settings.md](./settings.md#field-reference). Which checkbox actions are offered is decided by the template, not a settings.yml list (see Checkbox actions). External-run checks are opt-in per upload via `--check`/`check_names` ([./byo-ci.md](./byo-ci.md)), never a settings.yml policy; see Check Runs below.
 
 ### Template rendering
 
@@ -134,10 +133,9 @@ A report or job carries a `scope` (package/app name + path prefix), set by the s
 | Check Run | Created when | Name | Details URL |
 | --- | --- | --- | --- |
 | Named check (script-defined) | `ci.check(name, opts)` runs in the script | the exact `name` passed to `ci.check` | dashboard check page |
-| Per external job | First ingest for job, if the repo's external-check policy is per-job | `<run_key> / <job>` | dashboard job page |
-| Per external run | First ingest for run, if the repo's external-check policy is per-run (the default) | `<run_key>` | dashboard run page |
+| Named check (external run) | `cloud-ci upload --check <name>` (or the ingest API's `StartJob.check_names`) names a check this run hasn't created yet | the exact name passed | dashboard check page |
 
-A script may create zero, one, or many named checks; a check with no attached nodes when the script ends concludes `success` with "no matching tasks" (see [dynamic-pipelines.md#github-status-checks](./dynamic-pipelines.md#github-status-checks)). External runs default to a per-run check because the external CI (for example GitHub Actions) usually posts its own per-job checks already. A shard group maps to a single Check Run, and the summary holds a shard table. There is no aggregate check; branch protection names whichever script-created check(s) it requires directly.
+A script may create zero, one, or many named checks; a check with no attached nodes when the script ends concludes `success` with "no matching tasks" (see [dynamic-pipelines.md#github-status-checks](./dynamic-pipelines.md#github-status-checks)). External runs work the same way: a job reports no check at all unless its upload explicitly names one via `--check`/`check_names` ([./byo-ci.md](./byo-ci.md)) — there is no default per-job or per-run check and no settings.yml policy selecting one; the uploading CI chooses by naming (or not naming) a check, exactly like a script choosing `check: null`. A shard group maps to a single Check Run, and the summary holds a shard table. There is no aggregate check; branch protection names whichever check(s) — script- or upload-named — it requires directly.
 
 Check Run `output.summary` holds the slice of the rendered comment relevant to that check (tests, failures, AI summary), built from the same template context. Failures that carry file/line from reports become annotations (`annotation_level: failure`, flaky as `warning`).
 
@@ -240,11 +238,11 @@ On flush `PullRequestState` builds a `PrReport` (proto message in `cloud-ci-prot
 - **Scopes:** see Scopes (monorepo) above.
 - **Tests:** merged totals per run, per scope. While shards are still running, partial totals are shown and labelled `partial`. After the merge barrier ([./parallelization.md](./parallelization.md)), the merged report replaces the partial sums.
 - **Failures:** failed test cases ordered by (required check first, first-failure-on-PR first, job DAG order, test name). Each carries message, trimmed stack, shard, attempt, log deep link, and history link. AI summaries are attached when `ai.summaries` has a row for the failure cluster ([./ai.md](./ai.md)); the AI job reports `ai_summary_ready` asynchronously. The comment never waits on AI and never shows a placeholder.
-- **Coverage:** the head report named by `coverage_report` (or the only one) is compared with the base report. The base is the coverage report of the same name from the latest completed run at the PR's merge-base sha, which comes from the compare API's `merge_base_commit` and is cached per (base, head). If no run exists at the merge-base, the latest base-branch run committed before it is used, labelled `(approximate base)`. Per-file deltas are shown only for files the PR touches or whose line coverage changed by at least 0.1 points.
+- **Coverage:** every named, scoped coverage report attached to the head run(s) is exposed in the context — not a single settings-selected one; the template decides which to render and how. Each head report is matched to its base by stable identity — `(run_key, job_name, report_kind, report_name, scope)` — read from the latest completed run at the PR's merge-base sha, which comes from the compare API's `merge_base_commit` and is cached per (base, head); a head report whose identity has no match in the base run renders with `no base report` instead of a diff. If no run exists at the merge-base, the latest base-branch run committed before it is used, labelled `(approximate base)`. Per-file deltas are shown only for files the PR touches or whose line coverage changed by at least 0.1 points.
 - **Perf:** job wall-time deltas and benchmark report deltas, plus the run's critical path (longest job-dependency chain by wall time). Present in the context for any template that wants it, but the built-in template does not render it — the full report page always shows it (see [./analytics.md](./analytics.md)). Runner-sizing decisions are not part of this context at all; they live only on the full report page, read directly from D1 `insights`/`sizing_decisions` ([./analytics.md](./analytics.md)).
 - **Reports:** site artifacts (merged Playwright, Vitest HTML, coverage HTML) at PR `latest` URLs, plus the artifact count ([./assets.md](./assets.md)), grouped by scope.
 - **Flaky:** in-run retry flakes plus tests that analytics marks as known-flaky and that failed in this run.
-- **Actions:** the checkbox actions enabled by `pr_comment.actions`, each with its stable id, used by the built-in template to render the Actions section and by any custom template that wants the same.
+- **Actions:** one descriptor per supported action (`rerun_failed`, `rerun_all`, `cancel`, `explain`, `autofix`, ...), each with its stable id, the slash command it maps to, its minimum role from `commands.roles` (including the `autofix` repo opt-in from [./ai.md](./ai.md)), and whether it currently applies given run state (for example `cancel` only while something is still running). The template decides which descriptors to render as checkboxes (see Checkbox actions); the context never derives from what a template already rendered.
 
 ### Size budget and truncation
 
@@ -352,10 +350,10 @@ CREATE TABLE pr_comments (
 );
 
 CREATE TABLE check_runs (
-  run_id TEXT NOT NULL, job_id TEXT NOT NULL,   -- job_id '' for per-run checks
-  gh_check_run_id INTEGER NOT NULL, name TEXT NOT NULL, head_sha TEXT NOT NULL,
+  run_id TEXT NOT NULL, name TEXT NOT NULL,
+  gh_check_run_id INTEGER NOT NULL, head_sha TEXT NOT NULL,
   status TEXT NOT NULL, conclusion TEXT, annotations_posted INTEGER NOT NULL DEFAULT 0,
-  last_patched_at INTEGER, PRIMARY KEY (run_id, job_id)
+  last_patched_at INTEGER, PRIMARY KEY (run_id, name)
 );
 
 CREATE TABLE comment_commands (

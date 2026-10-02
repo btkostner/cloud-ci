@@ -142,7 +142,7 @@ flowchart LR
     CLI[cloud-ci upload BYO-CI] -->|Report: timings + test results, no samples| Worker
     Worker -->|writeDataPoint per step/sample/test| AE[(Analytics Engine)]
     Worker -->|job/run summary row| D1Live[(D1: runs/jobs/steps)]
-    Worker -->|report summary + failed/flaky rows + test_stats upsert| D1Test[(D1: report_summaries, test_failures, test_stats)]
+    Worker -->|per-upload summary; test_stats upsert once per finalized run| D1Test[(D1: report_uploads, report_summaries, test_stats_applications, test_failures, test_stats)]
     Worker -->|full parsed report, compressed| R2[(R2)]
     Cron[Cron: */15 rollup] -->|SQL API query| AE
     Cron -->|upsert rollups + fresh insights| D1Roll[(D1: run_rollups, insights)]
@@ -163,9 +163,10 @@ Engine via `writeDataPoint`, because D1 is not suited to write volumes of that s
 Analytics Engine's 3-month retention and sampling-at-scale are a better fit for raw time series
 (verified 2026-09-30, developers.cloudflare.com/analytics/analytics-engine/limits/: 3-month
 retention, up to 20 blobs/20 doubles/1 index per data point, 16 KB blob budget per data point, 250
-`writeDataPoint` calls per Worker invocation). The same ingest path also writes a per-report
-summary row, upserts the touched tests' rolling aggregates, and writes the full parsed report to
-R2 — see D1 rollup tables and R2, below.
+`writeDataPoint` calls per Worker invocation). The same ingest path also writes a per-upload
+summary row and that upload's full parsed report to R2 immediately on ingest, and separately
+applies the touched tests' rolling aggregates exactly once per finalized run — see D1 rollup
+tables and R2, below.
 
 ### What is collected
 
@@ -237,22 +238,47 @@ getting this wrong silently understates p95s for the busiest repos.
 
 The storage-growth constraint (per [ADR 0010](../adr/0010-pluggable-executors.md)'s accompanying
 decision) is that **D1 must never hold one row per test case per run** — that scales with total
-test executions across all history, not with anything bounded. D1 instead holds three kinds of
+test executions across all history, not with anything bounded. D1 instead holds five kinds of
 rows, all either bounded by a count that does not grow with run volume, or swept by retention:
 
 ```sql
--- One row per report upload (run_id, job_name, report_type) — a summary, not per-test data.
+-- One immutable row per parsed upload, 1:1 with [./byo-ci.md](./byo-ci.md)'s `reports` row
+-- (the same `SubmitReport` call writes both, in the same D1 `batch()`); never updated after
+-- insert, so a retried `SubmitReport` resolves to this row via the PRIMARY KEY instead of
+-- re-parsing or duplicating it.
+CREATE TABLE report_uploads (
+  run_id          INTEGER NOT NULL,
+  job_name        TEXT NOT NULL,
+  shard_index     INTEGER NOT NULL,
+  report_type     TEXT NOT NULL,     -- junit | playwright-json | vitest-json | coverage | ...
+  report_name     TEXT NOT NULL,
+  scope           TEXT NOT NULL,     -- metadata only, not part of the key (byo-ci.md § Idempotency)
+  content_sha256  TEXT NOT NULL,
+  total           INTEGER NOT NULL,
+  passed          INTEGER NOT NULL,
+  failed          INTEGER NOT NULL,
+  skipped         INTEGER NOT NULL,
+  duration_ms     INTEGER NOT NULL,
+  r2_key          TEXT NOT NULL,     -- full parsed report, compressed, content-addressed (see R2, below)
+  created_at      INTEGER NOT NULL,
+  PRIMARY KEY (run_id, job_name, shard_index, report_type, report_name, content_sha256)
+);
+
 CREATE TABLE report_summaries (
   run_id        INTEGER NOT NULL,
   job_name      TEXT NOT NULL,
-  report_type   TEXT NOT NULL,       -- junit | playwright-json | vitest-json | coverage | ...
+  report_type   TEXT NOT NULL,
+  report_name   TEXT NOT NULL,
+  scope         TEXT NOT NULL,
+  shards_total  INTEGER NOT NULL,    -- the job's declared shard_total as of this recomputation
+  shards_in     INTEGER NOT NULL,    -- distinct shard_index values currently contributing
   total         INTEGER NOT NULL,
   passed        INTEGER NOT NULL,
   failed        INTEGER NOT NULL,
   skipped       INTEGER NOT NULL,
   duration_ms   INTEGER NOT NULL,
-  r2_key        TEXT NOT NULL,       -- full parsed report, compressed (see R2, below)
-  PRIMARY KEY (run_id, job_name, report_type)
+  updated_at    INTEGER NOT NULL,
+  PRIMARY KEY (run_id, job_name, report_type, report_name, scope)
 );
 
 -- One row per failing or flaky test *occurrence* — not every passing test. Retention-swept.
@@ -291,70 +317,177 @@ CREATE TABLE test_stats (
 );
 CREATE INDEX idx_test_stats_flaky ON test_stats (repo_id, flakiness_score);
 
+-- Gate for applying one run's finalized groups to test_stats/test_failures exactly once — see
+-- "Idempotency" below.
+CREATE TABLE test_stats_applications (
+  run_id        INTEGER NOT NULL,
+  job_name      TEXT NOT NULL,
+  report_type   TEXT NOT NULL,
+  report_name   TEXT NOT NULL,
+  scope         TEXT NOT NULL,
+  applied_at    INTEGER NOT NULL,
+  PRIMARY KEY (run_id, job_name, report_type, report_name, scope)
+);
+
 CREATE TABLE run_rollups      (run_id PK, repo_id, head_sha, started_at, duration_ms, queue_ms, critical_path_ms, cache_hit_rate, cost_usd_estimate, status);
 CREATE TABLE insights         (repo_id, kind, subject_id, severity, detail_json, created_at, PRIMARY KEY (repo_id, kind, subject_id, created_at));
 CREATE TABLE sizing_decisions (repo_id, job_name PK, current_instance_type, p95_memory_bytes, p95_cpu_frac, last_resized_at, reason, PRIMARY KEY (repo_id, job_name));
 ```
 
-`report_summaries`, `test_failures`, and `test_stats` are populated by the same ingest path (not
-the cron): the `post-run-analysis` Queue consumer that parses an uploaded report (via
-`cloud-ci-reports`) writes all three in one pass, per report. `run_rollups`, `insights`, and
-`sizing_decisions` remain populated by the `*/15` and nightly crons, same as before.
+`report_uploads` is a pure content-addressed log: its PRIMARY KEY omits `scope` because `scope`
+is metadata on the row, not part of upload identity (matching [byo-ci.md](./byo-ci.md)'s
+`reports`/`uploads` keys — see that doc's § Idempotency). `report_summaries` is the opposite: it
+is recomputed wholesale (overwritten, never incremented) by summing, per `shard_index`, whichever
+`report_uploads` row is *currently* canonical (byo-ci.md `reports.is_canonical`) for that slot,
+grouped by each canonical row's own `(report_type, report_name, scope)` — never a sum over every
+`report_uploads` row ever inserted, which would double-count a replaced or stale upload. Because
+it is a pure function of current canonical state, recomputing it from any trigger (a new upload
+landing, a duplicate/retried trigger, a late replacement) always converges to the same answer
+rather than drifting. `shards_in < shards_total` marks a partial aggregate (the job is still
+running, or some shards are missing) — this is what makes the same table serve both a live,
+partial dashboard view and the final one.
 
-**Upsert pattern for `test_stats`.** A report with thousands of test cases must not become
-thousands of D1 queries (D1's per-Worker-invocation cap is 1000 queries on Workers Paid, verified
-2026-09-30, developers.cloudflare.com/d1/platform/limits/). The consumer instead builds one JSON
-array of `{test_id, file_path, test_name, duration_ms, status}` per report and issues a single
-batched upsert using `json_each`, binding the whole array as one parameter (so the 100
-bound-parameters-per-query limit, same source, never applies regardless of test count):
+`report_uploads`, `report_summaries`, `test_failures`, `test_stats`, and `test_stats_applications`
+are populated by two distinct events on the same ingest path (not the cron):
+
+1. **Per upload** (every `SubmitReport` call, inline or upload-backed): the
+   `post-run-analysis` Queue consumer parses the report via `cloud-ci-reports`, writes its
+   immutable parsed result to R2, and sends that result's identity to `RunCoordinator`.
+   The coordinator inserts the `report_uploads` row and selects
+   [byo-ci.md](./byo-ci.md)'s `reports.is_canonical` in one D1 `batch()`, using the highest
+   original `accepted_seq` among parsed reports for the
+   `(job_name, shard_index, report_type, report_name)` slot. A delayed parse or a retry never
+   promotes older content over newer content. The coordinator recomputes the affected
+   `report_summaries` from canonical rows, without incrementing previous totals. If a
+   replacement changes scope, it also recomputes the old scope's group, deleting that
+   aggregate if no canonical row still contributes. The coordinator persists pending
+   projection work and retries it in order before processing the next canonical change.
+2. **Once per run** (not per job, and not per upload): `RunCoordinator` detects the run reaching
+   a terminal state ([byo-ci](./byo-ci.md)'s Completion semantics), then waits for every
+   `accepted_seq` issued before terminal to resolve — each either produces a `report_uploads`
+   row or a recorded parse failure — before freezing the run's canonical set: for every
+   `(job_name, report_type, report_name, scope)` group any job in the run produced, the current
+   canonical content for that group. `RunCoordinator` then drives one finalization `batch()`
+   covering every group in that frozen set, applying each group's canonical content to
+   `test_stats`/`test_failures` (see Idempotency, below).
+
+Because the run rejects any ingest call once it is terminal ([byo-ci](./byo-ci.md)'s Completion
+semantics), nothing can land after the frozen set is computed — there is no "replacement arrives
+after finalization" case to reconcile; a correction only counts if its `accepted_seq` landed
+before the run went terminal, in which case the drain above already waited for its parse.
+
+**Merged vs. raw reports never double-count history.** `report_summaries`/`test_stats` group by
+`(job_name, report_type, report_name, scope)`, and within a group, `report_summaries` sums at
+most one canonical row per `shard_index` — so there is exactly one path by which a job's test
+history can be counted, never two. Concretely:
+- For formats the Worker merges inline (JUnit, coverage — see
+  [parallelization.md](./parallelization.md)'s merge strategies), there is no second, separately
+  uploaded "merged" report: the job-level aggregate *is* the union, computed once at
+  finalization from each shard's canonical per-shard upload. No merge step re-submits through
+  `SubmitReport`, so there is nothing to double-count.
+- For opaque framework-blob formats (Playwright blob, Vitest blob), the raw per-shard blob
+  uploads are never parsed (no test-case data, so they contribute nothing to any
+  `report_summaries` row's totals, or to `test_stats`); only an explicit, separately-kinded
+  re-upload from the generated merge node (e.g. `playwright-json`, under its own `job_name` per
+  [parallelization.md](./parallelization.md)) produces test rows, under its own
+  `(job_name, report_type, report_name)` group — distinct from the raw blob group, so it is
+  never summed alongside it.
+- A pipeline that re-submits an already-named report's merged content under the *same*
+  `(job_name, shard_index, report_type, report_name)` as an earlier upload is a replacement
+  (highest-`accepted_seq`-wins), not an addition — it supersedes that slot's contribution in the
+  next recomputation rather than adding a second one.
+
+**Upsert pattern for `test_stats`.** A run's finalization can span thousands of test cases
+across many groups and must not become thousands of D1 queries (D1's per-Worker-invocation cap
+is 1000 queries on Workers Paid, verified 2026-09-30,
+developers.cloudflare.com/d1/platform/limits/). `RunCoordinator` reads every currently-canonical
+shard's full parsed object (content-addressed keys recorded on their `report_uploads` rows)
+across every group in the run's frozen set, and concatenates their per-test entries into one
+JSON array of `{test_id, file_path, test_name, duration_ms, status}`. Two groups can describe the
+same test (for example a JUnit report and a hand-rolled timing report covering the same suite),
+so before binding the array it is deduplicated by `test_id`, keeping one entry per distinct
+test — SQLite's row-by-row `INSERT ... SELECT ... ON CONFLICT` semantics apply the `runs`/EWMA
+update once per row of the `SELECT`, so an array with the same `test_id` twice would silently
+count one run as two. Raw, unparsed blob uploads never reach this array (they produce no
+`report_uploads` row to read from). The deduplicated array is then bound as a single parameter to
+one batched upsert using `json_each` (so the 100 bound-parameters-per-query limit, same source,
+never applies regardless of test count); the `WHERE true` after `FROM json_each(:tests)` is
+required — without it, SQLite's parser reads the following `ON` as a join condition on
+`json_each`'s result, not as the start of the `ON CONFLICT` clause, and the statement fails to
+parse (verified 2026-09-30, sqlite.org/lang_upsert.html § 2.2, sqlite.org/lang_insert.html):
 
 ```sql
 INSERT INTO test_stats (repo_id, test_id, file_path, test_name, runs, duration_ewma_ms,
                          last_duration_ms, last_status, recent_outcomes, last_run_id, last_sha, updated_at)
 SELECT :repo_id, value->>'test_id', value->>'file_path', value->>'test_name', 1,
        value->>'duration_ms', value->>'duration_ms', value->>'status',
-       substr(value->>'status', 1, 1), :run_id, :sha, :now
+       upper(substr(value->>'status', 1, 1)), :run_id, :sha, :now
 FROM json_each(:tests)
+WHERE true
 ON CONFLICT (repo_id, test_id) DO UPDATE SET
   runs             = test_stats.runs + 1,
   duration_ewma_ms = 0.2 * excluded.last_duration_ms + 0.8 * test_stats.duration_ewma_ms,
   last_duration_ms = excluded.last_duration_ms,
   last_status      = excluded.last_status,
-  recent_outcomes  = substr(test_stats.recent_outcomes || excluded.last_status, -20),
+  recent_outcomes  = substr(test_stats.recent_outcomes || excluded.recent_outcomes, -20),
   last_run_id      = excluded.last_run_id,
   last_sha         = excluded.last_sha,
   updated_at       = excluded.updated_at;
 ```
 
+`recent_outcomes` is always a single uppercase `P`/`F`/`S` char per run, never the full
+`last_status` word: the insert branch normalizes with `upper(substr(value->>'status', 1, 1))`,
+and the conflict branch appends `excluded.recent_outcomes` (that same normalized char), not
+`excluded.last_status` (the full word) — appending the full word would silently corrupt the
+sparkline and the flip-count `flakiness_score` is computed from.
+
 `flakiness_score` is deliberately **not** computed inline (it needs a flip-count scan over
 `recent_outcomes`, not a constant-time expression); the `*/15` cron recomputes it for every
 `test_stats` row touched since its last tick and writes it back in the same batched-upsert style.
-This keeps the ingest-path write cheap and moves the slightly heavier string scan to the async
-cron, off the request path.
+This keeps the finalization-path write cheap and moves the slightly heavier string scan to the
+async cron, off the request path.
 
-**Idempotency.** A retried Queue message must not double-apply the EWMA update or append the same
-outcome twice. The consumer guards on `report_summaries`' primary key
-`(run_id, job_name, report_type)`: it writes `report_summaries` and the `test_stats`/
-`test_failures` upserts in one D1 `batch()` call, and checks for an existing `report_summaries`
-row for that key first — a retry that finds the row already present skips re-applying the
-`test_stats`/`test_failures` writes for that report entirely, since `report_summaries`'s presence
-*is* the "already processed" marker.
+**Idempotency.** `RunCoordinator` owns report acceptance, canonical selection, and the
+finalization decision. It records these decisions in a serialized local storage transaction;
+it does not hold a transaction across R2 reads or D1 calls. After the parse drain, it persists
+the frozen report IDs and pending finalization work before dispatching the D1 batch. A restart
+or retry reuses that same snapshot. A single Durable Object instance alone is not an
+exactly-once guarantee: asynchronous requests can interleave, so pending projection work is
+processed in order, and D1's atomic markers below prevent duplicate history updates.
+
+D1's own `test_stats_applications` table remains as a backstop against Queue redelivery replaying
+the same finalization `batch()` (not against two independent coordinators racing, which the
+Durable Object model already rules out). The finalization batch's first statements are plain
+`INSERT`s into `test_stats_applications`, one per `(run_id, job_name, report_type, report_name,
+scope)` group in the frozen set — no `OR IGNORE`. The `PRIMARY KEY` is the concurrency-safe
+marker: if any of those rows already exist, the corresponding `INSERT` fails with a constraint
+violation, and D1's `batch()` is documented to run its statements as a SQL transaction that
+aborts/rolls back the *entire* sequence when any one statement fails (verified 2026-09-30,
+developers.cloudflare.com/d1/worker-api/d1-database/#batch) — so a redelivered finalization
+message, replaying a batch whose groups are already marked applied, commits nothing a second
+time. A caller that gets this failure treats the whole batch as "already applied," not an error
+to retry.
 
 **D1 size budget.** D1's maximum database size is 10 GB on Workers Paid (500 MB on Free; cannot be
 increased past 10 GB even on Paid — verified 2026-09-30,
 developers.cloudflare.com/d1/platform/limits/). Every table above is bounded by something other
 than cumulative run count: `test_stats` by distinct test count (a repo with 100,000 tests at
-~250 bytes/row is ~25 MB); `report_summaries` and `run_rollups` by run × job count, swept by the
-retention cron below; `test_failures` similarly swept, and inherently low-cardinality relative to
-total test executions since only failures/flakes are stored. This is the design property D5 was
-written to guarantee: no table here scales with *(runs × tests per run)*, which is the dimension
-that would otherwise threaten the 10 GB ceiling for an active monorepo.
+~250 bytes/row is ~25 MB); `report_uploads` by run × job × shard × report count (one row per
+upload, not per test case); `report_summaries`, `test_stats_applications`, and `run_rollups` by
+run × job × report-group count, all swept by the retention cron below; `test_failures` similarly
+swept, and inherently low-cardinality relative to total test executions since only
+failures/flakes are stored. This is the design property D5 was written to guarantee: no table
+here scales with *(runs × tests per run)*, which is the dimension that would otherwise threaten
+the 10 GB ceiling for an active monorepo.
 
-**Retention.** `report_summaries`, `test_failures`, and `run_rollups` are pruned by the retention
-cron mentioned in the brief (age-based, deployment-configurable, default 90 days — exact knob
-deferred to the migration). `test_stats` is never pruned by age (it is a bounded aggregate, not an
-event log) — a row is only removed when its test hasn't appeared in any report for a configurable
-number of days (default 180), as a signal the test was deleted/renamed.
+**Retention.** `report_uploads`, `report_summaries`, `test_stats_applications`, `test_failures`,
+and `run_rollups` are pruned by the retention cron mentioned in the brief (age-based,
+deployment-configurable, default 90 days — exact knob deferred to the migration); a group's
+`test_stats_applications` row is only safe to prune once its run is old enough that no retry of
+its finalization could still arrive, which the age-based window already guarantees. `test_stats`
+is never pruned by age (it is a bounded aggregate, not an event log) — a row is only removed when
+its test hasn't appeared in any report for a configurable number of days (default 180), as a
+signal the test was deleted/renamed.
 
 `test_stats` is read by [./parallelization.md](./parallelization.md)'s `timing` split strategy and
 `auto` shard-count resolution; that doc never defines or writes this table.
@@ -365,22 +498,30 @@ keys above are the contract other docs can rely on.
 
 ### R2
 
-The full per-run parsed result — every test case's id, name, duration, and status, not just
-failures — is stored in R2, not D1, as a compressed file per report:
+The full parsed result of each upload — every test case's id, name, duration, and status, not
+just failures — is stored in R2, not D1, as one compressed, content-addressed file per upload
+(matching `report_uploads`' primary key, so a replacement upload never overwrites an older one):
 
 ```
-runs/{run_id}/jobs/{job_name}/parsed/{report_type}.json.zst   # cloud-ci-reports' internal schema, all test cases
+runs/{run_id}/jobs/{job_name}/shards/{shard_index}/parsed/{report_type}/{report_name}/{content_sha256}.json.zst
 ```
 
 This is what `cloud-ci-reports` (the report-parsing/merging package, see
-[ADR 0010](../adr/0010-pluggable-executors.md)) produces when it parses an uploaded report; it is
-the source `report_summaries` and `test_stats`/`test_failures` are derived from. A dashboard view
-that needs the full per-test list for one run (not just failures or the rolling aggregate) reads
-this object directly rather than querying D1. The merged, framework-native report files
-(`runs/{run_id}/jobs/{job_name}/merged/report.{ext}`) are [./parallelization.md](./parallelization.md)'s
-R2 keys, distinct from this parsed representation — one is the merged original-format file, the
-other is cloud-ci's own structured view used for analytics. Raw logs and the merged HTML site
-artifact are [./assets.md](./assets.md)'s domain.
+[ADR 0010](../adr/0010-pluggable-executors.md)) produces when it parses an upload — distinct
+from the *raw* bytes it was parsed from, which live at `uploads.r2_key`
+([byo-ci](./byo-ci.md)'s immutable per-upload storage) and at that job/shard's
+publication-alias path ([byo-ci](./byo-ci.md)'s R2 keys). This parsed object is the source
+`report_uploads` is a summary of, and what a run's finalization reads — concatenated across
+every group's currently-canonical shard objects in the run's frozen set (see Idempotency,
+above). A dashboard view that needs the full per-test list for one job's report reads every
+shard's currently-canonical object directly — the keys come from `report_uploads`/
+[byo-ci.md](./byo-ci.md)'s `reports.is_canonical` rows, not from an R2 prefix listing — rather
+than querying D1 for per-test rows it does not keep. The merged, framework-native report files
+(`runs/{run_id}/jobs/{job_name}/merged/report.{ext}`) are
+[./parallelization.md](./parallelization.md)'s R2 keys, written directly by the merge step
+outside the `SubmitReport` ingest path — they are a separate, display-oriented artifact, never
+re-ingested, so they never produce a second `report_uploads` row or a second contribution to
+`test_stats`. Raw logs and the merged HTML site artifact are [./assets.md](./assets.md)'s domain.
 
 ### Derived insights
 
@@ -524,8 +665,8 @@ flowchart TD
 
 ### D1 tables (see also "D1 rollup tables" above for the analytics-owned set)
 
-- `report_summaries`, `test_failures`, `test_stats`, `run_rollups`, `insights`,
-  `sizing_decisions` — owned by this doc; schemas above.
+- `report_uploads`, `report_summaries`, `test_stats_applications`, `test_failures`, `test_stats`,
+  `run_rollups`, `insights`, `sizing_decisions` — owned by this doc; schemas above.
 - `runs`, `jobs`, `steps` (live, written by RunCoordinator as a run progresses) — owned by
   [../architecture.md](../architecture.md); analytics reads `jobs.instance_type` and
   `jobs.duration_ms` as rollup inputs but does not define these tables.
@@ -540,8 +681,8 @@ flowchart TD
 
 ### R2
 
-- `runs/{run_id}/jobs/{job_name}/parsed/{report_type}.json.zst` — full per-run parsed test results
-  (every test case), this doc's own key, defined in "R2" above.
+- `runs/{run_id}/jobs/{job_name}/shards/{shard_index}/parsed/{report_type}/{report_name}/{content_sha256}.json.zst`
+  — full per-upload parsed test results (every test case), this doc's own key, defined in "R2" above.
 - Merged framework-native reports and the merged HTML site artifact are
   [./parallelization.md](./parallelization.md) and [./assets.md](./assets.md)'s keys respectively;
   this doc reads neither directly.
@@ -569,7 +710,8 @@ flowchart TD
 | --- | --- |
 | Agent crashes before emitting a Report (e.g. OOM-killed) | RunCoordinator detects the container exited without a final Report; if `memory.events.oom_kill` was observed (via a last-gasp sample or the Worker's own container-exit-code inspection), treat as OOM and trigger OOM-retry; otherwise mark the job failed with no resource data for that run (it is simply excluded from the next p95 window, not treated as a zero). |
 | Analytics Engine `writeDataPoints` call fails (e.g. transient 5xx) | Logged and dropped; one run's worth of samples/tests missing from Analytics Engine does not block the run from completing or from showing live durations (sourced from D1 `runs`/`jobs`/`steps`), since the dashboard's live run view does not depend on Analytics Engine at all. |
-| `post-run-analysis` consumer retries after partially writing `report_summaries`/`test_stats`/`test_failures` | The three writes happen in one D1 `batch()` call guarded by `report_summaries`' primary key (see "Idempotency" above), so a retry either sees the row already present and skips re-applying, or the whole batch failed atomically and retries cleanly — never a partial EWMA/outcome-string double-application. |
+| `post-run-analysis` consumer retries a finalization after partially writing `test_stats_applications`/`test_stats`/`test_failures` | All three writes happen in one D1 `batch()` call, marker insert first (see "Idempotency" above); a retry either hits the marker's `PRIMARY KEY` conflict and the whole batch rolls back (no-op), or the first attempt's batch itself failed partway and rolled back entirely — never a partial EWMA/outcome-string double-application, and never a silently skipped shard. |
+| `post-run-analysis` consumer retries a per-upload parse (a redelivered `SubmitReport` Queue message) | `report_uploads`' `PRIMARY KEY` is the upload's own content-addressed identity, so a retry that reparses identical bytes resolves to the same row (R2 write and D1 insert both become no-ops) rather than creating a duplicate or re-triggering a finalization. |
 | Rollup cron fails mid-batch | Upserts are idempotent per `(repo_id, period)`/`(run_id, job_id)` key, so a retried cron run (next scheduled tick) safely reprocesses the same window; no partial-rollup corruption, just a delay until the next successful tick. |
 | Analytics Engine query sampling kicks in for a very high-volume repo | p95/flakiness computations already weight by `_sample_interval`; accuracy degrades gracefully rather than silently, and extremely low event-count index values (new or quiet repos) are never sampled per Analytics Engine's equitable-sampling design. |
 | `runner: "auto"` has fewer than 5 historical runs (new node) | Uses configured `initial` size, does not attempt sizing, so a brand-new node never gets undersized on its first few runs based on no data. |

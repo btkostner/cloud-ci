@@ -74,7 +74,7 @@ Full schema and deployment-wide bounds: [settings.md](./settings.md#field-refere
 
 ### PR comment section
 
-The summary is one section of the sticky comment ([./pr-comment.md](./pr-comment.md)). It is capped at 1,500 characters per failure and 5 failures, inside a `<details>` block, so the AI section stays well under GitHub's 65,536-character comment limit. That limit is documented only through API error messages ("body is too long (maximum is 65536 characters)"), observed in https://github.com/orgs/community/discussions/41331 (checked 2026-09-30).
+The summary is one section of the sticky comment ([./pr-comment.md](./pr-comment.md)). It is capped at 800 bytes per failure and 5 failures, inside a `<details>` block, so the AI section stays well under GitHub's 65,536-character comment limit. That limit is documented only through API error messages ("body is too long (maximum is 65536 characters)"), observed in https://github.com/orgs/community/discussions/41331 (checked 2026-09-30).
 
 ```markdown
 <details open><summary><b>Why it failed</b> (AI-generated, gpt-oss-120b)</summary>

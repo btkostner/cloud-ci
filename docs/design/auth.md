@@ -58,12 +58,17 @@ manifest flow.
 [vars]
 GITHUB_APP_ID = "123456"
 GITHUB_APP_CLIENT_ID = "Iv1.8a61f9b3a7aba766"
-GITHUB_ALLOWED_ORGS = "acme-corp,acme-labs"            # set once at setup, see below
+GITHUB_ALLOWED_ORGS = "acme-corp,acme-labs"            # deployed allowlist, see below
 
 [[secrets_store_secrets]]
 binding = "GITHUB_APP_PRIVATE_KEY"
 store_id = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"
 secret_name = "github-app-private-key"
+
+[[secrets_store_secrets]]
+binding = "GITHUB_APP_CLIENT_SECRET"
+store_id = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"
+secret_name = "github-app-client-secret"
 
 [[secrets_store_secrets]]
 binding = "GITHUB_WEBHOOK_SECRET"
@@ -88,6 +93,16 @@ on every `installation` webhook — see [Multiple orgs and installations](#multi
 provides, since a public App (needed when a company's orgs are not all under one GitHub
 Enterprise account) can otherwise be installed by any GitHub account.
 
+These values and binding declarations are deployment configuration, not mutable Worker
+state. The `cloud-ci setup` CLI — run locally by the deployment operator, authenticated with
+the operator's own GitHub session and Cloudflare API token — writes the identifiers and
+allowlist to `wrangler.toml`, creates the account-level secrets using those Cloudflare
+credentials, records each binding's `store_id` and `secret_name`, and runs `wrangler deploy`.
+See [GitHub App setup](#github-app-setup) for the full flow. The running Worker only reads the
+resulting vars and secret bindings; it has no runtime API to rewrite its own `vars` or bind a
+Secrets Store secret, so no request handler — setup callback, dashboard, or otherwise — can
+persist changes to them.
+
 ### Per-repo overrides
 
 ```yaml
@@ -102,7 +117,7 @@ commands:
 Values can only be raised (`operator` → `admin`), never lowered below `operator` — `viewer`
 cannot invoke commands, so it is not a valid value here. `settings.yml` is always read from the
 repo's default branch, same as every other `settings.yml` key, so no PR can raise or lower these
-roles by editing the file on its own branch. See [settings.md](./settings.md#commands) for the
+roles by editing the file on its own branch. See [settings.md](./settings.md#field-reference) for the
 rest of the file format.
 
 ### CLI login
@@ -133,9 +148,9 @@ are resolved per repo across every installation this deployment has, not just on
 Login uses the GitHub App's own user-to-server OAuth (standard web application flow; GitHub
 Apps need no separate OAuth App registration): the browser is redirected to
 `github.com/login/oauth/authorize`, GitHub redirects back with a `code`, the Worker exchanges
-it at `/login/oauth/access_token` for a user access token, calls `GET /user` once to get a
-verified `login`/`id`/`email`, upserts a `users` row, creates a session, and sets the session
-cookie.
+it at `/login/oauth/access_token` using `GITHUB_APP_CLIENT_ID` and the bound
+`GITHUB_APP_CLIENT_SECRET` for a user access token, calls `GET /user` once to get a verified
+`login`/`id`/`email`, upserts a `users` row, creates a session, and sets the session cookie.
 
 The Worker never stores the GitHub user access token past the callback: it is used once, to
 call `GET /user` for a verified `login`/`id`, then discarded. Repo-level role resolution does
@@ -201,12 +216,16 @@ deployment has, of repos where `GET /repos/{owner}/{repo}/collaborators/{usernam
 `acme-corp` engineer and has no access to `acme-labs` simply sees zero `acme-labs` repos — there
 is no separate "which orgs can this user see" step, it falls out of the per-repo check.
 
-**Org allowlist changes.** Adding an org to `GITHUB_ALLOWED_ORGS` does not retroactively install
-anything — the org owner still has to run the GitHub install flow, which then succeeds because
-the allowlist no longer rejects it. Removing an org from the allowlist does not uninstall it
-automatically (the Worker only acts on `installation` webhooks); a deployer who wants it
-removed immediately also uninstalls the App from that org in GitHub's UI, or the next full
-reconcile pass flags the mismatch for manual follow-up [open question, below].
+**Org allowlist changes.** `cloud-ci setup allowed-orgs --add <login>` (or `--remove`) is the
+real write path: it edits `GITHUB_ALLOWED_ORGS` in `wrangler.toml` with the operator's own
+Cloudflare credentials and runs `wrangler deploy`, the same way [GitHub App
+setup](#github-app-setup) does for the initial value — there is no runtime admin action that
+mutates the allowlist. Adding an org does not retroactively install anything — the org owner
+still has to run the GitHub install flow, which then succeeds because the deployed allowlist no
+longer rejects it. Removing an org from the allowlist does not uninstall it automatically (the
+Worker only acts on `installation` webhooks); a deployer who wants it removed immediately also
+uninstalls the App from that org in GitHub's UI, or the next full reconcile pass flags the
+mismatch for manual follow-up [open question, below].
 
 ### Role resolution
 
@@ -250,11 +269,13 @@ handling.
 | Purge artifacts / change asset retention (see [assets.md](./assets.md)) | admin |
 | Issue, list, revoke scoped API tokens | admin |
 
-Rotating the GitHub App's own private key, webhook secret, or `CLOUD_CI_MASTER_KEY`, and
-changing `GITHUB_ALLOWED_ORGS` or installing/uninstalling the App on an org, are
-deployment-operator actions performed through Cloudflare (dashboard or `wrangler`) and GitHub,
-not a cloud-ci role — anyone who can deploy the Worker or administer the GitHub App already has
-that access, and no cloud-ci role is meant to substitute for it.
+Rotating the GitHub App's own private key, webhook secret, OAuth client secret, or
+`CLOUD_CI_MASTER_KEY` (new Secrets Store secret values via the operator's Cloudflare
+credentials, then `wrangler deploy`), and changing `GITHUB_ALLOWED_ORGS` (via `cloud-ci setup
+allowed-orgs`, above) or installing/uninstalling the App on an org, are deployment-operator
+actions performed through Cloudflare and GitHub, not a cloud-ci role — anyone who can deploy
+the Worker or administer the GitHub App already has that access, and no cloud-ci role is meant
+to substitute for it.
 
 ### Machine auth
 
@@ -339,27 +360,49 @@ The `info` string namespaces keys per token type (`job`, `ingest`) so a job toke
 
 The App is registered once per deployment via the [manifest
 flow](https://docs.github.com/en/apps/sharing-github-apps/registering-a-github-app-from-a-manifest)
-(accessed 2026-09-30), driven by a one-time setup command/page rather than manual form-filling.
-Setup also collects `GITHUB_ALLOWED_ORGS` (the deployer types the org logins they intend to use)
-before the first installation, since the allowlist check on `installation.created` needs it in
-place from the start:
+(accessed 2026-09-30), driven by `cloud-ci setup github-app`, a CLI the deployment operator
+runs locally, authenticated with the operator's own GitHub browser session and the operator's
+own Cloudflare API token (the same credential `wrangler` already uses). The CLI performs every
+write itself — a Worker has no runtime API to rewrite its own `vars` or bind a new Secrets
+Store secret, so persisting these credentials has to happen before `wrangler deploy`, not
+inside a `fetch` handler. The operator passes `GITHUB_ALLOWED_ORGS` (the org logins they intend
+to use) as a CLI argument before the manifest is ever sent, since the allowlist check on
+`installation.created` needs it in place from the deployment that first registers the App:
 
 ```mermaid
 sequenceDiagram
     participant Op as Deployer
-    participant W as cloud-ci-worker (setup route)
+    participant T as cloud-ci setup (local CLI)
     participant GH as GitHub
+    participant CF as Cloudflare API
 
-    Op->>W: GET /setup/github-app
-    W->>Op: HTML form (incl. GITHUB_ALLOWED_ORGS), POSTs manifest JSON to GitHub
-    Op->>GH: POST github.com/settings/apps/new (or /organizations/{org}/settings/apps/new)
-    GH->>Op: 302 to redirect_url?code=...
-    Op->>W: GET /setup/github-app/callback?code
-    W->>GH: POST /app-manifests/{code}/conversions
-    GH->>W: { id, pem, webhook_secret, client_id, client_secret }
-    W->>W: store pem + webhook_secret in Secrets Store, app_id/client_id/allowed_orgs in vars
-    W->>Op: "App registered — install it on each allowed org"
+    Op->>T: cloud-ci setup github-app --allowed-orgs acme-corp,acme-labs
+    T->>T: start loopback listener on 127.0.0.1:<port>
+    T->>Op: open browser to github.com/settings/apps/new with manifest (redirect_url = loopback)
+    Op->>GH: confirm app creation (operator's own GitHub session)
+    GH->>Op: 302 to http://127.0.0.1:<port>/callback?code=...
+    Op->>T: browser delivers code to the loopback listener
+    T->>GH: POST /app-manifests/{code}/conversions
+    GH->>T: { id, pem, webhook_secret, client_id, client_secret }
+    T->>T: generate CLOUD_CI_MASTER_KEY locally
+    T->>CF: create 4 Secrets Store secrets (operator's Cloudflare API token)
+    CF->>T: store_id + secret_name per secret
+    T->>T: write app_id/client_id/allowed_orgs to wrangler.toml [vars], write 4 secrets_store_secrets bindings
+    T->>CF: wrangler deploy
+    CF->>T: deployed
+    T->>Op: "App registered and deployed — install it on each allowed org"
 ```
+
+The `code` never leaves the operator's machine — the manifest's `redirect_url` is a loopback
+address, not the deployed Worker's hostname — and the conversion call, secret creation, and
+`wrangler.toml` edit all happen in that same local process, so `pem`, `webhook_secret`, and
+`client_secret` never cross a public URL, never reach Worker logs, and never appear in a
+browser response; the browser only ever sees the final confirmation message. Until that first
+`wrangler deploy` from setup lands, `GITHUB_APP_ID` and `GITHUB_ALLOWED_ORGS` are unset and the
+four secret bindings do not exist, so the deployed Worker's webhook handler, OAuth callback,
+and OIDC/ingest paths all fail closed (503, "not yet configured") — no `installation` can be
+accepted and no human or machine caller can authenticate until an operator has actually
+finished setup.
 
 All three steps must complete within one hour of the manifest `POST`
 (docs.github.com/en/apps/sharing-github-apps/registering-a-github-app-from-a-manifest,
@@ -370,7 +413,7 @@ accessed 2026-09-30). The manifest:
   "name": "cloud-ci (acme)",
   "url": "https://ci.acme.example",
   "hook_attributes": { "url": "https://ci.acme.example/webhooks/github" },
-  "redirect_url": "https://ci.acme.example/setup/github-app/callback",
+  "redirect_url": "http://127.0.0.1:<port>/callback",
   "public": false,
   "default_permissions": {
     "contents": "read",
@@ -378,7 +421,8 @@ accessed 2026-09-30). The manifest:
     "pull_requests": "write",
     "issues": "write",
     "metadata": "read",
-    "statuses": "write"
+    "statuses": "write",
+    "actions": "read"
   },
   "default_events": [
     "push",
@@ -387,13 +431,14 @@ accessed 2026-09-30). The manifest:
     "check_run",
     "issue_comment",
     "installation",
-    "installation_repositories"
+    "installation_repositories",
+    "workflow_run"
   ]
 }
 ```
 
-`public` starts `false`; it is flipped to `true` during setup only if the deployer's orgs are
-not all under one GitHub Enterprise account — see
+`public` starts `false`; the `cloud-ci setup github-app` CLI flips it to `true` only if the
+deployer's orgs are not all under one GitHub Enterprise account — see
 [Multiple orgs and installations](#multiple-orgs-and-installations) for why that is the only
 case that needs it, and why `GITHUB_ALLOWED_ORGS` is mandatory as soon as it is.
 
@@ -405,6 +450,7 @@ case that needs it, and why `GITHUB_ALLOWED_ORGS` is mandatory as soon as it is.
 | Issues | write | `issue_comment` events carry `/cloud-ci` slash commands on PRs (PRs are issues in the GitHub API) |
 | Metadata | read | Mandatory for every GitHub App; also backs the collaborator-permission role lookup above |
 | Commit statuses | write | Legacy status API fallback where Check Runs are unavailable [unverified — may be droppable if Checks alone suffices] |
+| Actions | read | Required to receive `workflow_run` webhook deliveries, used to close a BYO CI run on completion ([byo-ci.md](./byo-ci.md)) |
 
 | Event | Why |
 | --- | --- |
@@ -413,6 +459,7 @@ case that needs it, and why `GITHUB_ALLOWED_ORGS` is mandatory as soon as it is.
 | `check_suite`, `check_run` | `rerequested` action drives re-run from GitHub's own UI |
 | `issue_comment` | `/cloud-ci` slash commands |
 | `installation`, `installation_repositories` | Discover/allowlist-gate new installations (see [Multiple orgs and installations](#multiple-orgs-and-installations)); invalidate `repo_role_cache` and `repos` rows on suspend/uninstall/repo add-remove |
+| `workflow_run` | `completed` deliveries close a BYO CI run correlated by `GITHUB_RUN_ID` ([byo-ci.md](./byo-ci.md)) |
 
 **Contents: write** and the ability to open PRs with the suggested-changes bot identity is requested only when a deployment opts into AI autofix's fix-PR mode at setup time ([ai.md](./ai.md)); it is not in the default manifest, keeping the default install's blast radius to "comment and check status," never "push code," matching the autofix invariant in architecture.md.
 
@@ -424,12 +471,26 @@ App-level authentication (fetching an installation token, or any `/app/*` endpoi
 | --- | --- | --- |
 | GitHub App private key (PEM) | Secrets Store, `workers` scope binding | Account-level, encrypted, never readable again after creation; shared only by this Worker |
 | GitHub webhook secret | Secrets Store | Same as above |
+| GitHub App OAuth client secret | Secrets Store | Needed to exchange the OAuth `code` for a user access token during [human login](#human-auth-github-oauth); same as above — never has a legitimate reason to be read back |
 | `CLOUD_CI_MASTER_KEY` (HKDF root for job/ingest tokens and asset grants, see [assets.md](./assets.md)) | Secrets Store | Same as above; rotating it invalidates all outstanding job/ingest tokens, which is acceptable since they are minutes-to-hours lived |
-| `GITHUB_APP_ID`, `GITHUB_APP_CLIENT_ID`, `GITHUB_ALLOWED_ORGS` | Worker `vars` | Not secret — public identifiers / an allowlist, not a credential |
+| `GITHUB_APP_ID`, `GITHUB_APP_CLIENT_ID`, `GITHUB_ALLOWED_ORGS` | Worker `vars` | Not secret — public identifiers / an allowlist, not a credential; written by the `cloud-ci setup` CLI into `wrangler.toml`, read-only at runtime |
 | Scoped API tokens | D1, `api_tokens.token_hash` (SHA-256) | Caller-controlled lifetime; must be revocable, so hashed-at-rest, not HMAC-derived |
 | Session ids | D1, `sessions.id` (SHA-256 of the cookie value) | Same reasoning as API tokens — revocable, worthless if D1 leaks |
 
-Secrets Store is an account-level store (distinct from per-Worker `wrangler secret put` variables), bound into the Worker via `secrets_store_secrets` in `wrangler.toml` and read with `await env.<BINDING>.get()`; creating or binding a secret requires the Super Administrator or Secrets Store Admin/Deployer role on the Cloudflare account (developers.cloudflare.com/secrets-store/integrations/workers, updated 2026-05-05). This means the same GitHub App private key is available to `cloud-ci-worker` without copy-pasting it into every environment's `wrangler secret put` separately, and the dashboard/API never has a code path that can read a secret value back out.
+Secrets Store is an account-level store (distinct from per-Worker `wrangler secret put`
+variables), bound into the Worker via `secrets_store_secrets` in `wrangler.toml` and read with
+`await env.<BINDING>.get()`. Creating a secret requires the Super Administrator or Secrets
+Store Admin role, and binding it into a Worker requires the Super Administrator or Secrets
+Store Deployer role, on the Cloudflare account
+(developers.cloudflare.com/secrets-store/integrations/workers, updated 2026-05-05). The
+`cloud-ci setup` CLI does both steps with the operator's own Cloudflare API token — it creates
+each of the four secrets above, writes the resulting `binding`/`store_id`/`secret_name` into
+`wrangler.toml`, and runs `wrangler deploy` to bind them (see [GitHub App
+setup](#github-app-setup)); the deployed Worker only ever reads them with
+`await env.<BINDING>.get()` and has no code path that creates, rewrites, or reads a secret
+value back out for display. This means the same GitHub App private key is available to
+`cloud-ci-worker` without copy-pasting it into every environment's `wrangler secret put`
+separately.
 
 ### Webhook signature verification
 

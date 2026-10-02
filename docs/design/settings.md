@@ -69,7 +69,7 @@ pr_comment:
 
 ai:
   enabled: true                    # master switch for this repo; off by default
-  summaries: true                  # Workers AI failure summaries in the PR comment (off | pr | all)
+  summaries: pr                    # Workers AI failure summaries in the PR comment (off | pr | all)
   flaky_hints: true                # heuristic hints for known-flaky failures
   perf_suggestions: weekly         # off | weekly
   autofix: suggest                 # off | suggest | pull_request
@@ -279,21 +279,36 @@ deployment's Secrets Store, which is checked at job start, not at config-validat
 | `retention.logs_days` | int | `30` | 1..deployment max |
 | `retention.snapshots_days` | int | `14` | 1..deployment max |
 | `cache.max_size_per_repo` | size | `5GiB` | 1..deployment max |
-| `secrets.<pipeline_file_name>` | string[] | `[]` | pipeline must exist in `.cloud-ci/pipelines/`; names `^[A-Z][A-Z0-9_]{0,63}$` |
+| `secrets.<pipeline_file_name>` | string[] | `[]` | pipeline must exist in `.cloud-ci/pipelines/` at the resolved default-branch sha (checked every event, never cached); names `^[A-Z][A-Z0-9_]{0,63}$` |
 
 ### Validation
 
-Validation runs in two passes, collecting all errors (up to 50) instead of stopping at the first.
-Each error carries `line:col` and is posted as an annotation on the `cloud-ci / config` check.
+Validation runs content-dependent checks and a pipeline-reference check, cached differently
+because they depend on different inputs. All collect errors (up to 50) instead of stopping at the
+first; each error carries `line:col` and is posted as an annotation on the `cloud-ci / config`
+check.
+
+Content-dependent passes are a pure function of `settings.yml`'s bytes, so identical bytes always
+produce the same result regardless of which commit carries them — these are what the
+`repo_settings` cache (see Data model) stores, keyed by `blob_sha`:
 
 1. YAML 1.2 core schema, so `on`/`yes`/`no` parse as strings. Duplicate map keys are errors.
    Unknown keys are errors, not warnings — each suggests the nearest known key, so a misspelled
    key cannot silently pass.
-2. Semantic: enum values, name patterns, numeric bounds, and the `secrets.<pipeline>` key must
-   name a file that exists in `.cloud-ci/pipelines/` at the same sha (an allow-list for a pipeline
-   that does not exist is a typo, not a no-op). Deployment-wide-bound clamping (see
+2. Semantic: enum values, name patterns, and numeric bounds. Deployment-wide-bound clamping (see
    [Deployment-wide limits](#deployment-wide-limits)) runs after this pass and only ever produces
    warnings, never errors.
+
+Pipeline-reference check is not cacheable by `blob_sha`: its answer depends on the pipeline tree,
+which moves independently of `settings.yml`'s content.
+
+3. Every `secrets.<pipeline>` key must name a file that exists in `.cloud-ci/pipelines/` at the
+   resolved default-branch sha (an allow-list for a pipeline that does not exist is a typo, not a
+   no-op) — the same sha `settings.yml` itself is fetched from (see
+   [Fetching settings.yml](#fetching-settingsyml)), never the triggering event's own sha. This
+   check re-runs against the current `pipeline_manifest` on every event, even when
+   `settings.yml`'s `blob_sha` is unchanged and its cached content-errors are reused, because a
+   pipeline file can be renamed or removed on the default branch without touching `settings.yml`.
 
 Limits: 64 KiB file, 100 pipeline files per repo, 50 secret names per pipeline entry. The parser
 is a pure module with no I/O, shared by the Worker and the CLI (`cloud-ci lint`).
@@ -308,6 +323,13 @@ CREATE TABLE pipeline_manifest (repo_id INTEGER, file_name TEXT, blob_sha TEXT, 
 CREATE TABLE repo_schedules (repo_id INTEGER, file_name TEXT, idx INTEGER, cron TEXT, branch TEXT,
   config_blob_sha TEXT, next_fire_at INTEGER, PRIMARY KEY (repo_id, file_name, idx));
 ```
+
+`repo_settings.errors_json` holds only the content-dependent parse and semantic errors from
+Validation steps 1–2 above — a pure function of `blob_sha`. The pipeline-reference check (step 3)
+is never written here: it is recomputed on every event by matching each `secrets.<pipeline>` name
+against `pipeline_manifest` rows for `repo_id` at the resolved default-branch sha, so a pipeline
+file disappearing from the default branch is caught immediately even when `settings.yml`'s
+`blob_sha` — and its cached content-errors — have not changed.
 
 R2 keys: `runs/{run_id}/pipeline.js` (bundled pipeline source, immutable per run) and
 `runs/{run_id}/settings.json` (resolved settings, immutable per run). `RepoState` holds the
@@ -347,13 +369,6 @@ themselves stay in Cloudflare Secrets Store and are never read into D1.
 | No `settings.yml` | Deployment defaults apply; no config-validation failure |
 | Schedule alarm lost | Re-armed by the 15-minute safety Cron Trigger; at most one occurrence delayed, never double-fired |
 | Schedule `branch` missing when the alarm fires | Occurrence skipped and logged |
-
-## Open questions
-
-1. `secrets.<pipeline>` currently requires the pipeline file to exist at validation time. Does a
-   rename (`ci.ts` -> `verify.ts`) in the same PR as a `settings.yml` update race against which
-   sha each is read at? Both are read at the same commit sha today, which should make this moot,
-   but it is worth a Phase 0 check.
 
 ## Alternatives considered
 

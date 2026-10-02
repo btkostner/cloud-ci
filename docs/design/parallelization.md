@@ -42,7 +42,8 @@ terminal state, it triggers the merge step appropriate to the report type.
   worker count) — that is the framework's concern, orthogonal to cloud-ci's shard-level splitting.
 - Analytics on top of timing data (regressions, flaky-test detection, critical path) — see
   [./analytics.md](./analytics.md), which owns the `test_stats` rolling per-test aggregate this
-  doc reads for timing-aware splits and updates after every merge.
+  doc reads for timing-aware splits and which is applied once per run at `RunCoordinator`
+  finalization, not by this doc's merge step.
 
 ## User experience
 
@@ -139,7 +140,7 @@ jobs:
       - run: npx playwright test $(cat shard-files.txt) --reporter=blob
       - uses: actions/upload-artifact@v4
         with: { name: blob-report-${{ matrix.shard }}, path: blob-report }
-      - run: cloud-ci upload --type playwright-blob --path blob-report --run-key ${{ github.run_id }}-${{ github.run_attempt }}
+      - run: cloud-ci upload playwright-blob 'blob-report/*.zip' --job e2e --shard ${{ matrix.shard }}/4
 ```
 
 `cloud-ci split` authenticates with the same machine credentials as `cloud-ci upload` (GitHub
@@ -275,7 +276,7 @@ token) RPCs into `RunCoordinator`, which updates `shard_state` and checks:
 
 | Report type | Where merged | Default command |
 | --- | --- | --- |
-| `junit` | Worker / `post-run-analysis` Queue consumer (no container) | Parse each shard's JUnit XML from R2, concatenate `testsuite` elements into one `testsuites` document, upsert rolling per-test aggregates into `test_stats` (analytics.md — one row per `(repo_id, test_id)`, updated in place, not one row per test case per run), write merged XML to R2. |
+| `junit` | Worker / `post-run-analysis` Queue consumer (no container) | Parse each shard's JUnit XML from R2, concatenate `testsuite` elements into one `testsuites` document, write merged XML to R2. Does not touch `test_stats`: rolling per-test aggregates (`test_stats`/`test_failures`) are applied once per run at `RunCoordinator` finalization from each shard's canonical upload ([./analytics.md](./analytics.md)). |
 | `coverage` (lcov, cobertura) | Worker / `post-run-analysis` Queue consumer (no container) | Parse and sum per-line/per-branch hit counts across shards; write merged file to R2. |
 | `playwright-blob` | Generated `<id>/merge` container node | `npx playwright merge-reports --reporter <merge> <dir>` (verified 2026-09-30, playwright.dev/docs/test-sharding) |
 | `vitest-blob` | Generated `<id>/merge` container node | `npx vitest --merge-reports <dir>` (verified 2026-09-30, vitest.dev/guide/reporters; reads the default `.vitest/blob/` directory when `<dir>` is omitted) |
@@ -302,23 +303,26 @@ await ci.container(`${id}/merge`, {
     `cloud-ci agent download-shards --job ${id} --out ./blobs`,
     ...(opts.merge?.setup ?? []),              // merge.setup steps, if any, run before the merge command
     `npx playwright merge-reports --reporter html ./blobs`,  // --reporter value from reports[].merge
-    `cloud-ci upload --type site --path playwright-report --job ${id}/merge`,
+    `cloud-ci upload --site playwright-report=playwright-report --job ${id}/merge`,
   ],
 });
 ```
 
-By default this uploads only the merged `site` Artifact (the dashboard-facing HTML report) —
+By default this uploads only the merged `site` Artifact (the dashboard-facing HTML report),
+which lands at the ordinary site artifact key (`runs/{run_id}/artifacts/{name}/site.tar` +
+`site.index.json`, per [./assets.md](./assets.md) and [./byo-ci.md](./byo-ci.md)) —
 matching the generated node's default behavior for every blob type. It does **not**, by itself,
-update `test_stats`: a blob zip's internal format is an unversioned, undocumented
+contribute to `test_stats`: a blob zip's internal format is an unversioned, undocumented
 Playwright/Vitest implementation detail that cloud-ci does not parse directly [unverified whether
 a stable public schema exists for either]. If a shard group's `timing` split should benefit from
 per-test history on its *next* run, `reports[].merge` must additionally request a
 machine-readable reporter (e.g. `merge: "html,json"` for Playwright, since
 `merge-reports --reporter` accepts a comma-separated list per
 playwright.dev/docs/test-reporters), and `merge.command` is overridden to also run
-`cloud-ci upload --type playwright-json --path merge-reports.json --job <id>/merge` — that upload
-goes through the same native ingest path as a non-sharded `playwright-json` report, so
-`test_stats` gets updated identically regardless of whether the original report type was native
+`cloud-ci upload playwright merge-reports.json --job <id>/merge` — that upload
+goes through the same native ingest path as a non-sharded `playwright-json` report, so it is
+applied to `test_stats` at run finalization ([./analytics.md](./analytics.md)) identically
+regardless of whether the original report type was native
 or blob. The Vitest merge node follows the same shape: blobs download into `.vitest/blob/`,
 `npx vitest --merge-reports` produces the configured reporters' output, and only an
 explicitly-configured JSON/JUnit reporter output is re-uploaded for history.
@@ -380,10 +384,11 @@ CREATE TABLE shard_state (
 
 The historical duration source for `timing` splits and `auto` shard-count resolution is
 `test_stats`, owned and schema-defined by [./analytics.md](./analytics.md) (one row per
-`(repo_id, test_id)`, updated in place after every default-branch merge — see that doc's D1
+`(repo_id, test_id)`, updated in place once per finalized default-branch run — see that doc's D1
 rollup tables for the schema and the upsert pattern). This doc only reads
-`test_stats.duration_ewma_ms`; it never defines or writes that table directly — the merge step
-(above) does, via `cloud-ci-reports`.
+`test_stats.duration_ewma_ms`; it never defines or writes that table directly — neither does the
+merge step: `RunCoordinator` applies each run's canonical reports to `test_stats` once, at run
+finalization, via `cloud-ci-reports` ([./analytics.md](./analytics.md)).
 
 `shard_plan`/`shard_state` are mirrored (not duplicated — same tables, DO-local view) inside
 `RunCoordinator`'s own SQLite storage for the lifetime of the run; the D1 copy is the durable
@@ -392,11 +397,9 @@ record the dashboard and `cloud-ci split`'s historical lookups read after the ru
 ### R2 keys
 
 ```
-runs/{run_id}/jobs/{job_name}/shards/{idx}/report.{ext}        # per-shard native report (junit.xml, lcov.info, ...)
-runs/{run_id}/jobs/{job_name}/shards/{idx}/blob/{file}          # per-shard blob reporter output (verbatim framework filenames)
+runs/{run_id}/jobs/{job_name}/shards/{shard_index}/reports/{report_kind}/{name}  # per-shard report, native or blob (publication alias, see ./byo-ci.md)
 runs/{run_id}/jobs/{job_name}/shards/{idx}/log.txt
-runs/{run_id}/jobs/{job_name}/merged/report.{ext}               # merged native report
-runs/{run_id}/jobs/{job_name}/merged/html/                      # merged HTML site artifact (served from assets host, see ./assets.md)
+runs/{run_id}/jobs/{job_name}/merged/report.{ext}               # merged native report (written by the Worker inline merge)
 ```
 
 ## Security considerations
@@ -406,7 +409,8 @@ runs/{run_id}/jobs/{job_name}/merged/html/                      # merged HTML si
   `runs/{run_id}/jobs/{job_name}/shards/{idx}/...` — one shard cannot overwrite another shard's
   report or another run's data.
 - The generated merge node's token is scoped to **read** every `shards/*/` prefix under its own
-  `job_name` and **write** only under `merged/`; it has no access to other jobs or other runs.
+  `job_name` and to upload only as its own `<id>/merge` node (its site artifact lands at the
+  [./assets.md](./assets.md) site key); it has no access to other jobs or other runs.
 - `cloud-ci split`'s read of `test_stats` from BYO CI is scoped by `repo_id` derived from the
   caller's credential (GitHub Actions OIDC repo claim, or the scoped API token's bound repo) — a
   token for repo A can never read repo B's timing history, consistent with the
@@ -488,17 +492,17 @@ sequenceDiagram
     RC->>RC: barrier satisfied (count(terminal) == expected_total)
     alt report type is native (junit/coverage)
         RC->>Worker: enqueue post-run-analysis (Queue)
-        Worker->>R2: read shards/*/report, merge inline
-        Worker->>D1: upsert test_stats aggregates
+        Worker->>R2: read shards/*/reports/*, merge inline
         Worker->>R2: write merged/report
     else report type is blob (playwright/vitest)
         RC->>MJ: dispatch generated merge node
-        MJ->>R2: download shards/*/blob/*
+        MJ->>R2: download shards/*/reports/{blob kind}/*
         MJ->>MJ: npx playwright merge-reports / vitest --merge-reports
-        MJ->>Worker: cloud-ci upload (site artifact; + json upload only if reports[].merge includes json)
-        Worker->>R2: write merged/html
-        Worker->>D1: upsert test_stats aggregates (only for the optional json upload)
+        MJ->>Worker: cloud-ci upload --site (site artifact; + json upload only if reports[].merge includes json)
+        Worker->>R2: write runs/{run_id}/artifacts/{name}/site.tar + site.index.json
     end
+    RC->>RC: run terminal → finalization
+    RC->>D1: apply canonical reports to test_stats/test_failures once per run (see ./analytics.md)
     RC->>Worker: shard group + merge complete
     Worker->>GH: update Check Run / PR comment (see ./pr-comment.md)
 ```
@@ -512,8 +516,8 @@ sequenceDiagram
 - [./byo-ci.md](./byo-ci.md) — ingest API, `cloud-ci upload`, OIDC credential exchange used by
   `cloud-ci split`.
 - [./analytics.md](./analytics.md) — `test_stats` rolling per-test aggregate (duration +
-  flakiness) this doc reads for timing splits and the merge step updates; rightsizing
-  retry-one-size-up reused for OOM'd shards.
+  flakiness) this doc reads for timing splits, applied once per run at `RunCoordinator`
+  finalization (not by the merge step); rightsizing retry-one-size-up reused for OOM'd shards.
 - [./pr-comment.md](./pr-comment.md) — how shard group / merge status surfaces in the sticky PR
   comment.
 - [./auth.md](./auth.md) — token scoping model referenced in Security considerations.

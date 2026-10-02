@@ -357,7 +357,7 @@ service IngestService {
 | `StartJob` | `run_id`, `job_name`, `shard_total` (default 1), `runner_label` (freeform, e.g. `ubuntu-latest`), `check_names` (repeated, optional) | Returns `job_id`. Idempotent on `(run_id, job_name)`. A `shard_total` different from the stored one is rejected (400). Unknown `check_names` are created on first use (§ Checks and scopes). |
 | `CreateUpload` | `job_id`, `shard_index`, `kind` (report/artifact/site), `name`, `scope` (optional), `content_type`, `size_bytes`, `sha256` | Size ≤ 32 MiB → single-part, caller `PUT`s once. Larger → multipart; response includes `part_size_bytes` (fixed 32 MiB) and `part_count`. Dedupes on `(job_id, shard_index, kind, name, sha256)` — see § Idempotency. |
 | `CompleteUpload` | `upload_id`, `parts: [{number, etag}]` | Calls R2's multipart complete; validates part count/sizes against what `CreateUpload` reserved. |
-| `SubmitReport` | `job_id`, `shard_index`, `report_kind`, `name`, `scope` (optional), either `inline_data` (≤ 4 MiB) or `upload_id` | Parses the report via `cloud-ci-reports` into D1 per-report summaries, failed/flaky test rows, and rolling per-test aggregates — never one row per test case (§ Supported report formats). Raw bytes are always kept in R2 regardless of path taken. A `deployment` report is small inline JSON. |
+| `SubmitReport` | `job_id`, `shard_index`, `report_kind`, `name`, `scope` (optional), either `inline_data` (≤ 4 MiB) or `upload_id` | Content-addressed by `sha256` either way: an upload-backed call reuses `uploads.sha256`; an inline call has the Worker hash `inline_data` itself, so both paths resolve to the same `(job_id, shard_index, report_kind, name, sha256)` identity — `scope` is a plain column on the row, not part of it, so a replacement may carry a different scope than the row it replaces (§ Idempotency). Parses the report via `cloud-ci-reports` into one immutable per-upload summary ([analytics](./analytics.md)'s `report_uploads`) and recomputes the job-level `report_summaries` aggregate for that upload's own `(report_kind, name, scope)` group from current canonical state. `test_stats`/failed-flaky rows are applied once per run — after the run reaches a terminal state and every accepted report has finished parsing, never per upload or per job (§ Supported report formats; [analytics](./analytics.md) owns the finalization/idempotency contract). Never one row per test case. Raw bytes are always kept in R2 regardless of path taken, retained per replacement (§ Idempotency). A `deployment` report is small inline JSON. |
 | `CompleteShard` | `job_id`, `shard_index`, `conclusion` (optional, inferred from the shard's reports if omitted), `external_url` | Marks the shard uploaded. When all `shard_total` shards are uploaded, the job concludes with the worst shard conclusion. Triggers the same Check-Run-update and comment-debounce path as a managed job (§ How external runs feed...). |
 | `GetRun` | `repo`, `sha`, `run_key`, `attempt` | Lets the CLI resume: look up `run_id` and which jobs/uploads already exist before re-sending anything. |
 
@@ -447,12 +447,17 @@ External jobs attach to the same named-check and report-scope model managed pipe
 | `VITEST_BLOB` | `vitest-blob` | Vitest's `--reporter=blob` shard output | Framework merge: `vitest --merge-reports` over the directory of blob files (verified 2026-09-30, [Vitest: CLI](https://vitest.dev/guide/cli); blob file location changed across Vitest versions — pin the version in the generated merge job) |
 
 Native formats are parsed by `cloud-ci-reports` (`cloud-ci-worker` and `cloud-ci-cli` both
-depend on it, so parsing is identical on both paths) into per-report summaries, failed/flaky
-test rows, and rolling per-test aggregates in D1 — never one row per test case per run; the full
-parsed result is stored as a compressed file in R2 keyed by run/report (retention:
-[assets](./assets.md)). Blob formats are opaque to us; their merge step runs as an ordinary job
-(managed, or externally if the uploader already has a merge step) and its output is submitted
-the same way as any other report.
+depend on it, so parsing is identical on both paths) into one immutable per-upload summary row
+in D1 immediately on ingest — never one row per test case per run; the full parsed result is
+stored as a compressed, content-addressed file in R2 keyed by run/job/shard/report (retention:
+[assets](./assets.md)). Rolling per-test aggregates (`test_stats`) and failed/flaky rows are
+applied once per run, after the run reaches a terminal state and every accepted report has
+finished parsing — never per upload, never per job, and never from raw, unparsed blob uploads
+(see [analytics](./analytics.md)'s D1 rollup tables and Idempotency). Blob formats are opaque to
+us; their merge step runs as an ordinary job (managed, or externally if the uploader already has
+a merge step) and its output is submitted the same way as any other report, under its own
+`job_name`/report identity — so it is parsed and can contribute to `test_stats` like any report,
+without double-counting the raw, unparsed blob shards it was built from.
 
 **Vite build report.** Vite has no native JSON stats output `[unverified]`, so a small plugin,
 `@cloud-ci/vite-plugin`, writes `.cloud-ci/vite-build.json` under the Vite project root (not
@@ -502,16 +507,26 @@ Resumability:
   same `shard_total`; a different total is rejected (400), so two legs cannot disagree on the
   shard count.
 - **Uploads** are idempotent on `(job_id, shard_index, kind, name, sha256)` — identical bytes
-  re-sent after a retry are a no-op. The shard index is part of the key because every shard of a
-  job usually uploads files with the same name (for example `results.json`); without it, shard 2's
-  report would look like a corrected copy of shard 1's. Different bytes under the same
-  `(job_id, shard_index, kind, name)` (a shard re-ran part of its suite and produced a corrected
-  report) are *not* overwritten in place: they land as a new row, and the most recently
-  completed one is canonical for parsing/merging/dashboard reads, while older rows stay in R2
-  for audit. This matches the invariant already stated in
-  [architecture.md](../architecture.md#coordination-invariants): "every upload is idempotent on
-  `(run, job/shard, report kind | artifact path, content hash)`" — the hash is part of the key,
-  so distinct content is a distinct upload, not a conflict.
+  re-sent after a retry are a no-op. The shard index is part of the key because every shard of
+  a job usually uploads files with the same name (for example `results.json`); without it,
+  shard 2's report would look like a corrected copy of shard 1's. `scope` is a plain column on
+  the row, not part of this key: it is immutable for one piece of content (a retry that resends
+  the same `sha256` under a different `scope` is rejected as conflicting metadata, not silently
+  relabeled), but a genuine *replacement* — different bytes under the same `(job_id,
+  shard_index, kind, name)` — may legitimately carry a different scope than the row it replaces
+  (for example, a corrected re-run after a package rename). A replacement is not overwritten in
+  place: each lands as a new, immutable row, with its raw bytes held at `uploads.r2_key` (an
+  internal, content-addressed location keyed by the upload's own identity, never overwritten —
+  older uploads stay there for audit). `RunCoordinator` assigns a monotonically increasing
+  `accepted_seq` on first acceptance of each upload identity; a retry reuses its original
+  sequence and cannot promote old content. For each `(job_id, shard_index, kind, name)` slot,
+  the parsed report with the highest original `accepted_seq` is canonical for
+  merging/dashboard reads (`reports.is_canonical`). A delayed parse cannot flip canonical
+  backward. The coordinator orders publication of canonical content to the documented R2
+  alias (below), retrying pending publication before advancing it again.
+  This matches the invariant stated in [architecture.md](../architecture.md#coordination-invariants): "every upload is
+  idempotent on `(run, job/shard, report kind | artifact path, content hash)`" — the hash is
+  part of the key, so distinct content is a distinct upload, not a conflict.
 - **`CompleteShard`** is idempotent: calling it again with the same `conclusion` is a no-op;
   calling it with a *different* conclusion after the job is concluded is rejected (400), since a
   CI system shouldn't be able to flip a result after the fact without going through a new
@@ -591,14 +606,14 @@ ingest-specific bookkeeping):
 | `runs` | `id`, `repo_id`, `sha`, `run_key`, `attempt`, `kind` (`managed`\|`external`), `external_url`, `state`, `expect_jobs`, `timeout_s` | `UNIQUE(repo_id, sha, run_key, attempt)` backs the `BeginRun` upsert. |
 | `jobs` | `id`, `run_id`, `name`, `shard_total`, `runner_label`, `check_names` (JSON array, references the shared `checks` table), `state`, `conclusion` | `UNIQUE(run_id, name)`. |
 | `job_shards` | `job_id`, `shard_index`, `state` (`pending`\|`uploaded`\|`missing`), `conclusion`, `external_url`, `completed_at` | `PRIMARY KEY(job_id, shard_index)`; a job is complete when `shard_total` rows are `uploaded`. |
-| `uploads` | `id`, `job_id`, `shard_index`, `kind`, `name`, `scope`, `sha256`, `size_bytes`, `state` (`pending`\|`complete`), `received_parts` (bitset/count), `r2_key` | `UNIQUE(job_id, shard_index, kind, name, sha256)` backs upload dedupe; `received_parts` lets `CreateUpload` answer "which parts do you have" without R2 `ListParts`. |
-| `reports` | `id`, `job_id`, `shard_index`, `kind`, `name`, `scope`, `upload_id`, `created_at`, `is_canonical` | Newest row per `(job_id, shard_index, kind, name)` flips `is_canonical`; parsed summary and failed/flaky-test rows reference the report row, not the raw upload — the full per-run parsed result is a separate R2 object (§ Supported report formats). |
+| `uploads` | `id`, `job_id`, `shard_index`, `kind`, `name`, `scope`, `sha256`, `size_bytes`, `state` (`pending`\|`complete`), `received_parts` (bitset/count), `r2_key`, `accepted_seq` | `UNIQUE(job_id, shard_index, kind, name, sha256)` backs upload dedupe; `scope` is metadata, not part of the key (§ Idempotency); `accepted_seq` is `RunCoordinator`'s per-run monotonic counter assigned at accept time; `received_parts` lets `CreateUpload` answer "which parts do you have" without R2 `ListParts`. |
+| `reports` | `id`, `job_id`, `shard_index`, `kind`, `name`, `scope`, `content_sha256`, `upload_id` (null for inline), `accepted_seq`, `created_at`, `is_canonical` | `content_sha256` is `uploads.sha256` when `upload_id` is set, or the Worker's own hash of `inline_data` otherwise — inline and uploaded reports share one identity. `UNIQUE(job_id, shard_index, kind, name, content_sha256)`; the row with the highest `accepted_seq` for a `(job_id, shard_index, kind, name)` slot flips `is_canonical` once its parse completes (§ Idempotency). [analytics](./analytics.md)'s `report_uploads` shares this row's key 1:1, minus `scope` (per-upload parsed summary); its `report_summaries` is the job-level aggregate across shards grouped by `(report_type, report_name, scope)`, derived from whichever row is canonical per `(job_id, shard_index, kind, name)` slot — neither duplicates `reports`' identity or canonicality state. |
 
 R2 keys:
 
 | Content | Key |
 | --- | --- |
-| Report raw bytes | `runs/{run_id}/jobs/{job_name}/shards/{shard_index}/reports/{report_kind}/{name}` |
+| Report raw bytes (publication alias) | `runs/{run_id}/jobs/{job_name}/shards/{shard_index}/reports/{report_kind}/{name}` — always holds a copy of the slot's current canonical content; the Worker rewrites it each time `is_canonical` advances in accepted order (§ Idempotency), so it is not content-addressed and is not where a replaced upload's bytes survive. Each upload's own bytes live at `uploads.r2_key`, an immutable, content-addressed location set once and never rewritten — that is what audit/replay reads, not this alias. |
 | Plain artifact (file or non-browsable dir, tarred) | `runs/{run_id}/artifacts/{name}` |
 | Site artifact (browsable HTML dir) | `runs/{run_id}/artifacts/{name}/site.tar` + `runs/{run_id}/artifacts/{name}/site.index.json` — uncompressed tar, index maps relative path → `{offset, len, content_type, content_encoding?}` with `offset`/`len` pointing at exact file content (past the file's tar header, before its padding), so [assets](./assets.md) can serve any path as an R2 ranged read with no server-side expansion |
 
@@ -648,8 +663,10 @@ only specifies what `cloud-ci upload` writes, not how it's served.
 | Deployment log parser finds no preview URL | CLI exits non-zero; nothing is uploaded. |
 | Two jobs in the same run race to `BeginRun` first | Both get the same `run_id` from the upsert; no duplicate run rows. |
 | Caller's OIDC JWT `aud` doesn't match deployment | `BeginRun` rejects with 401 before any run is created. |
-| Report bytes fail to parse (malformed JUnit XML, etc.) | Raw bytes are still stored in R2 and `reports.is_canonical` is set, but no test-case rows are written; the PR comment shows "report attached, unparsed" rather than silently dropping it. |
-| Same `(job_id, kind, name)` uploaded with different content twice in one job (flaky re-run) | Both rows kept; newest is canonical (§ Idempotency) — not a merge, a replacement for display purposes. |
+| Report bytes fail to parse (malformed JUnit XML, etc.) | Raw bytes are still stored in R2 and `reports.is_canonical` is set, but no `report_uploads` row is written and the group's `report_summaries`/`test_stats` recomputation simply has nothing to add for that shard's slot; the PR comment shows "report attached, unparsed" rather than silently dropping it. |
+| Same `(job_id, shard_index, kind, name)` uploaded with different content twice in one job (flaky re-run) | Both rows kept; the one with the highest `accepted_seq` is canonical once parsed (§ Idempotency) — a replacement for that slot, not an addition, so [analytics](./analytics.md)'s job aggregate reflects the newest accepted content only, never both. |
+| The run reaches a terminal state while a report accepted before terminal is still parsing | Finalization waits: `RunCoordinator` freezes the run's canonical set only after every `accepted_seq` issued before terminal has either produced a `report_uploads` row or a recorded parse failure, so a slow in-flight parse is included, never dropped or raced (see [analytics](./analytics.md)'s Idempotency). |
+| Same `(job_id, shard_index, kind, name, sha256)` resent with a different `scope` than its first acceptance | Rejected (400) — `scope` is immutable per accepted content; the caller must resend the exact scope it sent before, or upload genuinely different bytes as a replacement. |
 
 ## Open questions
 
