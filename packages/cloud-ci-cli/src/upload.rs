@@ -39,7 +39,7 @@ pub struct UploadError {
 }
 
 impl UploadError {
-    fn new(step: impl Into<String>, message: impl Into<String>) -> Self {
+    pub(crate) fn new(step: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             step: step.into(),
             message: message.into(),
@@ -56,9 +56,10 @@ impl std::fmt::Display for UploadError {
 impl std::error::Error for UploadError {}
 
 /// One glob-matched file plus the monorepo scope and logical upload name it
-/// carries into `CreateUpload`/`SubmitReport`.
-struct MatchedFile {
-    path: PathBuf,
+/// carries into `CreateUpload`/`SubmitReport`. Also reused by
+/// `cloud-ci split` (`crate::split`), which only needs `path`.
+pub(crate) struct MatchedFile {
+    pub(crate) path: PathBuf,
     scope: String,
     /// `CreateUploadRequest.name` / `SubmitReportRequest.name`. For reports
     /// this is the matched path (so two scopes sharing a report's usual
@@ -214,8 +215,9 @@ fn proto_conclusion(conclusion: Conclusion) -> ProtoConclusion {
 
 /// Expands one glob pattern to its matched files with their resolved
 /// scopes. A glob that matches no files is a hard error, per
-/// `docs/design/byo-ci.md`'s "Globs and scopes".
-fn expand_glob(pattern: &str, flag: &str) -> Result<Vec<MatchedFile>, UploadError> {
+/// `docs/design/byo-ci.md`'s "Globs and scopes". Also reused by
+/// `cloud-ci split` (`crate::split`).
+pub(crate) fn expand_glob(pattern: &str, flag: &str) -> Result<Vec<MatchedFile>, UploadError> {
     let step = format!("{flag} {pattern:?}");
     let entries =
         glob::glob(pattern).map_err(|e| UploadError::new(&step, format!("bad glob: {e}")))?;
@@ -358,7 +360,10 @@ fn guess_content_type(path: &Path) -> String {
 /// GitHub Actions, else none (the server will reject the call). Exchanging
 /// the OIDC JWT for a run-scoped ingest token is `BeginRun`'s job, not the
 /// CLI's; this only acquires the raw JWT to send as the `BeginRun` bearer.
-fn resolve_credential(
+/// Also reused by `cloud-ci split` (`crate::split`), which accepts the same
+/// `--token`/OIDC flags as plumbing for a future `test_stats` lookup (see
+/// that module's docs) but does not yet call out to anything with it.
+pub(crate) fn resolve_credential(
     explicit: Option<&str>,
     env: &dyn EnvSource,
 ) -> Result<Option<String>, String> {

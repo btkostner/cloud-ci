@@ -1,13 +1,21 @@
 //! Argument parsing for the `cloud-ci` binary.
 //!
-//! Scope for this pass is the `upload` subcommand only, per
-//! `docs/design/byo-ci.md`'s GitHub Actions example:
+//! Two subcommands: `upload`, per `docs/design/byo-ci.md`'s GitHub Actions
+//! example:
 //!
 //! ```text
 //! cloud-ci upload --job test \
 //!   --report junit:reports/junit.xml \
 //!   --report lcov:coverage/lcov.info \
 //!   --conclusion success
+//! ```
+//!
+//! and `split`, per `docs/design/parallelization.md`'s "`cloud-ci split`
+//! (also usable from BYO CI)":
+//!
+//! ```text
+//! cloud-ci split --strategy timing --shards 4 --index 2 \
+//!   --files 'tests/**/*.spec.ts' > shard-files.txt
 //! ```
 
 use std::fmt;
@@ -31,6 +39,8 @@ pub struct Cli {
 pub enum Command {
     /// Upload reports/sites for one job/shard of an external (BYO) CI run.
     Upload(UploadArgs),
+    /// Compute one shard's deterministic file assignment (BYO CI matrices).
+    Split(SplitArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -103,6 +113,61 @@ pub enum Conclusion {
     Success,
     Failure,
     Cancelled,
+}
+
+/// `cloud-ci split --strategy timing|file|count --shards <N> --index <1..N>
+/// --files <glob> [--granularity file|test]`, per
+/// `docs/design/parallelization.md`'s "`cloud-ci split` (also usable from
+/// BYO CI)". Shard count here is always a fixed integer (`1..64`, clamped
+/// by `cloud_ci_core::split::resolve_shard_count`) — the `{min, max,
+/// target}` auto-sizing spec is part of `ci.shard`'s script-level API, not
+/// this CLI's documented surface.
+#[derive(Debug, Parser)]
+pub struct SplitArgs {
+    /// Split strategy. `timing` currently degrades to `file` order for
+    /// every run — see `crate::split`'s module docs for why.
+    #[arg(long)]
+    pub strategy: SplitStrategy,
+
+    /// Total shard count, `1..64` (values outside that range are clamped).
+    #[arg(long)]
+    pub shards: u32,
+
+    /// 1-based shard index to print the file list for.
+    #[arg(long)]
+    pub index: u32,
+
+    /// Glob matched against the universe of files to divide. A glob
+    /// matching no files is an error.
+    #[arg(long)]
+    pub files: String,
+
+    /// Item granularity. `test` is not yet implemented (see `crate::split`'s
+    /// module docs).
+    #[arg(long, value_enum, default_value = "file")]
+    pub granularity: Granularity,
+
+    /// Scoped API token. GitHub Actions auto-detects an OIDC token instead
+    /// when this is unset (`CLOUD_CI_TOKEN`). Accepted and resolved for a
+    /// future `test_stats` lookup; unused by this round's `timing` fallback
+    /// — see `crate::split`'s module docs.
+    #[arg(long)]
+    pub token: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "lowercase")]
+pub enum SplitStrategy {
+    Timing,
+    File,
+    Count,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "lowercase")]
+pub enum Granularity {
+    File,
+    Test,
 }
 
 /// One `--report <kind>:<glob>` occurrence.
@@ -214,7 +279,9 @@ mod tests {
             "--conclusion",
             "success",
         ]);
-        let Command::Upload(args) = cli.command;
+        let Command::Upload(args) = cli.command else {
+            unreachable!("expected Command::Upload");
+        };
         assert_eq!(args.job, Some("test".to_string()));
         assert_eq!(args.reports.len(), 2);
         assert_eq!(args.conclusion, Some(Conclusion::Success));

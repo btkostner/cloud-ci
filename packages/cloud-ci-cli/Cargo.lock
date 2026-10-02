@@ -185,6 +185,7 @@ version = "0.1.0"
 dependencies = [
  "buffa",
  "clap",
+ "cloud-ci-core",
  "cloud-ci-proto",
  "glob",
  "serde",
@@ -192,6 +193,10 @@ dependencies = [
  "sha2",
  "ureq",
 ]
+
+[[package]]
+name = "cloud-ci-core"
+version = "0.1.0"
 
 [[package]]
 name = "cloud-ci-proto"

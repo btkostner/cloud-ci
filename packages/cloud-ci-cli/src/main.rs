@@ -2,6 +2,7 @@ mod cli;
 mod connect_client;
 mod identity;
 mod scope;
+mod split;
 mod upload;
 
 use std::process::ExitCode;
@@ -18,6 +19,13 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 eprintln!("cloud-ci upload: {err}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::Split(args) => match split::run(&args, &RealEnv) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("cloud-ci split: {err}");
                 ExitCode::FAILURE
             }
         },
