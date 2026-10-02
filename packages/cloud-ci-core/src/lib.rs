@@ -11,4 +11,5 @@
 //! ([ADR 0010](../../../docs/adr/0010-pluggable-executors.md)) — not added
 //! here since nothing in this round of work needs it.
 
+pub mod settings;
 pub mod split;
