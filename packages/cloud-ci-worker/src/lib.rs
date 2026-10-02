@@ -7,6 +7,7 @@ pub mod ingest_token;
 pub mod installations;
 pub mod oauth;
 pub mod oidc;
+pub mod pr_comment;
 pub mod reconcile;
 pub mod roles;
 pub mod session;
