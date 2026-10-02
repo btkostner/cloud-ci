@@ -40,8 +40,38 @@ const STUB_ORIGIN: &str = "https://run-coordinator.cloud-ci.internal";
 /// that uniquely identifies it everywhere else (architecture.md's "Run
 /// identity"). Not the run's own ULID: `StartJob`/`GetRun` sometimes only
 /// have one or the other, and this is the one every call can always derive.
+///
+/// `sha` and `run_key` are free-form, caller-supplied text for external
+/// (BYO CI) runs (docs/design/byo-ci.md's "Run identity" table), so a plain
+/// colon-joined string is not injective: `(1, "a", "b:1", 2)` and
+/// `(1, "a:b", "1", 2)` would both join to `"1:a:b:1:2"`, letting two
+/// unrelated callers collide on one `RunCoordinator` instance. Hashing each
+/// field length-prefixed (so the hashed byte sequence is unambiguous
+/// regardless of what bytes `sha`/`run_key` contain, unlike escaping, which
+/// is easy to get wrong — e.g. forgetting to also escape the escape
+/// character) makes this injective by construction. Reuses `sha2::Sha256`
+/// (already a dependency for ingest-token signing) rather than adding one.
 pub fn do_name(repo_id: u64, sha: &str, run_key: &str, attempt: u32) -> String {
-    format!("{repo_id}:{sha}:{run_key}:{attempt}")
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(repo_id.to_be_bytes());
+    for field in [sha, run_key] {
+        hasher.update((field.len() as u64).to_be_bytes());
+        hasher.update(field.as_bytes());
+    }
+    hasher.update(attempt.to_be_bytes());
+    hex_encode(&hasher.finalize())
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        // `write!` to a `String` cannot fail; `let _ =` discards the `Result`
+        // without `unwrap`/`expect`, per this package's lint rules.
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -656,4 +686,36 @@ impl RunCoordinatorStore {
 
 fn stub_error(path: &str, e: worker::Error) -> CoordinatorError {
     CoordinatorError::Internal(format!("run coordinator error on {path}: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn do_name_is_deterministic_for_the_same_identity() {
+        let a = do_name(1, "sha", "run-key", 2);
+        let b = do_name(1, "sha", "run-key", 2);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn do_name_does_not_collide_across_a_field_boundary_shift() {
+        // A naive colon-join would make these two different identities
+        // collide: "1:a:b:1:2" either way. `run_key`/`sha` are free-form,
+        // caller-supplied text for external runs (docs/design/byo-ci.md),
+        // so this is a real cross-caller collision, not a theoretical one.
+        let a = do_name(1, "a", "b:1", 2);
+        let b = do_name(1, "a:b", "1", 2);
+        assert_ne!(a, b, "different run identities must not share a DO name");
+    }
+
+    #[test]
+    fn do_name_differs_when_any_field_differs() {
+        let base = do_name(1, "sha", "run-key", 1);
+        assert_ne!(base, do_name(2, "sha", "run-key", 1));
+        assert_ne!(base, do_name(1, "other-sha", "run-key", 1));
+        assert_ne!(base, do_name(1, "sha", "other-run-key", 1));
+        assert_ne!(base, do_name(1, "sha", "run-key", 2));
+    }
 }

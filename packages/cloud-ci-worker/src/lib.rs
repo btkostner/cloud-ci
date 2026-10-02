@@ -291,6 +291,10 @@ mod tests {
     -> std::result::Result<(), ConnectError> {
         // Exercises the exact field accesses `handle_begin_run`/`handle_get_run`
         // use to derive the Durable Object name, without needing a live `Env`.
+        // Compares against a direct `do_name` call with the same literal
+        // values rather than pinning the hash's incidental output, since
+        // what matters here is that the field order/values match, not the
+        // specific digest.
         let req = BeginRunRequest {
             key: RunKey {
                 repo_id: 1_296_269,
@@ -308,10 +312,13 @@ mod tests {
             &req.key.run_key,
             req.key.attempt,
         );
-        assert_eq!(
-            name,
-            "1296269:6dcb09b5b57875f334f61aebed695e2e4193db5e:gha/42:1"
+        let expected = coordinator::do_name(
+            1_296_269,
+            "6dcb09b5b57875f334f61aebed695e2e4193db5e",
+            "gha/42",
+            1,
         );
+        assert_eq!(name, expected);
         Ok(())
     }
 }
