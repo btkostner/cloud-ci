@@ -2,6 +2,7 @@ pub mod api_tokens;
 pub mod connect;
 pub mod coordinator;
 pub mod github_app;
+pub mod github_checks;
 pub mod ingest_token;
 pub mod installations;
 pub mod oidc;
