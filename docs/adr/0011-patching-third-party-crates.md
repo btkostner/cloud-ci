@@ -30,7 +30,7 @@ branch:
 
 ```toml
 [patch.crates-io]
-worker = { git = "https://github.com/btkostner/workers-rs", branch = "container-exec-and-durable-object-sizing", rev = "0a6f661a61f420bcce1530cec471a207367b5e8f" }
+worker = { git = "https://github.com/btkostner/workers-rs", branch = "container-exec-and-durable-object-sizing", rev = "df96700ab45b9e5dc400c48946f5c57951dcfd11" }
 ```
 
 (`worker-sys` does not need its own patch entry: inside the fork's workspace, `worker`'s
