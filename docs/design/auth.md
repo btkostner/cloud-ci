@@ -218,9 +218,10 @@ is no separate "which orgs can this user see" step, it falls out of the per-repo
 
 **Org allowlist changes.** `cloud-ci setup allowed-orgs --add <login>` (or `--remove`) is the
 real write path: it edits `GITHUB_ALLOWED_ORGS` in `wrangler.toml` with the operator's own
-Cloudflare credentials and runs `wrangler deploy`, the same way [GitHub App
-setup](#github-app-setup) does for the initial value — there is no runtime admin action that
-mutates the allowlist. Adding an org does not retroactively install anything — the org owner
+Cloudflare credentials, and only when `--deploy` is passed does it also run `wrangler deploy`
+(the same way [GitHub App setup](#github-app-setup) does for the initial value) — otherwise it
+prints the diff and leaves deploying to the operator; either way there is no runtime admin action
+that mutates the allowlist. Adding an org does not retroactively install anything — the org owner
 still has to run the GitHub install flow, which then succeeds because the deployed allowlist no
 longer rejects it. Removing an org from the allowlist does not uninstall it automatically (the
 Worker only acts on `installation` webhooks); a deployer who wants it removed immediately also
