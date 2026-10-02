@@ -46,12 +46,28 @@ bucket_name = "cloud-ci-assets"
 name = "RUN_COORDINATOR"
 class_name = "RunCoordinator"
 
+# One SQLite-backed Durable Object per PR (docs/design/pr-comment.md's
+# "`PullRequestState`: one writer per PR"). Addressed by
+# `(repo_id, pr_number)` via `idFromName("{repo_id}/{pr_number}")`, never
+# shared with `RunCoordinator`: a PR's comment spans many runs.
+[[durable_objects.bindings]]
+name = "PULL_REQUEST_STATE"
+class_name = "PullRequestState"
+
 # new_sqlite_classes, not new_classes: RunCoordinator uses
 # state.storage().sql(), which only exists on SQLite-backed objects. Never
 # rewrite this entry — migrations are append-only.
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["RunCoordinator"]
+
+# new_sqlite_classes, not new_classes: PullRequestState uses
+# state.storage().sql(), same reasoning as RunCoordinator's v1 migration
+# above. Migrations are append-only — never edit the v1 entry above to
+# add this class to it.
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["PullRequestState"]
 
 # Installation reconcile job (docs/design/auth.md § "Multiple orgs and
 # installations", "Discovery" paragraph): calls `GET /app/installations`

@@ -8,6 +8,7 @@ pub mod installations;
 pub mod oauth;
 pub mod oidc;
 pub mod pr_comment;
+pub mod pull_request_state;
 pub mod reconcile;
 pub mod roles;
 pub mod session;
