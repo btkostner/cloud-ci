@@ -1654,7 +1654,7 @@ secrets:
 
     #[test]
     fn unknown_key_suggests_nearest_known_key() {
-        let outcome = parse(b"version: 1\nai:\n  enabled: true\n");
+        let outcome = parse(b"version: 1\nai:\n  flaky_hint: true\n");
         let Some(err) = outcome
             .diagnostics
             .iter()
@@ -1666,7 +1666,7 @@ secrets:
             )
         };
         assert!(
-            err.message.contains("did you mean `enabled`"),
+            err.message.contains("did you mean `flaky_hints`"),
             "{}",
             err.message
         );

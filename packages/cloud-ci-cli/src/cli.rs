@@ -17,6 +17,19 @@
 //! cloud-ci split --strategy timing --shards 4 --index 2 \
 //!   --files 'tests/**/*.spec.ts' > shard-files.txt
 //! ```
+//!
+//! and `lint`, per `docs/design/settings.md`'s "### Validation": validates
+//! `.cloud-ci/settings.yml` against passes 1 and 2 only (YAML 1.2 core
+//! schema + duplicate/unknown-key errors, then enum/pattern/numeric-bound
+//! semantic checks). Pass 3 — whether each `secrets.<pipeline>` name
+//! actually exists under `.cloud-ci/pipelines/` — needs the live pipeline
+//! tree (a GitHub API read) that this local, offline command does not have,
+//! and is INTENTIONALLY NOT checked here; see `LintArgs`' doc comment,
+//! which is this command's own `--help` text.
+//!
+//! ```text
+//! cloud-ci lint --file .cloud-ci/settings.yml
+//! ```
 
 use std::fmt;
 use std::str::FromStr;
@@ -41,6 +54,33 @@ pub enum Command {
     Upload(UploadArgs),
     /// Compute one shard's deterministic file assignment (BYO CI matrices).
     Split(SplitArgs),
+    /// Validate `.cloud-ci/settings.yml` (YAML + semantic checks only).
+    Lint(LintArgs),
+}
+
+/// `cloud-ci lint [--file <path>]`: validates `settings.yml` against
+/// `docs/design/settings.md`'s content-dependent passes only —
+///
+/// 1. YAML 1.2 core schema parsing (duplicate-map-key and
+///    unknown-key-with-suggestion errors), and
+/// 2. semantic checks (enum values, name patterns, numeric bounds).
+///
+/// **Does NOT check `secrets.<pipeline>` against `.cloud-ci/pipelines/`**
+/// (settings.md's validation pass 3): that check needs the live pipeline
+/// file tree from GitHub, which this local, offline, no-network command
+/// has no access to. A `secrets:` entry naming a pipeline that doesn't
+/// exist will lint clean here; it is only caught by the Worker's
+/// `cloud-ci / config` check against the repo's actual default branch.
+///
+/// Exits non-zero only if validation found errors; warnings (deployment
+/// -wide-bound clamping, which this command does not perform — it has no
+/// deployment context — see `cloud_ci_core::settings`' module docs) never
+/// fail the command.
+#[derive(Debug, Parser)]
+pub struct LintArgs {
+    /// Path to the settings file to validate.
+    #[arg(long, default_value = ".cloud-ci/settings.yml")]
+    pub file: std::path::PathBuf,
 }
 
 #[derive(Debug, Parser)]

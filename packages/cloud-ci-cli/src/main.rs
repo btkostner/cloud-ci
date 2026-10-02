@@ -1,6 +1,7 @@
 mod cli;
 mod connect_client;
 mod identity;
+mod lint;
 mod scope;
 mod split;
 mod upload;
@@ -26,6 +27,14 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 eprintln!("cloud-ci split: {err}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::Lint(args) => match lint::run(&args) {
+            Ok(true) => ExitCode::SUCCESS,
+            Ok(false) => ExitCode::FAILURE,
+            Err(err) => {
+                eprintln!("cloud-ci lint: {err}");
                 ExitCode::FAILURE
             }
         },
