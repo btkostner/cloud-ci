@@ -20,7 +20,8 @@ All inference runs in the deployer's own Cloudflare account, through an optional
 ## Goals
 
 - Turn a red check into one actionable paragraph, without the reader opening logs.
-- Keep the cost per run bounded and predictable, with hard daily caps that admins can configure.
+- Keep the cost per run bounded and predictable, with a hard daily cap configured per repo in
+  `.cloud-ci/settings.yml`.
 - Treat every byte of repo, log, and PR content as untrusted input to the model.
 - Treat model output as untrusted data. The worker never executes it. Autofix patches are executed only inside a verification container on a cloud-ci-owned branch.
 - Work identically for `managed` and `external` runs wherever the inputs exist (see [./byo-ci.md](./byo-ci.md)).
@@ -37,31 +38,39 @@ All inference runs in the deployer's own Cloudflare account, through an optional
 
 ### Enabling
 
-AI is off by default for every repo. An admin (see [./auth.md](./auth.md): GitHub admin/maintain) enables it in the dashboard under repo Settings > AI. The settings are stored in D1 (`repo_ai_settings`). The repo's `.cloud-ci/settings.yml` can only narrow what the admin enabled, never widen it. Without this rule, a PR from any contributor could switch on autofix or push mode by editing a settings file.
+AI is off by default for every repo. Setting `ai.enabled: true` in `.cloud-ci/settings.yml` on
+the default branch turns it on — the same review gate as any other code change to that branch
+(see [settings.md](./settings.md) for why `settings.yml` is read only from the default branch).
+A PR cannot enable AI, raise its own autofix mode, or widen its own `exclude_paths` by editing
+`settings.yml` in that same PR; the change only takes effect once merged.
 
-| Setting (D1, admin only) | Values | Default |
+| `settings.yml` key | Values | Default |
 | --- | --- | --- |
-| `enabled` | bool | `false` |
-| `summaries` | `off`, `pr` (PR runs only), `all` (also branch pushes) | `pr` |
-| `flaky_hints` | bool | `true` |
-| `perf_suggestions` | `off`, `weekly` | `weekly` |
-| `autofix` | `off`, `suggest`, `pull_request` | `off` |
-| `autofix_allow_push_to_pr_branch` | bool (requires `autofix != off`) | `false` |
-| `autofix_on_forks` | `off`, `suggest` | `off` |
-| `daily_neuron_cap` | integer | `20000` |
-| `model_summary` / `model_flaky` / `model_perf` / `model_autofix` | Workers AI model id | see Model selection |
-
-Repo-level narrowing in `.cloud-ci/settings.yml`, read from the base branch for fork PRs (schema in [./settings.md](./settings.md)):
+| `ai.enabled` | bool | `false` |
+| `ai.summaries` | `off`, `pr` (PR runs only), `all` (also branch pushes) | `pr` |
+| `ai.flaky_hints` | bool | `true` |
+| `ai.perf_suggestions` | `off`, `weekly` | `weekly` |
+| `ai.autofix` | `off`, `suggest`, `pull_request` | `off` |
+| `ai.autofix_allow_push_to_pr_branch` | bool (requires `autofix != off`) | `false` |
+| `ai.autofix_on_forks` | `off`, `suggest` | `off` |
+| `ai.exclude_paths` | glob[] | `[]` |
+| `ai.max_failures_summarized` | integer | `20` |
+| `ai.daily_neuron_cap` | integer | `20000` |
+| `ai.model_summary` / `.model_flaky` / `.model_perf` / `.model_autofix` | Workers AI model id | see Model selection |
 
 ```yaml
+# .cloud-ci/settings.yml
 ai:
-  summaries: true          # false disables summaries for this repo
-  autofix: suggest         # may lower pull_request -> suggest -> off; never raise
-  exclude_paths:           # never sent to the model (diff hunks and file reads)
+  enabled: true
+  summaries: all            # off | pr | all
+  autofix: suggest          # off | suggest | pull_request
+  exclude_paths:            # never sent to the model (diff hunks and file reads)
     - "infra/secrets/**"
     - "**/*.pem"
-  max_failures_summarized: 3   # may lower the per-run cap (5), never raise
+  max_failures_summarized: 3
 ```
+
+Full schema and deployment-wide bounds: [settings.md](./settings.md#field-reference).
 
 ### PR comment section
 
@@ -199,7 +208,7 @@ The model receives only the findings (budget of 6,000 tokens) and the current pi
 
 Autofix requires all of the following:
 
-1. Repo `autofix != off` (admin, D1), and not lowered to `off` by `settings.yml`.
+1. Repo `ai.autofix != off` in `.cloud-ci/settings.yml` (default branch).
 2. A human trigger: a `/cloud-ci autofix` comment, the PR comment's `- [ ] Autofix` checkbox ([./pr-comment.md](./pr-comment.md)), or a dashboard button press, from a user whose GitHub permission is write or higher ([./auth.md](./auth.md)). Autofix is never triggered automatically in v1.
 3. A failure summary with `confidence != low` exists for the run.
 4. The repo's daily neuron cap has room.
@@ -228,11 +237,11 @@ Requested-By: octocat
 
 The commit is authored by the GitHub App, so GitHub shows it as the bot. The cloud-ci pipeline runs on the resulting push like any other.
 
-GitHub App permissions (see [./auth.md](./auth.md)): the default manifest requests `contents: read` and `pull_requests: write`, which is enough for `suggest` mode. `contents: write` is requested only when a deployment enables fix-PR autofix (`pull_request` or push mode) at setup time; granting it to an existing installation later requires the installer to re-approve the updated permission set on GitHub, so moving a deployment from `suggest`-only to fix-PR autofix is an operational step, not a runtime toggle. Without `contents: write`, `autofix` stays capped at `suggest` for every repo on that installation, regardless of the `repo_ai_settings` value.
+GitHub App permissions (see [./auth.md](./auth.md)): the default manifest requests `contents: read` and `pull_requests: write`, which is enough for `suggest` mode. `contents: write` is requested only when a deployment enables fix-PR autofix (`pull_request` or push mode) at setup time; granting it to an existing installation later requires the installer to re-approve the updated permission set on GitHub, so moving a deployment from `suggest`-only to fix-PR autofix is an operational step, not a runtime toggle. Without `contents: write`, `autofix` stays capped at `suggest` for every repo on that installation, regardless of the repo's `ai.autofix` setting.
 
 ### Model selection
 
-Models are configured at two levels. Deploy-time defaults are set in wrangler `vars`. Per-repo overrides are set in D1 by an admin. Only ids that start with `@cf/` are accepted.
+Models are configured at two levels. Deploy-time defaults are set in wrangler `vars`. Per-repo overrides are set in `.cloud-ci/settings.yml` (`ai.model_summary` etc., see Enabling). Only ids that start with `@cf/` are accepted.
 
 | Use | Default | Why | Verified facts (checked 2026-09-30) |
 | --- | --- | --- | --- |
@@ -288,21 +297,12 @@ Usage is counted from the `usage` field the model returns (`prompt_tokens`, `com
 
 D1 (sketch; the wire types live in `cloud-ci-proto` as `cloud.ci.v1.AiInsight` and `cloud.ci.v1.AutofixRequest`, exposed through the query API to `cloud-ci-web`):
 
-```sql
-CREATE TABLE repo_ai_settings (
-  repo_id INTEGER PRIMARY KEY REFERENCES repos(id),
-  enabled INTEGER NOT NULL DEFAULT 0,
-  summaries TEXT NOT NULL DEFAULT 'pr',          -- off|pr|all
-  flaky_hints INTEGER NOT NULL DEFAULT 1,
-  perf_suggestions TEXT NOT NULL DEFAULT 'weekly',
-  autofix TEXT NOT NULL DEFAULT 'off',           -- off|suggest|pull_request
-  autofix_allow_push_to_pr_branch INTEGER NOT NULL DEFAULT 0,
-  autofix_on_forks TEXT NOT NULL DEFAULT 'off',
-  daily_neuron_cap INTEGER NOT NULL DEFAULT 20000,
-  model_overrides TEXT,                          -- JSON {"summary": "@cf/..."}
-  updated_by TEXT NOT NULL, updated_at INTEGER NOT NULL
-);
+`ai.enabled`, `ai.summaries`, `ai.autofix`, and every other knob in the Enabling table above are
+part of `.cloud-ci/settings.yml`, parsed and cached the same way as the rest of that file
+(`repo_settings` in [settings.md](./settings.md)); there is no separate `repo_ai_settings` admin
+table.
 
+```sql
 CREATE TABLE ai_insight (
   id TEXT PRIMARY KEY,                           -- ulid, "ai_..."
   repo_id INTEGER NOT NULL, run_id TEXT, job_id TEXT, test_id TEXT,
@@ -365,7 +365,10 @@ The "Inputs" link in the PR comment points to a dashboard view of `prompt.json`.
 
 **Tooling.** No model call is given tools or function calling in v1. The model cannot fetch URLs or read files beyond what the context builder chose.
 
-**Permission gates.** All settings that enable spending or writing are admin-only and live in D1. `settings.yml` can only narrow them. Every autofix request records `requested_by` and, for push mode, the head sha at trigger time.
+**Permission gates.** All settings that enable spending or writing live in
+`.cloud-ci/settings.yml` on the default branch; a PR cannot enable or widen them in itself (see
+[settings.md](./settings.md)). Every autofix request records `requested_by` and, for push mode,
+the head sha at trigger time.
 
 **Protected branches.** These are checked through the API before every write. The default branch is never written. Branch protection rulesets on the repo still apply to the App's token as defense in depth.
 
@@ -400,6 +403,5 @@ The "Inputs" link in the PR comment points to a dashboard view of `prompt.json`.
 | Let the model detect perf problems from raw analytics | Rejected. It produces plausible but invented numbers. Deterministic rules detect, the model explains, and the numeric-claim filter enforces this. |
 | Automatic autofix on every failure | Rejected. It costs spend on every red run, invites injection-driven commits, and creates noise. A human trigger is required. |
 | Agentic autofix loop (model plus tools in a container) | Deferred. Single-shot generation plus verification is predictable in cost and easier to audit. |
-| Autofix config in `settings.yml` only | Rejected. Any PR could enable it. D1 admin settings are the authority, and settings.yml can only narrow. |
 | Rely on AI Gateway exact-match caching alone | Insufficient. Inputs differ slightly between shards. The D1 fingerprint cache plus a custom `cacheKey` dedupes semantically identical failures. |
 | Run open models in Cloudflare Containers | Rejected. The container instance types listed in [../architecture.md](../architecture.md) are CPU-only, and a 4 vCPU/12 GiB instance cannot serve a useful code model at acceptable latency. `[unverified: GPU availability in Containers]` |

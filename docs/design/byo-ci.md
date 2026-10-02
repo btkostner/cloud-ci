@@ -21,7 +21,7 @@ same method names and message shapes over plain JSON `POST`s; the data plane bel
 either way.
 
 This doc covers the ingest API shape, the CLI UX, run identity, auth, supported report
-formats, upload mechanics and resumability, idempotency, finalize semantics, and how external
+formats, upload mechanics and resumability, idempotency, completion semantics, and how external
 runs feed [pr-comment](./pr-comment.md) and [analytics](./analytics.md). Token *format* and
 scopes are owned by [auth](./auth.md); this doc only names the scope it needs. Artifact
 *serving* (site hosting, caching, retention) is owned by [assets](./assets.md); this doc only
@@ -34,7 +34,8 @@ specifies what gets written to R2 and in what shape.
 - Resumable upload of large artifacts and reports without requiring the uploader to hold R2 or
   AWS credentials.
 - Zero-config auth from GitHub Actions via OIDC; token-based auth from anywhere else.
-- A run that never gets an explicit "done" signal still reaches a terminal state.
+- No explicit "done" command. A run reaches a terminal state from the shard counts its uploads
+  declare, the external CI's completion webhook, or a timeout.
 - Parity: an external run contributes to the PR comment, Check Runs, and analytics the same as
   a managed run, minus the signals a managed run can only produce from our own container
   (resource samples, rightsizing).
@@ -43,7 +44,7 @@ specifies what gets written to R2 and in what shape.
 
 - **Live log streaming for external runs.** The CI system that ran the job already has a log
   viewer (the Actions run page, the Buildkite build page); `cloud-ci` does not duplicate it.
-  Ingest accepts reports and artifacts, not step-by-step stdout. A `CompleteJob` call may
+  Ingest accepts reports and artifacts, not step-by-step stdout. A `CompleteShard` call may
   attach an `external_url` that the PR comment and dashboard link out to instead.
 - **Executing anything.** BYO CI never schedules work; it only records what already happened.
 - **OIDC trust for non-GitHub providers at launch.** Buildkite, CircleCI, GitLab CI, etc. all
@@ -63,7 +64,7 @@ specifies what gets written to R2 and in what shape.
 
 Managed runs are driven by a TypeScript pipeline script (`.cloud-ci/pipelines/*.ts`, see [dynamic-pipelines](./dynamic-pipelines.md)).
 External runs have no such file — the uploading CI system owns its own job definitions. An
-external run's job list is whatever sequence of `StartJob`/`CompleteJob` calls the uploader
+external run's job list is whatever sequence of `StartJob`/`CompleteShard` calls the uploader
 makes; there is no DAG, no `runner:` instance sizing, and no merge-barrier scheduling. (Native
 report merging and framework blob merges still apply — see § Supported report formats and
 [parallelization](./parallelization.md).)
@@ -71,30 +72,52 @@ report merging and framework blob merges still apply — see § Supported report
 ### `cloud-ci upload`
 
 ```
-cloud-ci upload [--job <name>] [--shard <i>/<n>] [--scope <name>]
-                 [--check <name>]...
-                 [--report <kind>:<path>]...
-                 [--artifact <name>=<path>]...
-                 [--site <name>=<dir>]...
-                 [--repo <owner>/<name>] [--sha <sha>]
-                 [--run-key <key>] [--attempt <n>]
-                 [--token <api-token> | (auto: GitHub Actions OIDC)]
+cloud-ci upload <kind> <path-or-glob>... [options]
+cloud-ci upload [--report <kind>:<path-or-glob>]...
+                [--artifact <name>=<path>]...
+                [--site <name>=<dir>]... [options]
+cloud-ci upload deployment --name <name> --preview-url <url> [--inspect-url <url>] [options]
+cloud-ci upload deployment --name <name> --from <tool> <log-file|-> [options]
 
-cloud-ci upload finalize [--conclusion success|failure]
-                          [--run-key <key>] [--attempt <n>]
+options:
+  [--job <name>] [--shard <i>/<total>] [--partial]
+  [--conclusion success|failure|cancelled]
+  [--scope <name> | --scope-from manifest|turbo] [--turbo-task <task>]
+  [--check <name>]...
+  [--expect-jobs <n>] [--timeout <duration>]
+  [--repo <owner>/<name>] [--sha <sha>] [--run-key <key>] [--attempt <n>]
+  [--token <api-token> | (auto: GitHub Actions OIDC)]
 ```
 
-`--report`, `--artifact`, and `--site` are repeatable and may be combined in one invocation or
-spread across several (one per test command, say). Each invocation that is not a `finalize`
-opens the run if it doesn't exist yet (`BeginRun` is an upsert — see § Idempotency) and starts
-or reuses the named job.
+`<kind>` is a report kind's CLI name from § Supported report formats (for example `junit`,
+`playwright`, `oxlint`, `vite-build`). The positional form uploads one kind. `--report`,
+`--artifact`, and `--site` are repeatable, so one invocation can upload several kinds.
+
+Each invocation does these steps:
+
+1. Opens the run if it does not exist yet (`BeginRun` is an upsert, see § Idempotency).
+2. Starts or reuses the job named by `--job` (default: `$GITHUB_JOB` on GitHub Actions, else
+   the report kind) and declares the job's shard total from `--shard <i>/<total>` (default
+   `1/1`).
+3. Uploads the files for shard `i`.
+4. Marks shard `i` as uploaded (`CompleteShard`), unless `--partial` is set.
+
+There is no `finalize` command. A job is complete when all `total` shards have uploaded, and a
+run is complete when its jobs are complete and a completion signal arrives (§ Completion
+semantics). Upload everything a shard produces in one invocation (repeat `--report` for several
+kinds). If a shard must upload in several invocations, set `--partial` on every invocation
+except the last.
+
+`--conclusion` sets the shard's conclusion. If it is omitted, the Worker infers it from the
+parsed reports: `failure` if a report has a failed test or an error-level diagnostic, else
+`success`.
 
 `--check <name>` (repeatable) attaches this job's result to one or more named Check Runs — the
 same named-check model managed pipelines use via `ci.check` ([dynamic-pipelines](./dynamic-pipelines.md)).
 An external run has no script to declare checks up front, so `StartJob` creates any check name it
-hasn't seen yet for this run the first time a job names it (§ Checks and scopes). `--scope <name>`
-tags the job's reports with a monorepo scope (package/app name) for grouping in the PR comment and
-full report ([pr-comment](./pr-comment.md)).
+hasn't seen yet for this run the first time a job names it (§ Checks and scopes). `--scope` and
+`--scope-from` set the monorepo scope (package/app name) of each uploaded report, for grouping
+in the PR comment and full report ([pr-comment](./pr-comment.md)); see § Globs and scopes.
 
 Run-identity and auth flags are optional on GitHub Actions; the CLI auto-detects them from the
 environment (§ Run identity). On any other CI system they are required, or sourced from
@@ -105,16 +128,82 @@ Example, outside GitHub Actions:
 
 ```
 cloud-ci upload --job unit-tests \
-  --report junit:./reports/junit.xml \
-  --report lcov:./coverage/lcov.info \
+  --report junit:'reports/*.xml' \
+  --report lcov:coverage/lcov.info \
+  --expect-jobs 1 \
   --repo acme/widgets --sha "$BUILDKITE_COMMIT" \
   --run-key "buildkite/$BUILDKITE_BUILD_ID" --attempt 1 \
   --token "$CLOUD_CI_TOKEN"
-
-cloud-ci upload finalize --conclusion success \
-  --repo acme/widgets --run-key "buildkite/$BUILDKITE_BUILD_ID" --attempt 1 \
-  --token "$CLOUD_CI_TOKEN"
 ```
+
+`--expect-jobs 1` tells the run how many jobs to wait for. Without it, and without a completion
+webhook from the CI system, the run closes when its timeout passes (§ Completion semantics).
+
+### Globs and scopes
+
+Quote globs so that the CLI expands them, not the shell (`**` is supported). Shell-expanded file
+lists also work. A glob that matches no files is an error: the CLI exits non-zero before it
+calls the API. Each matched file becomes one report, and the CLI sets its scope as follows:
+
+- `--scope <name>`: every file gets this scope.
+- `--scope-from manifest` (default): the CLI walks up from the file's directory to the nearest
+  package manifest (`package.json`, `Cargo.toml`, `go.mod`, `pyproject.toml`) and uses that
+  package's name. A manifest at the repository root, or no manifest, gives the unscoped group.
+- `--scope-from turbo`: the CLI runs `turbo run <task> --dry=json` (task from `--turbo-task`,
+  default the `--job` name) and maps each file to the package whose directory contains it, with
+  turbo's package name as the scope. The field names in turbo's dry-run JSON are `[unverified]`
+  until implementation. Use this when turbo's package set differs from the manifests on disk.
+
+A `deployment` upload has no file; its scope comes from `--scope`, else from the nearest
+manifest above the current working directory.
+
+Example: a turbo monorepo runs Playwright in GitHub Actions for every app, then uploads all
+results with one command:
+
+```yaml
+      - name: Run Playwright in every app
+        run: npx turbo run playwright
+
+      - name: Upload Playwright results
+        if: always()
+        run: cloud-ci upload playwright 'apps/*/test-results/*.json' --job playwright
+```
+
+Each app's Playwright config writes its JSON reporter output to
+`apps/<app>/test-results/results.json`. The CLI expands the glob, and maps
+`apps/web/test-results/results.json` to the scope `@acme/web` from `apps/web/package.json`
+(and the same for every other app). To use turbo's package graph instead of the manifests on
+disk, add `--scope-from turbo`; the task name defaults to the job name `playwright`. The job has
+one shard (`1/1`), so this single command completes it. The PR comment then shows one
+Playwright section per app.
+
+### Deployments (previews)
+
+A `deployment` report records an external preview: `preview_url` (the deployed preview) and
+optional `inspect_url` (the third-party build page, for example a Chromatic build or a Vercel
+deployment page). The PR comment shows deployments in its Previews section
+([pr-comment](./pr-comment.md)).
+
+Explicit form, which works with any tool:
+
+```
+cloud-ci upload deployment --job storybook --name storybook \
+  --preview-url "$STORYBOOK_URL" \
+  --inspect-url "$CHROMATIC_BUILD_URL"
+```
+
+Parser form, which reads the tool's output and extracts the URLs:
+
+```
+set -o pipefail
+npx wrangler versions upload 2>&1 | tee wrangler.log
+cloud-ci upload deployment --job docs --name docs --from wrangler wrangler.log
+```
+
+`--from <tool>` reads a log file, or stdin when the path is `-`. Explicit `--preview-url` and
+`--inspect-url` override parsed values. If the parser finds no preview URL, the CLI exits
+non-zero and uploads nothing. Which tools get a parser (candidates: `chromatic`, `vercel`,
+`wrangler`) and their exact output formats are open questions `[unverified]`.
 
 ### GitHub Actions snippet
 
@@ -143,16 +232,33 @@ jobs:
         run: |
           cloud-ci upload --job test \
             --report junit:reports/junit.xml \
-            --report lcov:coverage/lcov.info
-
-      - name: Finalize run
-        if: always()
-        run: cloud-ci upload finalize --conclusion ${{ job.status }}
+            --report lcov:coverage/lcov.info \
+            --conclusion ${{ job.status }}
 ```
 
-`--job test` runs once here; a matrix or sharded suite calls `cloud-ci upload` once per matrix
-leg with distinct `--job`/`--shard` values and a single `finalize` in a final job gated on
-`needs:` all legs — see [parallelization](./parallelization.md) for the matrix+split pattern.
+`${{ job.status }}` gives `success`, `failure`, or `cancelled` `[unverified]`. There is no final
+step: the `test` job has one shard, so this upload completes it, and GitHub's `workflow_run`
+webhook closes the run (§ Completion semantics).
+
+A matrix or sharded suite calls `cloud-ci upload` once per leg with the same `--job` and its own
+`--shard`:
+
+```yaml
+  e2e:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v4
+      - run: npx playwright test --shard=${{ matrix.shard }}/4 --reporter=blob
+      - if: always()
+        run: cloud-ci upload playwright-blob 'blob-report/*.zip' --job e2e --shard ${{ matrix.shard }}/4
+```
+
+No job gated on `needs:` all legs is necessary. The `e2e` job is complete when shard 4 of 4 has
+uploaded; a shard that never uploads is marked `missing` when the run closes. See
+[parallelization](./parallelization.md) for the matrix and split pattern.
 
 ## Design
 
@@ -160,7 +266,7 @@ leg with distinct `--job`/`--shard` values and a single `finalize` in a final jo
 
 | Plane | Transport | Why |
 | --- | --- | --- |
-| Control (begin run, start/complete job, create/complete upload, submit small reports, finalize) | Connect RPC, `POST /cloud_ci.ingest.v1.IngestService/<Method>` | Typed, versioned by the proto contract every language binding shares; small request/response bodies the Worker can buffer and validate as JSON/protobuf. |
+| Control (begin run, start job, create/complete upload, submit small reports, complete shard) | Connect RPC, `POST /cloud_ci.ingest.v1.IngestService/<Method>` | Typed, versioned by the proto contract every language binding shares; small request/response bodies the Worker can buffer and validate as JSON/protobuf. |
 | Data (upload part bytes) | Plain `PUT /ingest/v1/uploads/{upload_id}/parts/{n}` | A Connect unary RPC would require base64- or proto-bytes-encoding the payload and buffering the whole message before the handler sees it. A raw `PUT` lets the Worker stream the request body straight into an R2 multipart `uploadPart` call without holding the full part in memory, and keeps the CLI's upload code a plain HTTP client instead of a Connect streaming-RPC client (client-streaming Connect support on `wasm32` is unproven — see [ADR 0002](../adr/0002-rust-cloudflare-worker.md) and the Phase 0 spikes in the [roadmap](../roadmap.md) for the broader pattern of not betting ingest-critical code on unverified wasm32 capability). |
 
 ### `IngestService` (sketch)
@@ -173,21 +279,19 @@ service IngestService {
   rpc CreateUpload(CreateUploadRequest) returns (CreateUploadResponse);
   rpc CompleteUpload(CompleteUploadRequest) returns (CompleteUploadResponse);
   rpc SubmitReport(SubmitReportRequest) returns (SubmitReportResponse);
-  rpc CompleteJob(CompleteJobRequest) returns (CompleteJobResponse);
-  rpc FinalizeRun(FinalizeRunRequest) returns (FinalizeRunResponse);
+  rpc CompleteShard(CompleteShardRequest) returns (CompleteShardResponse);
   rpc GetRun(GetRunRequest) returns (GetRunResponse);
 }
 ```
 
 | RPC | Key fields | Notes |
 | --- | --- | --- |
-| `BeginRun` | `repo`, `sha`, `run_key`, `attempt`, `trigger` (push/pull_request/manual), `external_url` | Upsert on `(repo_id, sha, run_key, attempt)`. Returns `run_id` + current state. |
-| `StartJob` | `run_id`, `job_name`, `shard` (`{index, total}` optional), `runner_label` (freeform, e.g. `ubuntu-latest`), `check_names` (repeated, optional), `scope` (optional) | Returns `job_id`. Idempotent on `(run_id, job_name, shard)`. Unknown `check_names` are created on first use (§ Checks and scopes). |
-| `CreateUpload` | `job_id`, `kind` (report/artifact/site), `name`, `content_type`, `size_bytes`, `sha256` | Size ≤ 32 MiB → single-part, caller `PUT`s once. Larger → multipart; response includes `part_size_bytes` (fixed 32 MiB) and `part_count`. Dedupes on `(job_id, kind, name, sha256)` — see § Idempotency. |
+| `BeginRun` | `repo`, `sha`, `run_key`, `attempt`, `trigger` (push/pull_request/manual), `external_url`, `expect_jobs` (optional), `timeout` (optional, default 30 minutes, clamped to the deployment-wide maximum) | Upsert on `(repo_id, sha, run_key, attempt)`. Returns `run_id` + current state. The first non-empty `expect_jobs` wins; a later different value is rejected (400). |
+| `StartJob` | `run_id`, `job_name`, `shard_total` (default 1), `runner_label` (freeform, e.g. `ubuntu-latest`), `check_names` (repeated, optional) | Returns `job_id`. Idempotent on `(run_id, job_name)`. A `shard_total` different from the stored one is rejected (400). Unknown `check_names` are created on first use (§ Checks and scopes). |
+| `CreateUpload` | `job_id`, `shard_index`, `kind` (report/artifact/site), `name`, `scope` (optional), `content_type`, `size_bytes`, `sha256` | Size ≤ 32 MiB → single-part, caller `PUT`s once. Larger → multipart; response includes `part_size_bytes` (fixed 32 MiB) and `part_count`. Dedupes on `(job_id, shard_index, kind, name, sha256)` — see § Idempotency. |
 | `CompleteUpload` | `upload_id`, `parts: [{number, etag}]` | Calls R2's multipart complete; validates part count/sizes against what `CreateUpload` reserved. |
-| `SubmitReport` | `job_id`, `report_kind`, `name`, either `inline_data` (≤ 4 MiB) or `upload_id` | Parses the report via `cloud-ci-reports` into D1 per-report summaries, failed/flaky test rows, and rolling per-test aggregates — never one row per test case (§ Supported report formats). Raw bytes are always kept in R2 regardless of path taken. |
-| `CompleteJob` | `job_id`, `conclusion`, `external_url` | Terminal for the job; triggers the same Check-Run-update and comment-debounce path as a managed job (§ How external runs feed...). |
-| `FinalizeRun` | `run_id`, `conclusion` (optional — inferred from job conclusions if omitted) | See § Finalize semantics. |
+| `SubmitReport` | `job_id`, `shard_index`, `report_kind`, `name`, `scope` (optional), either `inline_data` (≤ 4 MiB) or `upload_id` | Parses the report via `cloud-ci-reports` into D1 per-report summaries, failed/flaky test rows, and rolling per-test aggregates — never one row per test case (§ Supported report formats). Raw bytes are always kept in R2 regardless of path taken. A `deployment` report is small inline JSON. |
+| `CompleteShard` | `job_id`, `shard_index`, `conclusion` (optional, inferred from the shard's reports if omitted), `external_url` | Marks the shard uploaded. When all `shard_total` shards are uploaded, the job concludes with the worst shard conclusion. Triggers the same Check-Run-update and comment-debounce path as a managed job (§ How external runs feed...). |
 | `GetRun` | `repo`, `sha`, `run_key`, `attempt` | Lets the CLI resume: look up `run_id` and which jobs/uploads already exist before re-sending anything. |
 
 ### Run identity
@@ -247,27 +351,33 @@ External jobs attach to the same named-check and report-scope model managed pipe
   Worker creates any check name it hasn't seen yet for this run on the first `StartJob` that
   names it (`queued`, not required by default — the same semantics as a script-created check). A
   job with no `check_names` reports no check run and only appears in the PR comment and
-  dashboard, exactly like a script node with `check: null`. The aggregate `cloud-ci` check still
-  rolls up every job regardless of `check_names`.
-- **Scopes.** `StartJob`'s optional `scope` tags the job's reports with a monorepo scope
-  (package/app name, matching the `scope` a script sets via turbo helpers) so the PR comment and
-  full report group test/coverage/report links by scope the same way for external and managed
-  runs ([pr-comment](./pr-comment.md)). Jobs with no `scope` fall into the default (unscoped)
-  group.
+  dashboard, exactly like a script node with `check: null`. Because a later job can still name
+  the same check, an external check is sealed only when the run completes (§ Completion
+  semantics); it stays `queued`/`in_progress` until then and concludes from all of its jobs.
+  So it can never go green on one job and then flip when another job attaches.
+- **Scopes.** Each report carries an optional `scope` (package/app name, matching the `scope` a
+  script sets via turbo helpers) so the PR comment and full report group test/coverage/report
+  links by scope the same way for external and managed runs ([pr-comment](./pr-comment.md)).
+  Scope is per report, not per job, so one upload of a glob can cover many packages (§ Globs
+  and scopes). Reports with no `scope` fall into the default (unscoped) group.
 
 ### Supported report formats
 
-| Kind | Format | Merge strategy |
-| --- | --- | --- |
-| `JUNIT` | JUnit XML | Native: Worker parses and unions test cases across shards |
-| `VITEST_JSON` | Vitest's `--reporter=json` output | Native |
-| `PLAYWRIGHT_JSON` | Playwright's `--reporter=json` output | Native |
-| `LCOV` | lcov tracefile | Native: line-hit union |
-| `COBERTURA` | Cobertura XML | Native: line-hit union |
-| `CLOUD_CI_TIMING` | Our own `{test, file, duration_ms}` JSON, written by `cloud-ci agent`/`cloud-ci upload` after any of the above is parsed | Feeds [parallelization](./parallelization.md)'s `split: timing` |
-| `BENCH` | `{name, value, unit}` JSON | Native: latest-wins per name |
-| `PLAYWRIGHT_BLOB` | Playwright's `--reporter=blob` shard output | Framework merge: `npx playwright merge-reports --reporter=html <dir>` run by a generated merge job (verified command 2026-09-30, [Playwright: Sharding](https://playwright.dev/docs/test-sharding)) |
-| `VITEST_BLOB` | Vitest's `--reporter=blob` shard output | Framework merge: `vitest --merge-reports` over the directory of blob files (verified 2026-09-30, [Vitest: CLI](https://vitest.dev/guide/cli); blob file location changed across Vitest versions — pin the version in the generated merge job) |
+| Kind | CLI name | Format | Merge strategy |
+| --- | --- | --- | --- |
+| `JUNIT` | `junit` | JUnit XML | Native: Worker parses and unions test cases across shards |
+| `VITEST_JSON` | `vitest` | Vitest's `--reporter=json` output | Native |
+| `PLAYWRIGHT_JSON` | `playwright` | Playwright's `--reporter=json` output | Native |
+| `LCOV` | `lcov` | lcov tracefile | Native: line-hit union |
+| `COBERTURA` | `cobertura` | Cobertura XML | Native: line-hit union |
+| `CLOUD_CI_TIMING` | `timing` | Our own `{test, file, duration_ms}` JSON, written by `cloud-ci agent`/`cloud-ci upload` after any of the above is parsed | Feeds [parallelization](./parallelization.md)'s `split: timing` |
+| `BENCH` | `bench` | `{name, value, unit}` JSON | Native: latest-wins per name |
+| `OXLINT_JSON` | `oxlint` | `oxlint --format json` output `[unverified exact schema]` | Native: union of diagnostics across shards and scopes; diagnostics with file/line become Check Run annotations |
+| `OXFMT_JSON` | `oxfmt` | oxfmt JSON output listing unformatted files `[unverified that oxfmt has a JSON output]` | Native: union of unformatted files |
+| `VITE_BUILD` | `vite-build` | JSON written by `@cloud-ci/vite-plugin`: build time and output file sizes | Native: latest-wins per (scope, output file); sizes compared with the latest default-branch report for the same scope |
+| `DEPLOYMENT` | `deployment` | `{name, preview_url, inspect_url?, tool?}` JSON, built by the CLI from flags or a log parser | Native: latest-wins per (scope, name) |
+| `PLAYWRIGHT_BLOB` | `playwright-blob` | Playwright's `--reporter=blob` shard output | Framework merge: `npx playwright merge-reports --reporter=html <dir>` run by a generated merge job (verified command 2026-09-30, [Playwright: Sharding](https://playwright.dev/docs/test-sharding)) |
+| `VITEST_BLOB` | `vitest-blob` | Vitest's `--reporter=blob` shard output | Framework merge: `vitest --merge-reports` over the directory of blob files (verified 2026-09-30, [Vitest: CLI](https://vitest.dev/guide/cli); blob file location changed across Vitest versions — pin the version in the generated merge job) |
 
 Native formats are parsed by `cloud-ci-reports` (`cloud-ci-worker` and `cloud-ci-cli` both
 depend on it, so parsing is identical on both paths) into per-report summaries, failed/flaky
@@ -276,6 +386,17 @@ parsed result is stored as a compressed file in R2 keyed by run/report (retentio
 [assets](./assets.md)). Blob formats are opaque to us; their merge step runs as an ordinary job
 (managed, or externally if the uploader already has a merge step) and its output is submitted
 the same way as any other report.
+
+**Vite build report.** Vite has no native JSON stats output `[unverified]`, so a small plugin,
+`@cloud-ci/vite-plugin`, writes `.cloud-ci/vite-build.json` under the Vite project root (not
+under the build output directory, so it is never deployed). The file holds the Vite version, the
+build time in milliseconds, and one entry per output file with its size in bytes and optional
+gzip size. Upload it with `cloud-ci upload vite-build 'apps/*/.cloud-ci/vite-build.json'`; the
+usual manifest rule gives each app its scope. The Rollup hooks the plugin uses for timing are
+`[unverified]` until implementation.
+
+**Deployments.** A `deployment` report has no tests and no conclusion of its own; it only feeds
+the PR comment's Previews section and the dashboard (§ Deployments (previews)).
 
 ### Upload mechanics and resumability
 
@@ -302,7 +423,7 @@ Resumability:
 3. The CLI `PUT`s only the missing parts, then calls `CompleteUpload`.
 4. R2 aborts genuinely abandoned incomplete multipart uploads after 7 days by default (verified
    2026-09-30, [R2: Upload objects](https://developers.cloudflare.com/r2/objects/upload-objects/)) —
-   but a run's own 30-minute idle timeout (§ Finalize semantics) fires first, so a cleanup sweep
+   but a run's own idle timeout (§ Completion semantics) fires first, so a cleanup sweep
    ([assets](./assets.md) retention) explicitly aborts incomplete uploads belonging to
    `abandoned` runs instead of waiting on R2's default.
 
@@ -310,64 +431,82 @@ Resumability:
 
 - **`BeginRun`** is an upsert keyed on `(repo_id, sha, run_key, attempt)`: calling it twice
   (a CI step retried wholesale) returns the same `run_id` and current state, never a conflict.
-- **`StartJob`** is idempotent on `(run_id, job_name, shard)`.
-- **Uploads** are idempotent on `(job_id, kind, name, sha256)` — identical bytes re-sent after
-  a retry are a no-op. Different bytes under the same `(job_id, kind, name)` (a job re-ran part
-  of its suite and produced a corrected report) are *not* overwritten in place: they land as a
-  new row, and the most recently completed one is canonical for parsing/merging/dashboard
-  reads, while older rows stay in R2 for audit. This matches the invariant already stated in
+- **`StartJob`** is idempotent on `(run_id, job_name)`. Every shard of a job calls it with the
+  same `shard_total`; a different total is rejected (400), so two legs cannot disagree on the
+  shard count.
+- **Uploads** are idempotent on `(job_id, shard_index, kind, name, sha256)` — identical bytes
+  re-sent after a retry are a no-op. The shard index is part of the key because every shard of a
+  job usually uploads files with the same name (for example `results.json`); without it, shard 2's
+  report would look like a corrected copy of shard 1's. Different bytes under the same
+  `(job_id, shard_index, kind, name)` (a shard re-ran part of its suite and produced a corrected
+  report) are *not* overwritten in place: they land as a new row, and the most recently
+  completed one is canonical for parsing/merging/dashboard reads, while older rows stay in R2
+  for audit. This matches the invariant already stated in
   [architecture.md](../architecture.md#coordination-invariants): "every upload is idempotent on
   `(run, job/shard, report kind | artifact path, content hash)`" — the hash is part of the key,
   so distinct content is a distinct upload, not a conflict.
-- **`CompleteJob`/`FinalizeRun`** are idempotent: calling either again with the same
-  `conclusion` is a no-op; calling with a *different* conclusion after the job/run is already
-  terminal is rejected (400), since a CI system shouldn't be able to flip a result after the
-  fact without going through a new attempt.
+- **`CompleteShard`** is idempotent: calling it again with the same `conclusion` is a no-op;
+  calling it with a *different* conclusion after the job is concluded is rejected (400), since a
+  CI system shouldn't be able to flip a result after the fact without going through a new
+  attempt. An upload for a shard already marked `missing`, or for a run that is already
+  terminal, is also rejected (400).
 
-### Finalize semantics
+### Completion semantics
 
-An external run has no scheduler to tell `RunCoordinator` when it's done, so there are four
-ways a run reaches a terminal state, tried in this order:
+There is no `finalize` command or RPC. An external run has no scheduler to tell
+`RunCoordinator` when it is done, so completion comes from the shard counts the uploads declare,
+the external CI's completion webhook, or a timeout.
+
+**Job.** Every upload declares `--shard <i>/<total>` (default `1/1`). A job is complete when each
+shard `1..total` has a `CompleteShard`. Its conclusion is the worst shard conclusion. A job with
+one shard is complete after its single upload.
+
+**Run.** A run closes on the first of these signals:
 
 ```mermaid
 flowchart TD
-    R[running] -->|"cloud-ci upload finalize"| T1[terminal: explicit]
-    R -->|"workflow_run.completed webhook<br/>matches run_id by GITHUB_RUN_ID"| T2[terminal: webhook-inferred]
-    R -->|"CompleteJob count == --expect-jobs"| T3[terminal: count-inferred]
-    R -->|"30 min since last ingest call"| T4[abandoned]
+    R[running] -->|"workflow_run.completed webhook<br/>matches GITHUB_RUN_ID"| C1[closed: succeeded / failed]
+    R -->|"--expect-jobs N: N jobs complete"| C2[closed: succeeded / failed]
+    R -->|"timeout, all jobs complete"| C3[closed: succeeded / failed]
+    R -->|"timeout, shards missing"| A[abandoned]
 ```
 
-1. **Explicit finalize.** `cloud-ci upload finalize --conclusion <success|failure>` calls
-   `FinalizeRun`. This is the recommended path and the one shown in § GitHub Actions snippet.
-2. **`workflow_run` webhook.** If `BeginRun` was called with `external_url` pointing at a
-   GitHub Actions run (or the CLI auto-populated `GITHUB_RUN_ID`), the Worker correlates it
-   against incoming `workflow_run` `completed` deliveries — which fire "regardless of whether
-   the workflow was successful or unsuccessful" (verified 2026-09-30,
+1. **Completion webhook.** If `BeginRun` was called with `external_url` pointing at a GitHub
+   Actions run (or the CLI auto-populated `GITHUB_RUN_ID`), the Worker correlates it against
+   incoming `workflow_run` `completed` deliveries — which fire "regardless of whether the
+   workflow was successful or unsuccessful" (verified 2026-09-30,
    [GitHub: Webhook events and payloads § workflow_run](https://docs.github.com/en/webhooks/webhook-events-and-payloads#workflow_run);
-   requires the GitHub App to hold at least read-level `Actions` permission, same source) — and
-   finalizes with `workflow_run.conclusion`. This is a safety net for workflows that don't add
-   the explicit finalize step.
-3. **`--expect-jobs N`** on `BeginRun`. Once `N` `CompleteJob` calls have landed, the run
-   auto-finalizes. Useful for non-GitHub CI systems with no equivalent completion webhook and a
-   fixed, known job count (e.g. a matrix build).
-4. **Idle timeout.** `RunCoordinator` sets a DO alarm for 30 minutes after the most recent
-   ingest call for the run. If it fires while the run is still open, the run moves to
-   `abandoned` — already one of [architecture.md](../architecture.md#run-states)'s defined
-   terminal states ("External run never finalized before its deadline"). A later ingest call
-   for the same `run_key`/`attempt` after abandonment is rejected (400); the CI system must
-   retry under a new `attempt`.
+   requires the GitHub App to hold at least read-level `Actions` permission, same source). This
+   is the default path on GitHub Actions and needs no extra step. Equivalent webhooks from other
+   CI systems are an open question.
+2. **`--expect-jobs N`** on `BeginRun`. Once `N` jobs are complete, the run closes. Useful for CI
+   systems with no completion webhook and a fixed, known job count. This is also the way to
+   close a run without shards promptly outside GitHub Actions.
+3. **Timeout.** `RunCoordinator` sets a DO alarm for `--timeout` (default 30 minutes, clamped to
+   the deployment-wide maximum) after the most recent ingest call for the run. If every job is
+   complete when it fires, the run closes normally. If any job still has shards that did not
+   upload, those shards are marked `missing` and the run moves to `abandoned` — one of
+   [architecture.md](../architecture.md#run-states)'s terminal states.
+
+When the run closes by webhook or `--expect-jobs` while a job still has shards that did not
+upload, those shards are marked `missing` at once, without waiting for the timeout. A job with a
+missing shard concludes `failure` with the summary "N of total shards missing". On close, the
+run's conclusion is the worst job conclusion, and every external check is sealed and concludes
+from its jobs (§ Checks and scopes). A later ingest call for the same `run_key`/`attempt` after
+the run is terminal is rejected (400); the CI system must retry under a new `attempt`.
 
 ### How external runs feed PR comment & analytics
 
-**PR comment / Check Runs.** `CompleteJob` and `FinalizeRun` enqueue the same debounced
+**PR comment / Check Runs.** `CompleteShard` and run completion enqueue the same debounced
 comment-refresh message `RunCoordinator` emits for a managed job completing
 ([architecture.md](../architecture.md#core-flows) step 5) — the comment template doesn't
 branch on `run.kind`. The one external-specific addition is a small "via GitHub Actions" (or
 whatever `external_url`'s host implies) badge linking out, since there's no `cloud-ci`-native
-log to link to instead. See [pr-comment](./pr-comment.md).
+log to link to instead. `deployment` reports fill the template context's `deployments` list,
+which the default template renders as a Previews section. See [pr-comment](./pr-comment.md).
 
 **Analytics.** Duration, critical-path, flaky-test, and slowest-test analysis all read from
-report-supplied timestamps and per-test durations (`StartJob`/`CompleteJob` times, parsed
+report-supplied timestamps and per-test durations (`StartJob`/`CompleteShard` times, parsed
 `CLOUD_CI_TIMING`/JUnit/Vitest/Playwright durations) — external runs supply all of that, so
 they participate fully. Resource-sample analytics (cgroup CPU/memory, cost estimate, `runner:
 auto` rightsizing) do not apply: there's no container we control to sample or size.
@@ -382,16 +521,17 @@ ingest-specific bookkeeping):
 
 | Table | Key columns | Notes |
 | --- | --- | --- |
-| `runs` | `id`, `repo_id`, `sha`, `run_key`, `attempt`, `kind` (`managed`\|`external`), `external_url`, `state`, `expect_jobs` | `UNIQUE(repo_id, sha, run_key, attempt)` backs the `BeginRun` upsert. |
-| `jobs` | `id`, `run_id`, `name`, `shard_index`, `shard_total`, `runner_label`, `check_names` (JSON array, references the shared `checks` table), `scope`, `state`, `external_url` | `UNIQUE(run_id, name, shard_index)`. |
-| `uploads` | `id`, `job_id`, `kind`, `name`, `sha256`, `size_bytes`, `state` (`pending`\|`complete`), `received_parts` (bitset/count), `r2_key` | `UNIQUE(job_id, kind, name, sha256)` backs upload dedupe; `received_parts` lets `CreateUpload` answer "which parts do you have" without R2 `ListParts`. |
-| `reports` | `id`, `job_id`, `kind`, `name`, `upload_id`, `created_at`, `is_canonical` | Newest row per `(job_id, kind, name)` flips `is_canonical`; parsed summary and failed/flaky-test rows reference the report row, not the raw upload — the full per-run parsed result is a separate R2 object (§ Supported report formats). |
+| `runs` | `id`, `repo_id`, `sha`, `run_key`, `attempt`, `kind` (`managed`\|`external`), `external_url`, `state`, `expect_jobs`, `timeout_s` | `UNIQUE(repo_id, sha, run_key, attempt)` backs the `BeginRun` upsert. |
+| `jobs` | `id`, `run_id`, `name`, `shard_total`, `runner_label`, `check_names` (JSON array, references the shared `checks` table), `state`, `conclusion` | `UNIQUE(run_id, name)`. |
+| `job_shards` | `job_id`, `shard_index`, `state` (`pending`\|`uploaded`\|`missing`), `conclusion`, `external_url`, `completed_at` | `PRIMARY KEY(job_id, shard_index)`; a job is complete when `shard_total` rows are `uploaded`. |
+| `uploads` | `id`, `job_id`, `shard_index`, `kind`, `name`, `scope`, `sha256`, `size_bytes`, `state` (`pending`\|`complete`), `received_parts` (bitset/count), `r2_key` | `UNIQUE(job_id, shard_index, kind, name, sha256)` backs upload dedupe; `received_parts` lets `CreateUpload` answer "which parts do you have" without R2 `ListParts`. |
+| `reports` | `id`, `job_id`, `shard_index`, `kind`, `name`, `scope`, `upload_id`, `created_at`, `is_canonical` | Newest row per `(job_id, shard_index, kind, name)` flips `is_canonical`; parsed summary and failed/flaky-test rows reference the report row, not the raw upload — the full per-run parsed result is a separate R2 object (§ Supported report formats). |
 
 R2 keys:
 
 | Content | Key |
 | --- | --- |
-| Report raw bytes | `runs/{run_id}/reports/{report_kind}/{name}` |
+| Report raw bytes | `runs/{run_id}/jobs/{job_name}/shards/{shard_index}/reports/{report_kind}/{name}` |
 | Plain artifact (file or non-browsable dir, tarred) | `runs/{run_id}/artifacts/{name}` |
 | Site artifact (browsable HTML dir) | `runs/{run_id}/artifacts/{name}/site.tar` + `runs/{run_id}/artifacts/{name}/site.index.json` — uncompressed tar, index maps relative path → `{offset, len, content_type, content_encoding?}` with `offset`/`len` pointing at exact file content (past the file's tar header, before its padding), so [assets](./assets.md) can serve any path as an R2 ranged read with no server-side expansion |
 
@@ -433,8 +573,12 @@ only specifies what `cloud-ci upload` writes, not how it's served.
 | --- | --- |
 | CLI crashes mid multipart upload | Next invocation recomputes `sha256`, calls `CreateUpload` again, gets the same `upload_id` back with already-received part numbers, uploads only what's missing. |
 | Network drop mid-part | CLI retries that one `PUT`; re-uploading a part number before `CompleteUpload` simply overwrites it (standard multipart semantics). |
-| `finalize` never called, no `workflow_run` webhook (non-GitHub CI, no `--expect-jobs`) | Run sits `running` until the 30-minute idle alarm fires, then moves to `abandoned`. |
-| `workflow_run` webhook arrives for a run already explicitly finalized | No-op; `FinalizeRun` idempotency (§ Idempotency) absorbs it. |
+| A shard never uploads (leg crashed before `cloud-ci upload`, or was cancelled) | The completion webhook or `--expect-jobs` marks it `missing` when the run closes; otherwise the timeout marks it `missing` and the run moves to `abandoned`. The job concludes `failure` ("N of total shards missing"). |
+| Two legs of one job declare different totals (`--shard 1/4` and `--shard 2/3`) | `StartJob` rejects the second call (400); the first total wins. |
+| Shard uploads after it was marked `missing`, or after the run is terminal | Rejected (400); the CI system retries under a new `attempt`. |
+| `workflow_run` webhook arrives for a run already closed by `--expect-jobs` | No-op; the run is already terminal. |
+| Upload glob matches no files | CLI exits non-zero before any RPC; nothing is uploaded. |
+| Deployment log parser finds no preview URL | CLI exits non-zero; nothing is uploaded. |
 | Two jobs in the same run race to `BeginRun` first | Both get the same `run_id` from the upsert; no duplicate run rows. |
 | Caller's OIDC JWT `aud` doesn't match deployment | `BeginRun` rejects with 401 before any run is created. |
 | Report bytes fail to parse (malformed JUnit XML, etc.) | Raw bytes are still stored in R2 and `reports.is_canonical` is set, but no test-case rows are written; the PR comment shows "report attached, unparsed" rather than silently dropping it. |
@@ -453,6 +597,14 @@ only specifies what `cloud-ci upload` writes, not how it's served.
   the generic shape in § Auth.
 - Whether `--expect-jobs` should be inferable from a GitHub Actions matrix automatically (e.g.
   via the `workflow_run` payload's job count) instead of requiring the flag.
+- Which non-GitHub CI systems have a run-completion webhook we can correlate (for example a
+  Buildkite build-finished event `[unverified]`), so they can close runs without `--expect-jobs`.
+- Which tools get a deployment log parser for `--from` (candidates: `chromatic`, `vercel`,
+  `wrangler versions upload`), and the exact output format each one prints `[unverified]`.
+- Whether oxfmt has a JSON output `[unverified]`; if not, the `oxfmt` kind parses its
+  `--check` text output instead.
+- The exact JSON fields of `turbo run --dry=json` that `--scope-from turbo` reads
+  `[unverified]`.
 
 ## Alternatives considered
 
@@ -463,3 +615,4 @@ only specifies what `cloud-ci upload` writes, not how it's served.
 | One RPC that accepts an entire report/artifact inline, no separate upload flow | Fine for small JUnit files, breaks for multi-hundred-MB Playwright HTML reports or coverage sites; `SubmitReport`'s inline-vs-upload split keeps the common case (small reports) a single call while large payloads still get chunking. |
 | Variable part size (client picks, up to R2's 5 GiB max) | Simpler resumability math and a fixed 32 MiB Worker-side validation rule beat a few fewer round trips on very large files; also keeps part size well inside every Cloudflare plan's request body limit without per-deployment tuning. |
 | Treat re-uploaded content under the same name as a hard conflict (reject) | Flaky re-runs within a job are common enough that rejecting them would make `cloud-ci upload` unusable from a retry loop; keeping both rows and picking the newest as canonical costs a little R2 storage for a lot of uploader-side simplicity. |
+| Explicit `cloud-ci upload finalize` command and `FinalizeRun` RPC | It needs a final job gated on `needs:` every leg, which every CI system expresses differently and which is easy to forget or to skip when a leg is cancelled. Each leg already knows the shard total, so counting shards, plus the CI's own completion webhook or a timeout, closes the run without an extra step. |

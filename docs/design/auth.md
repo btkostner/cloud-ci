@@ -100,9 +100,10 @@ commands:
 ```
 
 Values can only be raised (`operator` → `admin`), never lowered below `operator` — `viewer`
-cannot invoke commands, so it is not a valid value here. For fork PRs this file is read from the
-base branch, same as every other `settings.yml` key. See
-[settings.md](./settings.md#commands) for the rest of the file format.
+cannot invoke commands, so it is not a valid value here. `settings.yml` is always read from the
+repo's default branch, same as every other `settings.yml` key, so no PR can raise or lower these
+roles by editing the file on its own branch. See [settings.md](./settings.md#commands) for the
+rest of the file format.
 
 ### CLI login
 
@@ -246,10 +247,8 @@ handling.
 | `/cloud-ci rerun`, `/cloud-ci cancel` PR comment commands (see [pr-comment.md](./pr-comment.md)) | operator (overridable, [per-repo overrides](#per-repo-overrides)) |
 | Request AI autofix (see [ai.md](./ai.md)) | operator (overridable) |
 | Trigger a BYO-CI ingest run manually from the dashboard | operator |
-| Change repo settings: retention, concurrency limits, `runner: auto` bounds, feature toggles | admin |
 | Purge artifacts / change asset retention (see [assets.md](./assets.md)) | admin |
 | Issue, list, revoke scoped API tokens | admin |
-| View/rotate per-repo config | admin |
 
 Rotating the GitHub App's own private key, webhook secret, or `CLOUD_CI_MASTER_KEY`, and
 changing `GITHUB_ALLOWED_ORGS` or installing/uninstalling the App on an org, are

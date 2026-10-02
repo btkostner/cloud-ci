@@ -6,9 +6,10 @@ Status: Proposed
 
 A `ci.shard(id, opts)` call in a pipeline script ([dynamic-pipelines](./dynamic-pipelines.md))
 splits a test suite into N `Shard`s that each run as an independent container, then merges their
-`Report`s back into one result. Shard count can be fixed or `auto` (sized to hit a target wall
-time). The split can use historical per-test/per-file timing pulled from D1, a flat file-count
-round-robin, or a flat test-count round-robin. The same splitting logic is exposed as
+`Report`s back into one result. Shard count is either a fixed integer or an auto-sizing spec
+(`{ min, max, target }`, sized to hit a target wall time). The split can use historical
+per-test/per-file timing pulled from D1, a flat file-count round-robin, or a flat test-count
+round-robin. The same splitting logic is exposed as
 `cloud-ci split` so bring-your-own-CI (BYO CI) pipelines (e.g. a GitHub Actions matrix) get
 identical, deterministic shard assignment without running inside cloud-ci's own containers.
 `RunCoordinator` (the per-run Durable Object, see [../architecture.md](../architecture.md)) tracks
@@ -20,8 +21,8 @@ terminal state, it triggers the merge step appropriate to the report type.
 - Deterministic shard assignment: given the same file list, timing snapshot, strategy, and shard
   count, the computed assignment is identical every time, on both the worker (managed runs) and
   the CLI (BYO CI runs).
-- `auto` shard count that targets a configured wall-clock duration instead of a fixed number of
-  machines.
+- An auto-sizing `count` spec (`{ min, max, target }`) that targets a configured wall-clock
+  duration instead of requiring a fixed number of machines.
 - Timing-aware splitting using real historical data, with a safe fallback when no history exists
   (new repo, new test files).
 - Native (no-container) merging for structured text reports (JUnit XML, lcov/cobertura coverage);
@@ -52,17 +53,13 @@ terminal state, it triggers the merge step appropriate to the report type.
 const test = ci.check("ci/test", { required: true });
 
 await ci.shard("test", {
+  split: "timing",                // required: timing | file | count
+  count: { min: 2, max: 16, target: "8m" },  // required: int 1-64, or { min, max, target } to auto-size
   runner: "standard-2",
   check: test,
-  count: "auto",                  // integer 1-64, or "auto"; default from settings.yml shard.*
-  split: "timing",                // timing | file | count (default: timing)
   files: "tests/**/*.spec.ts",
-  min: 2,                         // auto bounds, default settings.yml shard.min (2)
-  max: 16,                        // auto bounds, default settings.yml shard.max (16)
-  target: "8m",                   // auto only: pick a shard count so each shard runs ~target;
-                                   // default settings.yml shard.target (10m)
   failFast: false,                // cancel remaining shards on first failure
-  run: "npx playwright test --shard=$CLOUD_CI_SHARD_INDEX/$CLOUD_CI_SHARD_TOTAL --reporter=blob",
+  run: 'npx playwright test --shard={{ shard.index }}/{{ shard.total }} --reporter=blob',
   reports: [{ type: "playwright-blob", path: "blob-report/", merge: "html" }],
   merge: { runner: "basic" },     // instance type for the generated merge node; default basic
 });
@@ -72,11 +69,9 @@ await ci.shard("test", {
 
 | Option | Type | Default | Notes |
 | --- | --- | --- | --- |
-| `count` | int 1..64, or `"auto"` | `"auto"` | fixed shard count, or computed |
-| `split` | `"timing"` \| `"file"` \| `"count"` | `"timing"` | strategy `cloud-ci split` uses |
-| `files` | glob or glob[] | required when `split` is `"file"` or `"timing"` | universe of files to divide |
-| `min` / `max` | int | settings.yml `shard.min`/`shard.max` (2/16) | bounds for `count: "auto"` |
-| `target` | duration | settings.yml `shard.target` (10m) | `auto` only: pick a shard count so each shard runs about `target`, by history |
+| `split` | `"timing"` \| `"file"` \| `"count"` | required | strategy `cloud-ci split` uses |
+| `count` | int `1..64`, or `{ min, max, target }` | required | fixed shard count, or an auto-sizing spec (`min`/`max` bounds, `target` wall-time duration); no global default, every call sets its own |
+| `files` | glob or glob[] | required when `split` is `"file"` or `"timing"` | universe of files to divide; exposed to every shard's `run` as `{{ files }}` |
 | `failFast` | bool | `false` | cancel the remaining shards in the group on the first shard failure |
 | `runner` | same shapes as `ci.container`'s `runner` ([dynamic-pipelines](./dynamic-pipelines.md), [ADR 0010](../adr/0010-pluggable-executors.md)) | settings.yml `runners.default` | runner for each shard container |
 | `check` | a `ci.check(...)` result, or `null` | `null` | check every shard attaches to; `null` means no check run ([dynamic-pipelines](./dynamic-pipelines.md)'s GitHub status checks model: checks are opt-in, not always-on) |
@@ -84,23 +79,27 @@ await ci.shard("test", {
 | `merge.setup` | step[] | `[]` | steps run in the merge node before the merge command |
 | `merge.command` | string | generated | overrides the generated merge command entirely |
 
-Every shard container receives `CLOUD_CI_SHARD_INDEX` (1-based) and `CLOUD_CI_SHARD_TOTAL` as
-environment variables, in addition to the usual job env. For frameworks with native sharding
-(Playwright, Vitest), that's all a shard needs — `split: "file"` with native
-`--shard=$INDEX/$TOTAL` is equivalent to cloud-ci computing a round-robin file assignment, so no
-call to `cloud-ci split` is required inside a managed node; the worker only uses the computed
-assignment to decide shard *count*, not to hand the framework a file list.
+The engine always computes the split behind the scenes — a managed shard's `run` command never
+calls `cloud-ci split` or shells out to assemble its own file list. Instead, `run` is rendered as a
+MiniJinja template (the same `{{ }}` syntax used for check names and upload paths elsewhere) with
+`{{ shard.index }}` (1-based), `{{ shard.total }}`, and `{{ files }}` (this shard's assigned file
+list) in scope, in addition to the usual job env.
 
-`split: "timing"` and `split: "count"` are useful for frameworks without native sharding
+For frameworks with native sharding (Playwright, Vitest), `split: "file"` with
+`--shard={{ shard.index }}/{{ shard.total }}` is equivalent to cloud-ci computing a round-robin
+file assignment — the worker still computes `{{ files }}` for the shard, but the command can
+ignore it and use the native flag instead.
+
+`split: "timing"` and `split: "count"` matter most for frameworks without native sharding
 (`go test`, `cargo test`, `mocha`) or when a framework's native sharding doesn't account for
-historical duration. In that case the shard's `run` command calls `cloud-ci split` to get an
-explicit list:
+historical duration. In that case the shard's `run` command uses `{{ files }}` directly:
 
 ```ts
 await ci.shard("unit", {
   split: "timing",
+  count: { min: 2, max: 8, target: "5m" },
   files: ["**/*_test.go"],
-  run: "cargo nextest run $(cloud-ci split --strategy timing --granularity file)",
+  run: 'cargo nextest run {{ files | join(" ") }}',
 });
 ```
 
@@ -162,7 +161,7 @@ clamp.
 | `count` value | Resolution |
 | --- | --- |
 | integer `N` (1-64) | Fixed; used as-is. |
-| `"auto"` | `shard_count = clamp(ceil(historical_total_duration / target), min, max)`, where `historical_total_duration` sums the matched items' `duration_ewma_ms` from `test_stats`; falls back to `min` when there is no history for any matched item — this doc supplies the per-item imputation detail below for the common case of *partial* history. |
+| `{ min, max, target }` object | `shard_count = clamp(ceil(historical_total_duration / target), min, max)`, where `historical_total_duration` sums the matched items' `duration_ewma_ms` from `test_stats`; falls back to `min` when there is no history for any matched item — this doc supplies the per-item imputation detail below for the common case of *partial* history. |
 
 ### Split strategies
 
@@ -204,6 +203,47 @@ A brand-new repo, or a job whose `files` glob matches files never seen before, h
 4. A retried shard (OOM only — see Failed-shard retry semantics) always reuses the stored
    `shard_plan` entry for its index; a retry never re-runs the split algorithm and never happens
    for a non-OOM failure.
+
+### Check status and sealing (`ci.shard`)
+
+A shard group's `check` option attaches one member per shard to the check — the full member count
+for *this* `ci.shard` call becomes known the moment `RunCoordinator` persists `shard_plan` (end to
+end, step 2 above). That event fixes this call's contribution, but it does not by itself seal the
+check: the same `check` may still receive more attachments from other steps later in the same
+pipeline script (another `ci.container`, another `ci.shard`), so the check's overall member set
+isn't settled until sealing happens.
+
+A check stays `queued`/`in_progress` and never concludes until it is sealed — automatically, when
+the pipeline script's run function finishes scheduling (every step has been scheduled, so no
+further attachment is possible), or explicitly via `check.seal()`
+([dynamic-pipelines](./dynamic-pipelines.md)). `ci.shard` itself never seals a check; it only ever
+attaches members to one. Attaching a member to an already-sealed check is a script error.
+
+Without this rule, an observer polling GitHub's Checks API could see a check go green as soon as
+its first attached shard passes, then flip back to `in_progress` when a later step in the same
+script attaches another member.
+
+Timeline, before sealing existed (the bug this fixes):
+
+1. `t0` — shard 1 of (eventually) 4 starts and attaches to `check`; with no sealing, the check has
+   only this member, so it goes `in_progress` -> `success` as soon as shard 1 passes.
+2. `t1` — shard 2 attaches to the same `check`; GitHub now reopens a check that already reported
+   `success`, a confusing signal for branch protection, reviewers, or status badges that already
+   saw green.
+
+Timeline, with sealing:
+
+1. `t0` — the split step runs, resolves `shard_count = 4`, and persists `shard_plan`; all 4 shard
+   members are now attached to `check`, but `check` is **not** sealed yet — the script may still
+   attach more members to it later.
+2. `t1`..`t4` — shards 1-4 start and run; `check` stays `in_progress` no matter how many of them
+   finish, because it isn't sealed yet.
+3. `t5` — the pipeline script's run function finishes scheduling (no more steps will ever attach to
+   `check`); `RunCoordinator` seals `check` with `expected_total = 4`.
+4. `t6` — once all 4 shards are terminal, the merge barrier (below) is satisfied
+   (`count(terminal) == expected_total`), and only then does `RunCoordinator` conclude `check` —
+   which is also always after `t5`, so GitHub never observes a conclusion before the member set is
+   both complete and final.
 
 ### Merge barrier (RunCoordinator)
 
@@ -247,7 +287,7 @@ and Vitest blob reporters are opaque, framework-versioned binary/zip formats (Pl
 Node.js tooling can merge; `workers-rs`/wasm32 has no Node runtime, so these are merged by a
 **generated** `<id>/merge` node that runs in a Container exactly like a user-authored one. Its
 instance type, pre-merge steps, and command come from `ci.shard`'s own `merge.{runner,setup,command}`
-option (default `merge.runner` is settings.yml's `shard.merge.runner`, "basic"); the reporter(s)
+option (default `merge.runner` is `"basic"`); the reporter(s)
 passed to `--reporter` come from the triggering report's own `merge` field (`reports[].merge`,
 e.g. `merge: "html"`), kept separate from `merge`'s execution config.
 
@@ -292,7 +332,7 @@ explicitly-configured JSON/JUnit reporter output is re-uploaded for history.
   automatic retry path. A shard that fails for any other reason (non-zero exit, assertion failure,
   timeout) is terminal immediately — cloud-ci does not retry flaky test failures on its own.
 - An OOM retry reuses the exact same `shard_plan` entry for that index (same file/test list) and
-  the same `CLOUD_CI_SHARD_INDEX`/`CLOUD_CI_SHARD_TOTAL` — only the instance size changes.
+  the same `{{ shard.index }}`/`{{ shard.total }}` values — only the instance size changes.
   `shard_state.attempt` becomes `2` to record that it happened.
 - If the retried shard OOMs again at the new size, it fails for good, reporting the configured
   `max` and measured peak, exactly as a non-sharded `runner: "auto"` node would
@@ -387,7 +427,7 @@ runs/{run_id}/jobs/{job_name}/merged/html/                      # merged HTML si
 | A shard's blob file missing/corrupt in R2 at merge time | Merge node's download step fails fast with an explicit "shard N report missing" error rather than producing a silently incomplete merged report; surfaces as `merge_failed`. |
 | Two BYO CI matrix legs' `cloud-ci split` calls race with a default-branch run's `test_stats` upsert landing between calls | Low risk: each read is a single-row point lookup per test, not a window scan, so a leg sees either the pre- or post-upsert value, never a partial aggregate; documented as a known limitation rather than solved with distributed locking. |
 | Repo too new for history (`timing` with zero historical rows) | Falls back to `file` round-robin for that run only. |
-| `auto` shard count would exceed `max`/exceed account container concurrency | Clamped to `max`; `RunCoordinator` drip-feeds shard dispatch through `RepoState`'s existing concurrency limiter if the account-wide concurrent-container cap is hit [unverified exact Cloudflare Containers per-account concurrency ceiling]. |
+| An auto-sized `count` (`{ min, max, target }`) would resolve above `max`, or exceed account container concurrency | Clamped to `max`; `RunCoordinator` drip-feeds shard dispatch through `RepoState`'s existing concurrency limiter if the account-wide concurrent-container cap is hit [unverified exact Cloudflare Containers per-account concurrency ceiling]. |
 
 ## Open questions
 
@@ -407,7 +447,7 @@ runs/{run_id}/jobs/{job_name}/merged/html/                      # merged HTML si
 
 | Alternative | Rejected because |
 | --- | --- |
-| Always require users to hand-pick a fixed shard count | Loses the main benefit of historical timing; `count: "auto"` with a target wall time adapts as a suite grows without a script edit. |
+| Always require users to hand-pick a fixed shard count | Loses the main benefit of historical timing; `count: { min, max, target }` (auto-sizing within bounds) adapts as a suite grows without a script edit. |
 | Run `npx playwright merge-reports` inside the Worker itself | `workers-rs`/wasm32 has no Node.js/npm runtime available; merging must happen in a Container. |
 | Merge every report type (including junit/coverage) through a generated container node for consistency | Wasteful: junit/coverage are small structured text files, cheap to parse inline in a Queue consumer; spinning up a container for every node purely to concatenate XML adds latency and cost for no benefit. |
 | Dynamic rebalancing: on a failed shard, redistribute its remaining items across the other shards on retry | Rejected for determinism and debuggability — a shard's assignment must be reproducible and stable so a retry's logs/report map 1:1 back to the original plan; also doesn't fit a single-container "shard" model where "remaining items" isn't well defined once a test run has partially executed. |
@@ -434,12 +474,12 @@ sequenceDiagram
     RC->>RC: compute shard_plan (LPT bin-pack or fallback)
     RC->>D1: persist shard_plan, shard_state (queued)
     par Shard 1
-        RC->>S1: dispatch (CLOUD_CI_SHARD_INDEX=1, token scoped to shards/1/*)
+        RC->>S1: dispatch (shard.index=1, files templated into run, token scoped to shards/1/*)
         S1->>R2: upload shards/1/report (blob or native)
         S1->>Worker: ingest terminal status
         Worker->>RC: shard 1 terminal
     and Shard 2
-        RC->>S2: dispatch (CLOUD_CI_SHARD_INDEX=2, token scoped to shards/2/*)
+        RC->>S2: dispatch (shard.index=2, files templated into run, token scoped to shards/2/*)
         S2->>R2: upload shards/2/report
         S2->>Worker: ingest terminal status
         Worker->>RC: shard 2 terminal
@@ -467,7 +507,7 @@ sequenceDiagram
 - [../architecture.md](../architecture.md) — RunCoordinator/RepoState responsibilities, DAG model.
 - [./dynamic-pipelines.md](./dynamic-pipelines.md) — `ci.container`/`ci.check` execution model that
   `ci.shard` builds on.
-- [./settings.md](./settings.md) — `shard.*`/`runners.*` defaults this doc's options fall back to.
+- [./settings.md](./settings.md) — `runners.*` defaults this doc's `runner` option falls back to.
 - [./byo-ci.md](./byo-ci.md) — ingest API, `cloud-ci upload`, OIDC credential exchange used by
   `cloud-ci split`.
 - [./analytics.md](./analytics.md) — `test_stats` rolling per-test aggregate (duration +

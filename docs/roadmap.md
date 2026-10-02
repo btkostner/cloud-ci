@@ -55,7 +55,7 @@ Packages: `cloud-ci-web`.
 ## Phase 6 — Executors beyond Containers
 
 - Additional `Executor` implementations per [ADR 0010](./adr/0010-pluggable-executors.md): AWS
-  EC2, AWS Lambda, Kubernetes Jobs, self-hosted machines. Named runner pools in admin settings.
+  EC2, AWS Lambda, Kubernetes Jobs, self-hosted machines.
 
 ## Phase 7 — Distribution
 

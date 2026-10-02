@@ -32,9 +32,9 @@ snapshots), every other backend becomes a rewrite.
   | `network` | Egress model (open, allow-list, none) |
 
 - **Selection.** Scripts pick a runner per node, e.g.
-  `runner: { executor: "aws-ec2", type: "c7i.4xlarge" }`, or a named runner pool defined in admin
-  settings and referenced from [settings.yml](../design/settings.md). Admin settings decide which
-  executors and pools exist; scripts and settings.yml can only choose among them.
+  `runner: { executor: "aws-ec2", type: "c7i.4xlarge" }`. The first release ships Containers only
+  (below); other executors, and any config for choosing among several, land with the executor
+  that needs them.
 - **Credentials** for external executors (AWS keys, kubeconfig) live in Secrets Store and are
   only read by the Worker, never passed to scripts or jobs.
 

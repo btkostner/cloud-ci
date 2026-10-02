@@ -22,12 +22,13 @@ plan expanded by adapters; that kept the same problem one level up.
 - `RunCoordinator` remains the single writer of run state and enforces policy the script cannot
   override (secrets, runner bounds, concurrency, node caps).
 - Turborepo and mise support ships as library helpers in their own SDK modules
-  (`@cloud-ci/pipeline/turbo`, `@cloud-ci/pipeline/mise`), not as engine features; core
-  `@cloud-ci/pipeline` only has the generic graph + `ci` API.
+  (`@cloud-ci/pipeline-sdk/turbo`, `@cloud-ci/pipeline-sdk/mise`), not as engine features; core
+  `@cloud-ci/pipeline-sdk` only has the generic graph + `ci` API.
 - GitHub checks are created explicitly by name from the script (`ci.check(name, opts)`); nodes
-  attach to checks. No check is always-on — a check only exists if a script creates it. One
-  aggregate check (default name `cloud-ci`, configurable, can be disabled) is the recommended
-  branch-protection target.
+  attach to checks. No check is always-on — a check only exists if a script creates it. There is
+  no aggregate or rollup check; the only infra-created check is the settings check
+  `cloud-ci / config` (settings.yml and pipeline-file discovery errors). Branch protection targets
+  the script-created checks directly.
 - Static repo configuration (PR comment on/off, default check behavior, concurrency policy,
   runner bounds defaults, cache/retention prefs) lives in `.cloud-ci/settings.yml`, not in a
   pipeline file. See [settings](../design/settings.md).
@@ -46,7 +47,7 @@ Details: [dynamic-pipelines](../design/dynamic-pipelines.md).
 
 - The host side of script execution is likely TypeScript (`@cloudflare/dynamic-workflows` is a JS
   library), alongside the Rust Worker. The boundary is the coordinator RPC.
-- `cloud-ci-proto-typescript` and the `@cloud-ci/pipeline` SDK move to Phase 2.
+- `cloud-ci-proto-typescript` and the `@cloud-ci/pipeline-sdk` SDK move to Phase 2.
 - Script authors must keep code between steps deterministic.
 - Managed runs depend on Dynamic Workers and Workflows, both newer Cloudflare products.
 - The graph is not known up front, so the dashboard renders it progressively, and checks must be

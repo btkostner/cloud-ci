@@ -8,8 +8,8 @@ Related: [../architecture.md](../architecture.md#extension-boundary), [ADR 0009]
 
 cloud-ci reports results to GitHub in two independent ways:
 
-1. **Check Runs (optional, named).** A pipeline script creates checks explicitly, by name, via `ci.check(name, opts)`; nodes attach to whichever check they belong to. Nothing is created automatically per job, so a noisy or internal-only job can simply have no check. One aggregate check (default name `cloud-ci`, configurable and independently disableable in settings.yml) rolls up every check into a single branch-protection target. See [dynamic-pipelines.md#github-status-checks](./dynamic-pipelines.md#github-status-checks) for exactly when a check is created and how its conclusion is computed.
-2. **One sticky PR comment (optional, per repo).** The comment is created once, immediately, as a "running" placeholder, then edited in place for the life of the PR's current head sha. A hidden HTML marker identifies it. Rendering is forge-agnostic: a documented `PrReport` context (runs, pipelines, checks, scopes, tests, failures, coverage, perf, reports, links, actions) is turned into markdown by a template, and posting that markdown to a forge is a separate step behind the `Forge` trait ([../architecture.md#extension-boundary](../architecture.md#extension-boundary)). GitHub is the only `Forge` implementation that ships; the split exists so a later forge reuses the renderer unchanged. The default built-in template is short — it drops the per-job status table, perf/critical-path, and runner-sizing detail that used to live in the comment; those stay in the full report (dashboard run report page, linked from the comment). Repos can replace the template entirely. Writes are debounced and coalesced by a dedicated `PullRequestState` Durable Object (one instance per PR), and the rendered body is held under a byte budget below GitHub's comment limit.
+1. **Check Runs (optional, named).** A pipeline script creates checks explicitly, by name, via `ci.check(name, opts)`; nodes attach to whichever check they belong to. Nothing is created automatically per job, so a noisy or internal-only job can simply have no check. There is no aggregate/rollup check; branch protection targets the script-created named check(s) directly. See [dynamic-pipelines.md#github-status-checks](./dynamic-pipelines.md#github-status-checks) for exactly when a check is created and how its conclusion is computed.
+2. **One sticky PR comment (optional, per repo).** The comment is created once, immediately, as a "running" placeholder, then edited in place for the life of the PR's current head sha. A hidden HTML marker identifies it. Rendering is forge-agnostic: a documented `PrReport` context (runs, pipelines, checks, scopes, tests, failures, coverage, perf, reports, deployments, links, actions) is turned into markdown by a template, and posting that markdown to a forge is a separate step behind the `Forge` trait ([../architecture.md#extension-boundary](../architecture.md#extension-boundary)). GitHub is the only `Forge` implementation that ships; the split exists so a later forge reuses the renderer unchanged. The default built-in template is short — it drops the per-job status table, perf/critical-path, and runner-sizing detail that used to live in the comment; those stay in the full report (dashboard run report page, linked from the comment). Repos can replace the template entirely. Writes are debounced and coalesced by a dedicated `PullRequestState` Durable Object (one instance per PR), and the rendered body is held under a byte budget below GitHub's comment limit.
 
 `/cloud-ci` slash commands and checkbox actions in the comment let people rerun, cancel, refresh, and toggle the comment. Both are authorized against the actor's GitHub repo permission.
 
@@ -34,26 +34,20 @@ cloud-ci reports results to GitHub in two independent ways:
 
 ### Configuration
 
-Per D1, settings.yml — not an admin dashboard switch — is the master on/off for the comment, since posting a comment spends neither money nor secrets. For fork PRs, settings.yml is read from the base branch, so a fork cannot change the template, the coverage report compared, or which checkbox actions are offered.
+Per D1, settings.yml — not an admin dashboard switch — is the master on/off for the comment, since posting a comment spends neither money nor secrets. settings.yml is always read from the repo's default branch (never the PR's base ref, which can differ from the default branch, and never the PR head), so no PR, forked or not, can change the template or the coverage report compared by editing settings.yml on its own branch.
 
 ```yaml
 # .cloud-ci/settings.yml
 pr_comment:
   enabled: true                                  # repo default; per-PR override via /cloud-ci comment on|off
   template: .cloud-ci/templates/pr-comment.md     # optional; falls back to the built-in template
-  actions: [rerun_failed, autofix]                # which checkbox actions the comment offers
   coverage_report: unit                           # which coverage report name to diff vs base
-checks:
-  aggregate:
-    enabled: true
-    name: cloud-ci
-  name_template: "{pipeline} / {check}"
 commands:
   roles:
     autofix: admin                                # raises a command's min role above its default; never lowers it
 ```
 
-Full schema: [./settings.md](./settings.md#pr-comment) and [./settings.md](./settings.md#checks). External-run check policy (one check per job vs. per run vs. none) is also a settings.yml field; see [./settings.md](./settings.md#checks) and [./byo-ci.md](./byo-ci.md) for its exact key and defaults.
+Full schema: [./settings.md](./settings.md#pr-comment). Which checkbox actions are offered is decided by the template, not a settings.yml list (see Checkbox actions). External-run check policy (one check per job vs. per run vs. none) is also a settings.yml field; see [./settings.md](./settings.md#checks) and [./byo-ci.md](./byo-ci.md) for its exact key and defaults.
 
 ### Template rendering
 
@@ -61,7 +55,7 @@ The renderer turns a versioned `PrReport` context into markdown using [MiniJinja
 
 - **Built-in default template** ships with cloud-ci and renders the short layout in the mockup below.
 - **Repo override** at the path in `pr_comment.template` (default `.cloud-ci/templates/pr-comment.md`). Missing file falls back to the built-in template; a template that fails to parse or render falls back to the built-in template and logs `pr_comment_template_error` (the comment still posts).
-- **Context data model** is documented and versioned (`context_version`, independent of the comment marker's `v1`) so a template can check compatibility. Top-level fields: `runs`, `pipelines`, `checks`, `scopes`, `tests`, `failures`, `coverage`, `perf`, `reports`, `links`, `actions`, plus `all_passed` (a precomputed bool templates use to collapse a green PR to one line, replacing the old `collapse_when_green` setting — the template controls this directly, not a setting). Exact field shapes are finalized alongside the `PrReport` proto (see Aggregation). Rendering uses `UndefinedBehavior::Lenient` at runtime (a template referencing a field that does not exist in this render, e.g. an empty `perf` on a run with no benchmarks, renders empty rather than erroring) but a repo saving a custom template through the dashboard gets a `UndefinedBehavior::Strict` dry-run against a synthetic context first, to catch typos before they reach production renders.
+- **Context data model** is documented and versioned (`context_version`, independent of the comment marker's `v1`) so a template can check compatibility. Top-level fields: `runs`, `pipelines`, `checks`, `scopes`, `tests`, `failures`, `coverage`, `perf`, `reports`, `deployments`, `links`, `actions`, plus `all_passed` (a precomputed bool templates use to collapse a green PR to one line, replacing the old `collapse_when_green` setting — the template controls this directly, not a setting). `deployments` is the list of `deployment` reports (`name`, `preview_url`, `inspect_url?`, `scope?`) from [byo-ci.md](./byo-ci.md); the built-in template renders it as a Previews section. Exact field shapes are finalized alongside the `PrReport` proto (see Aggregation). Rendering uses `UndefinedBehavior::Lenient` at runtime (a template referencing a field that does not exist in this render, e.g. an empty `perf` on a run with no benchmarks, renders empty rather than erroring) and the same MiniJinja `{{ var }}` syntax as shard commands and upload paths ([dynamic-pipelines.md](./dynamic-pipelines.md)).
 - Template output is still subject to the byte budget and truncation rules below; truncation operates on the rendered markdown, not on the template.
 
 ### Comment layout (mockup)
@@ -114,6 +108,9 @@ Shard 3/8 · attempt 1 · first failure on this PR · [log](https://ci.example.c
 #### Reports
 [Playwright report (merged)](https://assets.example.com/s/acme/web/pr-412/latest/playwright/) · [Vitest HTML](https://assets.example.com/s/acme/web/pr-412/latest/vitest/) · [Coverage HTML](https://assets.example.com/s/acme/web/pr-412/latest/coverage/) · [12 artifacts](https://ci.example.com/acme/web/runs/r_9f2/artifacts)
 
+#### Previews
+[storybook](https://chromatic.com/build?appId=...&number=412) · [docs](https://docs-pr-412.pages.dev)
+
 #### Flaky
 - `e2e` checkout.spec.ts › pays with card: failed attempt 1, passed attempt 2. Flake rate on `main` over 30 days: 4.1%.
 
@@ -130,18 +127,17 @@ Report links go to the separate assets hostname, never the dashboard host (secur
 
 ### Scopes (monorepo)
 
-A report or job carries a `scope` (package/app name + path prefix), set by the script or by SDK helpers — the turbo integration in [dynamic-pipelines.md](./dynamic-pipelines.md) sets `scope` to the package name automatically. The context's `scopes` field groups `tests`, `failures`, `coverage`, and `reports` by scope. The built-in template renders each scope as its own block; a scope with no failures collapses to a one-line `<details>` summary (as `api` does above), and only failing scopes render expanded by default. A repo with no scopes set (a single-package repo) gets one implicit scope and the grouping headers disappear.
+A report or job carries a `scope` (package/app name + path prefix), set by the script or by SDK helpers — the turbo integration in [dynamic-pipelines.md](./dynamic-pipelines.md) sets `scope` to the package name automatically. `cloud-ci upload`'s glob + manifest/`--scope-from turbo` scoping does the same for external runs ([byo-ci.md#globs-and-scopes](./byo-ci.md#globs-and-scopes)). The context's `scopes` field groups `tests`, `failures`, `coverage`, and `reports` by scope. The built-in template renders each scope as its own block; a scope with no failures collapses to a one-line `<details>` summary (as `api` does above), and only failing scopes render expanded by default. A repo with no scopes set (a single-package repo) gets one implicit scope and the grouping headers disappear.
 
 ### Check Runs
 
 | Check Run | Created when | Name | Details URL |
 | --- | --- | --- | --- |
-| Named check (script-defined) | `ci.check(name, opts)` runs in the script | rendered from `checks.name_template` in settings.yml (default `"{pipeline} / {check}"`) | dashboard check page |
+| Named check (script-defined) | `ci.check(name, opts)` runs in the script | the exact `name` passed to `ci.check` | dashboard check page |
 | Per external job | First ingest for job, if the repo's external-check policy is per-job | `<run_key> / <job>` | dashboard job page |
 | Per external run | First ingest for run, if the repo's external-check policy is per-run (the default) | `<run_key>` | dashboard run page |
-| Aggregate | First run recorded for sha, if `checks.aggregate.enabled` (default on) | `checks.aggregate.name` (default `cloud-ci`) | dashboard PR/commit page |
 
-A script may create zero, one, or many named checks; a check with no attached nodes when the script ends concludes `success` with "no matching tasks" (see [dynamic-pipelines.md#github-status-checks](./dynamic-pipelines.md#github-status-checks)). External runs default to a per-run check because the external CI (for example GitHub Actions) usually posts its own per-job checks already. A shard group maps to a single Check Run, and the summary holds a shard table. The aggregate check, when enabled, is the one meant to be required in branch protection: it turns `completed` once every run known for the sha is terminal, with conclusion `failure` if any required check failed, otherwise `success`.
+A script may create zero, one, or many named checks; a check with no attached nodes when the script ends concludes `success` with "no matching tasks" (see [dynamic-pipelines.md#github-status-checks](./dynamic-pipelines.md#github-status-checks)). External runs default to a per-run check because the external CI (for example GitHub Actions) usually posts its own per-job checks already. A shard group maps to a single Check Run, and the summary holds a shard table. There is no aggregate check; branch protection names whichever script-created check(s) it requires directly.
 
 Check Run `output.summary` holds the slice of the rendered comment relevant to that check (tests, failures, AI summary), built from the same template context. Failures that carry file/line from reports become annotations (`annotation_level: failure`, flaky as `warning`).
 
@@ -165,7 +161,7 @@ Defaults can be raised, never lowered, per command via `commands.roles` in setti
 
 ### Checkbox actions
 
-GitHub comments have no real buttons, so the subset of `pr_comment.actions` enabled in settings.yml renders as task-list checkboxes (`- [ ] Rerun failed jobs`), each tagged with a stable id in a trailing HTML comment the renderer generates itself (`<!-- cloud-ci:action rerun_failed -->`). Checking one maps to the slash command of the same name and the same `commands.roles` gate. Check Run `actions` (max 3; GitHub-documented limits: label ≤ 20 chars, identifier ≤ 20, description ≤ 40, verified via the GitHub REST API OpenAPI description 2026-10-01, https://github.com/github/rest-api-description) are used instead wherever a check already exists for the job (failed job: `Rerun failed`/`Explain`; running job: `Cancel`); checkboxes are the fallback that works even when no check exists, or the comment is disabled.
+GitHub comments have no real buttons, so whichever action checkboxes the template emits (`- [ ] Rerun failed jobs`) render as task-list checkboxes, each tagged with a stable id in a trailing HTML comment the renderer generates itself (`<!-- cloud-ci:action rerun_failed -->`). Which actions a repo offers is a template choice, not a settings.yml list: a repo wanting fewer or different actions edits its `pr_comment.template`. Checking one maps to the slash command of the same name and the same `commands.roles` gate. Check Run `actions` (max 3; GitHub-documented limits: label ≤ 20 chars, identifier ≤ 20, description ≤ 40, verified via the GitHub REST API OpenAPI description 2026-10-01, https://github.com/github/rest-api-description) are used instead wherever a check already exists for the job (failed job: `Rerun failed`/`Explain`; running job: `Cancel`); checkboxes are the fallback that works everywhere else, including the summary comment and multi-check views.
 
 A GitHub webhook delivers `issue_comment` with `action: "edited"` and includes `changes.body.from` (the previous body) alongside the current `comment.body` and the `sender` who made the edit — confirmed against GitHub's webhook payload schema (`webhook-issue-comment-edited`, required fields `action, changes, issue, comment, repository, sender`; `changes.body.from` is a required string), verified 2026-10-01 against the GitHub REST API OpenAPI description (https://github.com/github/rest-api-description/blob/main/descriptions/api.github.com/api.github.com.json) and the mirrored JSON Schema (https://github.com/octokit/webhooks/blob/main/payload-schemas/api.github.com/issue_comment/edited.schema.json). GitHub's narrative webhook-events page lists `comment`/`issue` for `issue_comment` but does not separately enumerate `changes` in its payload-parameter table (verified 2026-10-01, https://docs.github.com/en/webhooks/webhook-events-and-payloads#issue_comment); the schema is the authoritative source here.
 
@@ -356,7 +352,7 @@ CREATE TABLE pr_comments (
 );
 
 CREATE TABLE check_runs (
-  run_id TEXT NOT NULL, job_id TEXT NOT NULL,   -- job_id '' for per-run / aggregate checks
+  run_id TEXT NOT NULL, job_id TEXT NOT NULL,   -- job_id '' for per-run checks
   gh_check_run_id INTEGER NOT NULL, name TEXT NOT NULL, head_sha TEXT NOT NULL,
   status TEXT NOT NULL, conclusion TEXT, annotations_posted INTEGER NOT NULL DEFAULT 0,
   last_patched_at INTEGER, PRIMARY KEY (run_id, job_id)
@@ -399,10 +395,10 @@ R2:
 
 - **Marker spoofing:** comments are adopted only when `performed_via_github_app.id` matches our App, and rendered content cannot contain `<!--`.
 - **Markdown/HTML injection:** see "Untrusted content escaping". Test output from fork PRs is attacker-controlled. Without escaping, it could forge status rows, ping users, or add misleading links.
-- **Template trust:** a custom template is repo config (read from the base branch for forks), trusted the same as settings.yml; it is not sandboxed against its author. Only the untrusted *values* passed into it are escaped.
+- **Template trust:** a custom template is repo config (read from the repo's default branch, never the PR base ref or head), trusted the same as settings.yml; it is not sandboxed against its author. Only the untrusted *values* passed into it are escaped.
 - **Command and action authorization:** every slash command and checkbox click is checked against the live repo permission of `sender`, never `author_association`, which shows association rather than permission, gated additionally by `commands.roles`. Fork authors without write get viewer commands only. `autofix` also requires the repo-level opt-in from [./ai.md](./ai.md).
 - **Checkbox loop avoidance:** cloud-ci's own PATCH to reset a checkbox triggers another `issue_comment.edited`; that event's `sender` is the App's own bot identity, so it's filtered before any diffing happens (see Checkbox actions).
-- **Fork PR config:** `pr_comment.*`, `checks.*`, and `commands.roles` are all read from the base branch for forks (see Configuration).
+- **Fork PR config:** `pr_comment.*`, `checks.*`, and `commands.roles` are all read from the repo's default branch, never the fork's branch or the PR base ref (see Configuration).
 - **Cost abuse:** `explain` and AI summaries are operator-gated or config-gated by [./ai.md](./ai.md), and `refresh` is rate-limited per PR.
 - **Link hygiene:** report links point to the assets hostname only ([./assets.md](./assets.md)). Dashboard links require auth ([./auth.md](./auth.md)), so a public PR comment exposes nothing that a viewer of a private dashboard could not see. In public repos, private-dashboard links simply 401 for outsiders.
 - **AI output** is labelled `may be wrong`, escaped like test output, and capped at 800 bytes per failure.
@@ -429,8 +425,7 @@ R2:
 2. **Do Check Run PATCHes count as content-generating requests?** [unverified]. If not, they can leave the shared bucket.
 3. **Characters or bytes for the 65536 comment limit?** The design is safe either way. Confirming would recover up to about 5% of the budget for ASCII-heavy bodies.
 4. **Comment for merge-ref builds.** If a pipeline script builds `refs/pull/N/merge`, the head shown is still the PR head sha, with the merge sha in the dashboard only. Confirm with [dynamic-pipelines.md](./dynamic-pipelines.md).
-5. **Should an aggregate `cloud-ci` check also include `external` runs** for repos where GitHub Actions already gates merges? Default: yes; per-repo opt-out may be needed.
-6. **External runs without a `RunCoordinator`** (depends on [./byo-ci.md](./byo-ci.md)). `PullRequestState` only ever receives `notify_dirty`; if external runs are not given a `RunCoordinator` or equivalent, the ingest path itself must call `notify_dirty` after each write.
+5. **External runs without a `RunCoordinator`** (depends on [./byo-ci.md](./byo-ci.md)). `PullRequestState` only ever receives `notify_dirty`; if external runs are not given a `RunCoordinator` or equivalent, the ingest path itself must call `notify_dirty` after each write.
 
 ## Alternatives considered
 

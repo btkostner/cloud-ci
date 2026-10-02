@@ -18,17 +18,18 @@ A pipeline is a TypeScript **script** in `.cloud-ci/pipelines/<name>.ts` — one
 its own Dynamic Workflow instance; several pipeline files can run for the same commit (e.g.
 `ci.ts` on `pull_request`, `deploy.ts` on `push` to `main`), independently of each other. There is
 no YAML pipeline format. The only static file is `.cloud-ci/settings.yml`
-([settings](./settings.md)): non-executable repo config — PR comment behavior, check naming and
-aggregation, concurrency policy, runner pool definitions, cache/retention preferences, and which
-secrets a pipeline may request. settings.yml cannot start a container or run code; it only narrows
-what pipeline scripts are allowed to do.
+([settings](./settings.md)): non-executable repo config — PR comment behavior, check naming
+defaults, concurrency policy (`concurrency.repository`, `concurrency.pipelines`,
+`concurrency.pipeline`), cache/retention preferences, and which secrets a pipeline may request.
+settings.yml cannot start a container or run code; it only narrows what pipeline scripts are
+allowed to do.
 
 A pipeline script does not return a static plan. It runs for the whole CI run: it starts
 containers, reads their results, decides what to do next, and loops. The script can run
 `turbo run --dry=json` in a container, parse the edges, and run each task in its own container as
 soon as its dependencies finish. That logic lives in plain code using helpers from
-`@cloud-ci/pipeline` and its integration modules (`@cloud-ci/pipeline/turbo`,
-`@cloud-ci/pipeline/mise`), not in a fixed engine feature.
+`@cloud-ci/pipeline-sdk` and its integration modules (`@cloud-ci/pipeline-sdk/turbo`,
+`@cloud-ci/pipeline-sdk/mise`), not in a fixed engine feature.
 
 Scripts run as **Dynamic Workflows**: a Cloudflare Workflow whose code is loaded at runtime into a
 Dynamic Worker. Every side effect (starting a container, waiting for it, publishing a check) is a
@@ -64,8 +65,8 @@ facts.
 
 ```ts
 // .cloud-ci/pipelines/ci.ts
-import { workflow } from "@cloud-ci/pipeline";
-import { turbo } from "@cloud-ci/pipeline/turbo";
+import { workflow } from "@cloud-ci/pipeline-sdk";
+import { turbo } from "@cloud-ci/pipeline-sdk/turbo";
 
 export default workflow({
   on: { pull_request: {}, push: { branches: ["main"] } },
@@ -88,17 +89,45 @@ export default workflow({
 
     const build = ci.check("ci/build", { required: true });
     const test = ci.check("ci/test", { required: true });
+    const typecheck = ci.check("ci/typecheck", { required: true });
 
     await turbo.execute(ci, graph, {
       snapshot: deps,
       concurrency: 24,
       runner: (node) => (node.task === "build" ? "standard-2" : "auto"),
-      check: (node) =>
-        node.task === "build" ? build : ["test", "typecheck"].includes(node.task) ? test : null,
+      check: (node) => {
+        if (node.task === "build") return build;
+        if (node.task === "test") return test;
+        if (node.task === "typecheck") return typecheck;
+        return null;
+      },
     });
   },
 });
 ```
+
+### Discovery and triggers
+
+`on` can be the static object shown above, or a function:
+
+```ts
+export default workflow({
+  on: (ctx) => ctx.event.kind === "pull_request" && !ctx.labels.includes("skip-ci"),
+  async run(ci) {
+    /* ... */
+  },
+});
+```
+
+`ctx` carries read-only event data: `event` (kind, repo, sha, ref), `changedFiles`, `branch`,
+`labels` — the same data the script sees as `ci.event`/`ci.changedFiles` during a run — and
+nothing else: no network, no secrets. Discovery evaluates `on` without ever calling `run`: for the
+static form it just reads the object; for the function form it loads the script once per event
+into a Dynamic Worker isolate with egress blocked and a CPU budget
+`[unverified: exact CPU budget]`, and calls `on(ctx)`. A function that throws, times out, or
+exceeds the budget counts as "does not match" and is logged, not treated as a fatal discovery
+error. The static form stays the fast path: the host can decide to start a pipeline without
+spinning up an isolate at all, and can cache the decision by the script's blob sha.
 
 `turbo.execute` is ordinary library code, roughly:
 
@@ -126,6 +155,34 @@ export async function execute(ci, graph, opts) {
 ```
 
 Users who need something different copy or wrap it.
+
+### One check per package
+
+`turbo.execute`'s `check` callback can also fan out to one check per package instead of one check
+per task, using the `turbo.checkPerTask` helper:
+
+```ts
+const packageTests = turbo.checkPerTask(ci, graph, {
+  task: "test",
+  name: "{{ package }}#test",
+  required: true,
+});
+
+await turbo.execute(ci, graph, {
+  snapshot: deps,
+  concurrency: 24,
+  check: (node) => (node.task === "test" ? packageTests(node) : null),
+});
+```
+
+`turbo.checkPerTask` walks `graph` for nodes matching `task`, creates one `ci.check` per distinct
+package the first time it sees that package (named by filling the `{{ package }}` MiniJinja
+template, e.g. `package1#test`, `package2#test`), and returns a lookup function that
+`turbo.execute`'s `check` callback uses to map each node to its package's check. Because `graph` is
+already resolved by `turbo.plan`, the full set of packages — and so the full set of checks — is
+known up front. `turbo.checkPerTask` can call `check.seal()` on each check after it attaches that
+package's nodes, so a package check need not wait for the whole script to finish (see
+[Check sealing](#check-sealing)).
 
 ### Steps and sidecars
 
@@ -155,39 +212,66 @@ if (ci.changedFiles.some((f) => f.startsWith("infra/"))) {
 ### Splitting tests across shards
 
 Sharding is a library helper, not a core primitive — it reuses the same deterministic split
-algorithm as `cloud-ci split` ([parallelization](./parallelization.md)):
+algorithm as `cloud-ci split` ([parallelization](./parallelization.md)). `ci.shard` takes a
+required `split` strategy (`"timing"`, `"file"`, or `"count"`) and a required count spec (a plain
+integer, or `{ min, max, target }`); the engine resolves the actual shard count and per-shard file
+assignment and gives each shard container a `{{ files }}` template variable (a list), plus
+`{{ shard.index }}` and `{{ shard.total }}` — no shell glue in `run`, just MiniJinja templating.
+
+A migration-backed suite only needs to migrate the database once. Run the migration as a plain
+`ci.container` with its own `postgres` sidecar, snapshot that sidecar's data volume once the
+migration finishes, then start each shard's own `postgres` sidecar `from:` that snapshot instead of
+sharing one live sidecar across shards:
 
 ```ts
-const shards = await ci.shard("test", {
+const test = ci.check("ci/e2e", { required: true });
+
+const migrated = await ci.container("migrate", {
   snapshot: deps,
-  files: "tests/**/*.spec.ts",
-  count: "auto",
-  run: (index, total) => `npx playwright test --shard=${index}/${total} --reporter=blob`,
+  sidecars: {
+    postgres: { image: "postgres:17", env: { POSTGRES_PASSWORD: "ci" }, ready: "tcp:5432" },
+  },
+  run: "pnpm db:migrate",
+});
+
+const pgSnapshot = ci.snapshot("postgres-migrated", {
+  from: migrated,
+  sidecar: "postgres",
+  volume: "/var/lib/postgresql/data",
+});
+
+const shards = await ci.shard("e2e", {
+  snapshot: deps,
+  split: "timing",
+  count: { min: 2, max: 8, target: "5m" },
+  sidecars: {
+    postgres: { image: "postgres:17", from: pgSnapshot, ready: "tcp:5432" },
+  },
+  run: 'npx playwright test {{ files | join(" ") }} --reporter=blob',
   reports: [{ type: "playwright-blob", merge: "html" }],
   check: test,
 });
 ```
 
-`ci.shard` resolves a shard count and per-shard file/test assignment (timing-aware or round-robin,
+Each shard starts its own `postgres` from the post-migration snapshot, so restoring it is a
+filesystem copy, not a fresh `pnpm db:migrate` run, and no shard depends on another shard's sidecar
+still being alive. That sidesteps needing one live sidecar reachable from many containers at once:
+whether two Cloudflare Containers can reach each other over a private network at all is
+`[unverified]` (see [Sidecars](#sidecars)) — a snapshot-per-shard sidecar never needs that, since
+each shard's `postgres` lives inside that shard's own container next to the test runner. Whether a
+container can start a sidecar from a snapshot another container's sidecar took, and how that
+compares in speed with a cold `postgres` start, is a Phase 0 spike (see
+[Open questions](#open-questions)); if sidecar-snapshot restore turns out as slow as a cold start,
+per-shard migration is the fallback — slower, but needs nothing new.
+
+`ci.shard` resolves the shard count and per-shard file assignment (timing-aware or round-robin,
 same algorithm and same `test_timings` data as `cloud-ci split`), starts one `ci.container` per
-shard, and runs the generated merge step once every shard reaches a terminal state. See
-[parallelization](./parallelization.md) for split strategies, the merge barrier, and OOM-retry
-semantics — `ci.shard` is the dynamic-pipelines entry point into that same design, not a separate
-one.
-
-### Runner selection
-
-Any node (`ci.container`, `turbo.execute`'s `runner`, `ci.shard`) accepts either a named size on
-the default executor (`"standard-2"`, `"auto"`) or an explicit executor:
-
-```ts
-runner: { executor: "aws-ec2", type: "c7i.4xlarge" }
-```
-
-or a named runner pool defined in [settings.yml](./settings.md) by an admin. Executors besides
-Cloudflare Containers, their capabilities, and the pull/callback agent model are
-[ADR 0010](../adr/0010-pluggable-executors.md); the script-facing surface is just the `runner`
-field above.
+shard — each with its own sidecars, if given — from the snapshot, and runs the generated merge step
+once every shard reaches a terminal state. Resolving the shard count attaches all shards to the
+check, so the check can report `in_progress` with a known total; it does not seal the check (see
+[Check sealing](#check-sealing)). See [parallelization](./parallelization.md)
+for split strategies, the merge barrier, and OOM-retry semantics — `ci.shard` is the
+dynamic-pipelines entry point into that same design, not a separate one.
 
 ## Design
 
@@ -261,8 +345,9 @@ The script decides *what* to run. `RunCoordinator` still:
 
 - owns run/node state and is its only writer (D1 projection, Check Runs, PR comment notify);
 - enforces policy the script cannot override: secret grants (none for fork PRs), runner min/max
-  per repo, the repo-wide concurrent-container cap from [settings.yml](./settings.md) (a script's
-  own `ci.limit`/`concurrencyGroup` can only narrow further, never raise it), max nodes per run;
+  per repo, the `concurrency.repository`/`concurrency.pipelines`/`concurrency.pipeline` caps from
+  [settings.yml](./settings.md) (a script's own `ci.limit` can only narrow further, never raise
+  it), max nodes per run;
 - starts and stops containers, mints per-node tokens, and receives agent uploads.
 
 Without this split, a PR could edit its own script to request a production secret or 500
@@ -274,16 +359,18 @@ Without this split, a PR could edit its own script to request a production secre
 | --- | --- |
 | `turbo.plan(ci, opts)` | Runs `turbo run <tasks> --dry=json` in a container; returns a graph of `taskId`, `package`, `task`, `hash`, `outputs`, `dependencies` (fields per turborepo.dev/docs/reference/run, checked 2026-10-01) |
 | `turbo.execute(ci, graph, opts)` | Dependency-ordered fan-out with cache-hit skipping and bounded concurrency (above) |
+| `turbo.checkPerTask(ci, graph, opts)` | Creates and memoizes one `ci.check` per distinct value of a grouping key (default `package`) among a task's nodes, named via a MiniJinja template like `"{{ package }}#test"`; returns a lookup function for `turbo.execute`'s `check` callback (see [One check per package](#one-check-per-package)) |
 | `mise.plan(ci, opts)` | Same for mise tasks `[unverified: mise's machine-readable graph command and format]` |
-| `graph.fromJson(json)` | Lifts any tool's own graph output (Nx, Bazel, Pants, a custom script that prints JSON) into cloud-ci's generic graph shape, so `ci.limit` and dependency-ordered fan-out work the same way as for turbo/mise. This is the escape hatch for tools without a built-in integration module |
+| `graph.fromJson(nodes)` | Builds cloud-ci's generic graph from an array already in cloud-ci's own node shape (`{ id, package, task, hash, dependencies, outputs }`); the primitive `turbo.plan`/`mise.plan` call internally after parsing their own tool's output |
+| `graph.fromGraph(rawNodes, mapFn)` | Escape hatch for tools without a built-in integration module (Nx, Bazel, Pants, a custom script that prints JSON): calls `mapFn` over each of the other tool's own raw nodes to produce cloud-ci's node shape, then `graph.fromJson`s the result. Parsing the other tool's output format is the caller's job via `mapFn` — cloud-ci does not understand Nx/Bazel/Pants output itself |
 | `ci.shard(id, opts)` | Deterministic test splitting, per-shard containers, and merge barrier, reusing the `cloud-ci split` algorithm ([parallelization](./parallelization.md)) |
 | `ci.limit(n, thunks)` | Concurrency limiter that is replay-safe (ordering is by call, not completion); the per-call half of concurrency control — repo-wide caps come from settings.yml (see Limits below) |
 | `ci.group(ids, spec)` | Run several nodes in one container to save startup cost |
 
-`turbo` and `mise` are separate entry points (`@cloud-ci/pipeline/turbo`,
-`@cloud-ci/pipeline/mise`), not exports of the core package. A script that only needs
-`graph.fromJson` and the generic `ci` API imports just `@cloud-ci/pipeline` and does not bundle
-turbo- or mise-specific code.
+`turbo` and `mise` are separate entry points (`@cloud-ci/pipeline-sdk/turbo`,
+`@cloud-ci/pipeline-sdk/mise`), not exports of the core package. A script that only needs
+`graph.fromJson`/`graph.fromGraph` and the generic `ci` API imports just `@cloud-ci/pipeline-sdk`
+and does not bundle turbo- or mise-specific code.
 
 Upstream outputs move through cloud-ci's Turborepo remote cache. Each node runs
 `turbo run <task> --filter=<pkg>` without `--only`, so turbo restores upstream outputs from the
@@ -299,8 +386,10 @@ Cloudflare Containers run one container per Durable Object instance. Whether two
 reach each other over a private network is `[unverified]`. v1 therefore runs sidecars as extra
 processes inside the job's container: the agent starts them from their images' entrypoints
 (image layers pulled into the job image at build time, or a multi-image runner image), waits for
-`ready`, and tears them down after the steps. A sidecar that needs its own container is an open
-question.
+`ready`, and tears them down after the steps. A sidecar that needs its own container — for example
+one shared live sidecar reachable from several shard containers at once — is an open question; see
+[Splitting tests across shards](#splitting-tests-across-shards) for the snapshot-per-shard
+workaround that avoids needing it for the migrate-once case.
 
 ### Layered snapshots
 
@@ -329,28 +418,75 @@ to 20 GB and kept 30 days (developers.cloudflare.com/containers/platform/limits,
 restore speed versus a cold install, are Phase 0 spikes; the fallback is a lockfile-keyed
 package-store cache ([assets](./assets.md)).
 
+`ci.snapshot` can also capture a sidecar's data volume instead of the job container's own
+filesystem:
+`ci.snapshot(name, { from: containerResult, sidecar: "postgres", volume: "/var/lib/postgresql/data" })`
+snapshots that volume as it stood when `containerResult`'s container finished, so a later
+`ci.container`/`ci.shard` call can start its own `postgres` sidecar `from:` that snapshot instead
+of a cold `postgres:17` plus a fresh migration. Same 20 GB/30-day limits and same cross-container
+restore open question as above; see [Splitting tests across shards](#splitting-tests-across-shards)
+for the worked example.
+
 ### GitHub status checks
 
 Checks are opt-in: nothing is created unless the script asks for it, and names are chosen by the
-script, not derived from node or task names.
+script, not derived from node or task names. There is no aggregate or rollup check — the only
+infra-created check is the settings check `cloud-ci / config` (settings.yml and pipeline-file
+discovery errors; see [settings](./settings.md)). Branch protection names the script-created
+checks directly.
 
 - `ci.check(name, { required })` creates the check run immediately (`queued`), so branch
   protection sees it before any work starts. Nodes attach to it via `check: build` on
   `ci.container`; its conclusion is the worst of its attached nodes, with cached counting as
-  success. A check with no attached nodes when the script ends concludes `success` with "no
-  matching tasks", or `failure` if the script itself failed.
+  success.
 - Nodes with `check: null` (or omitted) report no check run; they still appear in the PR comment
   and dashboard — this is how a noisy check stays hidden without losing visibility elsewhere.
-- One aggregate check, default name `cloud-ci`, rolls every check a pipeline creates up into a
-  single status. Its name is configurable, and it can be disabled entirely, per repo, in
-  [settings.yml](./settings.md); when enabled it's the recommended branch-protection target
-  instead of naming individual pipeline checks.
-- Check name templates (e.g. `"{pipeline} / {check}"`) are configurable in settings.yml so names
-  stay stable across pipeline-file renames.
+- Check names are MiniJinja templates (e.g. `"{{ pipeline }}/build"`) rendered in pipeline
+  code; there is no settings.yml name template.
 
 Naming a required check after a discovered task is unsafe: if the task leaves the graph, GitHub
 waits forever for it. `required` only drives documentation and dashboard warnings; GitHub branch
 protection does the enforcing.
+
+#### Check sealing
+
+A check's member set — the nodes attached to it — is fixed once the check is *sealed*. Before
+sealing, the check stays `queued`/`in_progress` on GitHub no matter how many attached nodes have
+already finished; this is what stops a check from going green on 1 of 1 attached nodes and then
+flipping back to pending when the script attaches a second node later. Sealing happens:
+
+- automatically, when the script's `run` function finishes scheduling — i.e. `run` returns and
+  every scheduling call it made has resolved — the default for a check sized once a full plan is
+  known, e.g. `turbo.execute`'s `check` mapping over an already-resolved `graph`;
+- never by `ci.shard` itself: resolving the shard count only attaches the shards as members (they
+  are not exposed before that point), and the check still seals by one of the two other rules;
+- explicitly, via `check.seal()`, when a script needs a check to conclude before the script itself
+  finishes (see the always-on check below).
+
+Attaching a node to an already-sealed check is a script error; the coordinator fails the run. A
+sealed check with no attached members concludes `success` with a "no matching tasks" summary,
+unless the script itself failed, in which case it concludes `failure`.
+
+#### An always-on required check
+
+A required check that must exist on every run, even when nothing relevant changed, seals itself
+immediately with an explicit conclusion instead of waiting on a node:
+
+```ts
+const docsLint = ci.check("ci/docs-lint", { required: true });
+
+if (ci.changedFiles.some((f) => f.endsWith(".md"))) {
+  await ci.container("docs-lint", { snapshot: deps, run: "pnpm lint:docs", check: docsLint });
+} else {
+  docsLint.seal({ conclusion: "skipped", summary: "no markdown files changed" });
+}
+```
+
+GitHub's branch protection treats a required check's `skipped` conclusion (like `neutral`) the
+same as `success` — required status checks must reach `successful`, `skipped`, or `neutral` before
+a PR can merge (docs.github.com/repositories/configuring-branches-and-merges-in-your-repository/
+managing-protected-branches/about-protected-branches, "Require status checks before merging",
+checked 2026-10-01) — so a PR with no markdown changes is not blocked waiting on `ci/docs-lint`.
 
 ### Limits (proposed)
 
@@ -359,7 +495,27 @@ protection does the enforcing.
 | Nodes per run | 2,000 | Coordinator state and UI |
 | Workflow steps per run | Under the Workflows default of 10,000, configurable to 25,000 (developers.cloudflare.com/workflows/build/workers-api, checked 2026-10-01) | Each node costs about 2 steps |
 | Script bundle | 1 MiB | Loaded on every replay |
-| Concurrent containers | Repo policy in [settings.yml](./settings.md), default 32; a script's own `ci.limit`/`concurrencyGroup` can only lower this per call, never raise it | Account-level container limits |
+| Concurrent containers | `concurrency.pipeline` in [settings.yml](./settings.md), default 32, caps containers for one pipeline run; `concurrency.pipelines` caps concurrent pipeline runs for the repo; `concurrency.repository` caps containers across all runs of the repo. A script's own `ci.limit` can only lower the per-run cap further, never raise it | Account-level container limits |
+
+## Concurrency
+
+A pipeline file can declare a concurrency group and whether a newer run in that group should
+cancel one already in flight:
+
+```ts
+export const concurrency = { group: "{{ ref }}", cancelSuperseded: true };
+```
+
+Discovery reads this export the same way it reads `on` — without calling `run` — so the
+coordinator knows the group and cancellation policy before starting the Workflow instance.
+`group` is a MiniJinja template rendered against the triggering event (`{{ ref }}`,
+`{{ pull_request.number }}`, ...); two runs of the same pipeline file with the same rendered group
+serialize, and if `cancelSuperseded` is true, a newer run cancels the older one in the group (same
+cancellation behavior as a manual [rerun](#reruns)). This is per-pipeline-file policy: it narrows
+execution within a run, never the repo-wide caps. Those caps —
+`concurrency.repository`/`concurrency.pipelines`/`concurrency.pipeline` — are enforced by the
+coordinator from [settings.yml](./settings.md) regardless of what a pipeline file declares (see
+[Limits](#limits-proposed) above).
 
 ## Data model
 
@@ -418,7 +574,7 @@ are not coordinated with each other beyond sharing the PR comment's run list
 2. Container-to-container networking for real sidecars.
 3. Cross-container snapshot restore and its speed compared with a cold install.
 4. npm imports in scripts: resolve from the repo lockfile at plan time, or keep v1 to
-   `@cloud-ci/pipeline` only?
+   `@cloud-ci/pipeline-sdk` only?
 5. Step pricing and latency of Workflows for runs with about 1,000 nodes.
 
 ## Alternatives considered

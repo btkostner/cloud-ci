@@ -66,9 +66,9 @@ None exist yet; [roadmap](./roadmap.md) says when each arrives.
 | `cloud-ci-proto` | protobuf | API contract source of truth: run/job/step/test/artifact model, ingest, query |
 | `cloud-ci-proto-rust` | Rust | Generated bindings, imported as `cloud_ci_proto` |
 | `cloud-ci-proto-typescript` | TypeScript | Generated bindings for the dashboard and pipeline SDK |
-| `cloud-ci-pipeline-sdk` | TypeScript | `@cloud-ci/pipeline`: typed `ci` API, `turbo`/`mise` helper modules for pipeline scripts |
+| `cloud-ci-pipeline-sdk` | TypeScript | `@cloud-ci/pipeline-sdk`: typed `ci` API, `@cloud-ci/pipeline-sdk/turbo` and `@cloud-ci/pipeline-sdk/mise` helper modules for pipeline scripts |
 | `cloud-ci-core` | Rust (no `worker` dep) | Splitter, rightsizer, shared domain logic — used by Worker and CLI, tested natively |
-| `cloud-ci-reports` | Rust (no `worker` dep) | Third-party report parsing + merging: JUnit, Vitest, Playwright, lcov, cobertura, bench, timing — split out from `cloud-ci-core` since this surface is expected to grow; used by Worker and CLI ([ADR 0010](./adr/0010-pluggable-executors.md) context: D5) |
+| `cloud-ci-reports` | Rust (no `worker` dep) | Third-party report parsing + merging: JUnit, Vitest, Playwright, lcov, cobertura, bench, timing, oxlint, oxfmt, vite build, deployment — split out from `cloud-ci-core` since this surface is expected to grow; used by Worker and CLI ([ADR 0010](./adr/0010-pluggable-executors.md) context: D5) |
 | `cloud-ci-worker` | Rust → wasm32 | HTTP front door, webhooks, ingest, asset serving, queue consumers, Durable Objects, cron |
 | `cloud-ci-cli` | Rust (native) | `cloud-ci` binary: `upload`, `split`, `merge`, `login`, `agent` |
 | `cloud-ci-runner-image` | Dockerfile | Base container image that runs `cloud-ci agent` |
@@ -93,7 +93,7 @@ AI narrowing, secret requests, slash-command roles — see [settings](./design/s
 | Job | (run, job name) | D1 + DO |
 | Shard | (job, index, total) | D1 + DO |
 | Step | (job/shard, ordinal) | D1 |
-| Report | (job/shard, kind) — junit, vitest, playwright, lcov, cobertura, timing, bench | parsed by `cloud-ci-reports`; D1 keeps per-report summaries, failed/flaky test rows, and rolling per-test aggregates (one row per (repo, test_id), updated in place) — never one row per test case per run; full per-run parsed results live in R2, compressed, keyed by run/report (see [analytics](./design/analytics.md)) |
+| Report | (job/shard, kind) — junit, vitest, playwright, lcov, cobertura, timing, bench, oxlint, oxfmt, vite build, deployment | parsed by `cloud-ci-reports`; D1 keeps per-report summaries, failed/flaky test rows, and rolling per-test aggregates (one row per (repo, test_id), updated in place) — never one row per test case per run; full per-run parsed results live in R2, compressed, keyed by run/report (see [analytics](./design/analytics.md)) |
 | Artifact / site | (run, name) | R2 under `runs/{run}/artifacts/{name}/…` |
 | Log | (job/shard, step) | R2, chunked |
 | Metric sample | (job/shard, timestamp) | Analytics Engine; rolled up into D1 by cron |
@@ -108,7 +108,7 @@ AI narrowing, secret requests, slash-command roles — see [settings](./design/s
 | `succeeded` | Every required job succeeded | yes |
 | `failed` | A required job failed | yes |
 | `cancelled` | Superseded by a newer push or cancelled by a user | yes |
-| `abandoned` | External run never finalized before its deadline | yes |
+| `abandoned` | External run's shards never all uploaded before its timeout | yes |
 
 External runs skip `queued`; they go straight to `running` on first upload.
 
@@ -137,7 +137,9 @@ External runs skip `queued`; they go straight to `running` on first upload.
 ### External run
 
 `cloud-ci upload` authenticates (GitHub Actions OIDC or API token), opens or joins a run keyed by
-(repo, sha, run key, attempt), uploads reports/artifacts, and finalizes. From step 5 onward it is
+(repo, sha, run key, attempt), and uploads reports/artifacts, each declaring a shard index and
+total. A job completes when all its shards have uploaded; a run closes on the external CI's
+completion webhook, an explicit `--expect-jobs` count, or a timeout. From step 5 onward it is
 the same path as a managed run. See [byo-ci](./design/byo-ci.md).
 
 ## Coordination invariants
@@ -151,7 +153,10 @@ the same path as a managed run. See [byo-ci](./design/byo-ci.md).
 - **Every upload is idempotent** on (run, job/shard, report kind | artifact path, content hash).
 - **Report HTML never shares an origin with the dashboard.** Hosted sites run arbitrary JS from
   the repo under test; serving them from the dashboard origin would hand that JS the user's
-  session. See [assets](./design/assets.md).
+  session. A completed run's own detail page is generated once as a static snapshot and served
+  from the same asset origin, for the same reason; the dashboard keeps only what needs live
+  data — in-progress runs, run lists, cross-run analytics, auth, actions. See
+  [assets](./design/assets.md).
 - **GitHub is told, not asked.** We never block a run on a GitHub API call succeeding; Check Run
   and comment updates are retried from the coordinator's state, not from the event that caused
   them.

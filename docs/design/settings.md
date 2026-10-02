@@ -19,26 +19,32 @@ covers the two things that are not pipeline code:
 1. **Discovery**: how `cloud-ci-worker` finds which `.ts` files exist and which events each one
    cares about, without running any of them.
 2. **`.cloud-ci/settings.yml`**: a single static YAML file holding repo config that must be
-   readable without evaluating code — check naming, PR comment behavior, AI narrowing,
-   concurrency and runner bound defaults, cache/retention preferences, which secrets each
-   pipeline may request, and slash-command role minimums.
+   readable without evaluating code — PR comment behavior, AI settings, concurrency and runner
+   bound defaults, cache/retention preferences, which secrets each pipeline may request, and
+   slash-command role minimums.
 
-Dashboard (admin) settings remain the authority for anything that spends money or grants
-secrets — runner size ceilings, concurrency ceilings, retention/cache maximums, AI autofix
-enablement, and secret grants. `settings.yml` can only narrow inside those ceilings; it is
-repo-owned, versioned with the code, and reviewable in PRs, so it must never be able to widen
-what an admin has not already allowed.
+`settings.yml` is the only place these repo settings live — there is no dashboard or admin layer
+underneath it that stores a separate copy or a ceiling for any of these values. The file is read
+only from the repo's default branch (the HEAD of the default branch at event time), never from a
+PR's head or base ref, regardless of whether the PR is same-repo or a fork. This is also the
+security property: a PR cannot widen its own autofix mode, concurrency bound, or secret access by
+editing `settings.yml` in that same PR, because the edit only takes effect once it lands on the
+default branch. Deployment-wide config (wrangler `vars` at deploy time) still sets hard platform
+limits that `settings.yml` cannot exceed — for example, the largest runner instance size a
+deployment offers — but there is no per-repo admin settings layer between those platform limits
+and `settings.yml`.
 
 ## Goals
 
 - A documented, cacheable way to discover pipeline files and their triggers from a commit sha,
   with no execution of job code.
-- One static file for repo-wide knobs that apply across all pipelines: check naming, PR comment
-  behavior, AI narrowing, concurrency/runner defaults, cache/retention preferences, secret-request
-  allow-lists, slash-command roles.
+- One static file for repo-wide knobs that apply across all pipelines: PR comment behavior, AI
+  settings, concurrency/runner defaults, cache/retention preferences, secret-request allow-lists,
+  slash-command roles.
 - Errors are collected, carry a location, and are visible on the commit — never a silent skip.
-- Secure defaults: a PR cannot widen its own fork-PR exposure, autofix mode, concurrency ceiling,
-  or secret access by editing `settings.yml` in that same PR.
+- Secure defaults: a PR cannot widen its own autofix mode, concurrency bound, or secret access by
+  editing `settings.yml` in that same PR, because the file is always read from the default
+  branch, regardless of which ref or PR triggered the run.
 
 ## Non-goals
 
@@ -57,23 +63,21 @@ what an admin has not already allowed.
 ```yaml
 version: 1                         # required; only 1 is accepted
 
-checks:
-  aggregate:
-    enabled: true                  # the recommended branch-protection target
-    name: cloud-ci                 # check-run name for the aggregate check
-  name_template: "{pipeline} / {check}"   # applied to every ci.check(name, ...) call whose name isn't already slash-qualified
-
 pr_comment:
-  enabled: true                    # narrows the dashboard master switch; cannot turn it on if the dashboard has it off
+  enabled: true                    # master on/off for the sticky comment
   template: .cloud-ci/templates/pr-comment.md   # falls back to the built-in template if the file is missing
-  actions: [rerun_failed, autofix]              # checkbox actions offered in the comment
-  coverage_report: coverage                     # report name diffed against the PR base in the comment
 
 ai:
-  summaries: true                  # Workers AI failure summaries in the PR comment
-  autofix: suggest                 # off | suggest | pull_request ; capped by the dashboard's autofix ceiling
+  enabled: true                    # master switch for this repo; off by default
+  summaries: true                  # Workers AI failure summaries in the PR comment (off | pr | all)
+  flaky_hints: true                # heuristic hints for known-flaky failures
+  perf_suggestions: weekly         # off | weekly
+  autofix: suggest                 # off | suggest | pull_request
+  autofix_allow_push_to_pr_branch: false   # requires autofix != off
+  autofix_on_forks: off            # off | suggest
   exclude_paths: ["vendor/**", "**/*.lock"]      # never summarized or autofixed
   max_failures_summarized: 20
+  daily_neuron_cap: 20000
 
 commands:
   roles:
@@ -83,23 +87,14 @@ commands:
 
 runners:
   default: auto                    # fallback when a ci.container() call omits runner
-  auto: { min: basic, max: standard-3, initial: basic }   # must fit inside the admin ceiling
-  pools:
-    gpu-ci:                        # named pool a script selects with runner: { pool: "gpu-ci" }
-      executor: aws-ec2
-      type: g5.xlarge
+  auto: { min: basic, max: standard-3, initial: basic }
 
 concurrency:
-  repo: 40                         # max containers across all runs of this repo, at once
-  run: 12                          # max containers for a single run
-  runs: 4                          # max concurrent runs for this repo
-  cancel_superseded: { pull_request: true, push: false }
-
-shard:
-  split: timing                    # timing | file | count ; default strategy for ci.shard(...)
-  min: 2
-  max: 16
-  target: 10m                      # auto shard count aims for ~10m per shard, by history
+  repository: 40                   # max containers across all runs of this repo, at once
+  pipelines: 4                     # max concurrent pipeline runs for this repo
+  pipeline: 12                     # max containers for a single pipeline run
+  # cancel-superseded policy is pipeline code, not settings.yml — see
+  # dynamic-pipelines.md#concurrency's `export const concurrency`
 
 retention:
   artifacts_days: 14
@@ -109,7 +104,7 @@ retention:
   snapshots_days: 7
 
 cache:
-  max_size_per_repo: 10GiB         # must fit inside the admin ceiling
+  max_size_per_repo: 10GiB
 
 secrets:
   ci: [E2E_LOGIN_PASSWORD]         # pipeline file name (no .ts) -> secret names it may request
@@ -122,11 +117,11 @@ secrets:
 version: 1
 ```
 
-Every section is optional. Omitted sections use deployment defaults: aggregate check named
-`cloud-ci`, PR comments on with the built-in template, AI off, `operator` for every command,
-`runners.default: auto` at the deployment-wide ladder, deployment concurrency/retention/cache
-defaults, and no pipeline allowed to request any secret (secure default — an empty `secrets` map
-denies every request, it does not grant every secret).
+Every section is optional. Omitted sections use deployment defaults: PR comments on with the
+built-in template, AI off, `operator` for every command, `runners.default: auto` at the
+deployment-wide ladder, deployment concurrency/retention/cache defaults, and no pipeline allowed
+to request any secret (secure default — an empty `secrets` map denies every request, it does not
+grant every secret).
 
 ## Design
 
@@ -219,68 +214,65 @@ no longer exists, the occurrence is skipped and logged.
   endpoint; we cap the file at 64 KiB, so the JSON form always works (verified 2026-09-30,
   https://docs.github.com/en/rest/repos/contents).
 - `ref` is always a commit sha, never a branch name, so a push landing between webhook and fetch
-  cannot swap settings mid-run. For `pull_request`, the sha is `pull_request.head.sha` — **except
-  for fork PRs**, where the entire file is instead read from the base repo's default branch head.
-  A fork PR cannot change its own check names, comment template, AI mode, concurrency, runner
-  bounds, retention, cache limit, command roles, or secret allow-list by editing `settings.yml` in
-  the PR; it always runs under the base branch's settings. Fetching a fork head sha through the
-  base repo's contents API would not be needed for this reason, but is also `[unverified]` for
-  the same-repo pipeline-discovery fetches above.
+  cannot swap settings mid-run. Regardless of the triggering event — `push` to any branch,
+  `pull_request` (same-repo or fork), `schedule`, or a manual run — `ref` is the default branch's
+  HEAD sha at the time the event was received, never the PR's own head or base sha, and never the
+  sha of a non-default branch a `push` landed on. For a `push` to the default branch itself, that
+  sha is already in the webhook payload; for every other event, the consumer resolves the default
+  branch's current head sha with one extra API call before fetching `settings.yml`
+  `[unverified: exact endpoint, likely GET /repos/{owner}/{repo}/git/refs/heads/{default_branch}]`.
+  This is also why `settings.yml` can never be widened by a PR: the PR's own ref is never read,
+  for forks or same-repo PRs alike.
 - Parse cache: D1 `repo_settings` keyed by `(repo_id, blob_sha)` stores the normalized JSON or the
   error list. Identical files across commits parse once.
 - `404`: deployment defaults apply, as in the minimal example above. No config-validation failure.
 - Every run stores the resolved settings it used at `runs/{run_id}/settings.json` in R2. Reruns
   reuse it and never refetch.
 
-### Precedence against admin (dashboard) settings
+### Deployment-wide limits
 
-Admin settings live in D1, are set by repo/deployment admins in the dashboard (not in git), and
-are the ceiling for anything that spends money or grants secrets. `settings.yml` values are
-clamped to the admin ceiling, with a warning annotation on the config-validation check, not a hard
-failure — a wider value never takes effect, but it also never blocks an otherwise-valid run.
+There is no admin dashboard layer between `settings.yml` and the platform. The only upstream
+bound is deployment-wide config — wrangler `vars` set at deploy time — which caps a handful of
+values that would otherwise let a single repo exhaust shared account resources:
 
-| `settings.yml` key | Admin ceiling | Rule |
+| `settings.yml` key | Deployment-wide bound | Rule |
 | --- | --- | --- |
-| `checks.*` | none | Free — check naming has no spend or secret implication |
-| `pr_comment.enabled` | dashboard PR-comment switch | Can only turn further off; cannot enable if the dashboard has it off |
-| `ai.summaries`, `.exclude_paths`, `.max_failures_summarized` | dashboard AI opt-in | Only take effect if AI is enabled for the repo |
-| `ai.autofix` | per-repo admin autofix ceiling (`off` \| `suggest` \| `pull_request`) | Clamped down to the ceiling; `push`-to-branch autofix is never settable from `settings.yml` at all — admin-only, see [ai.md](./ai.md) |
-| `commands.roles.*` | `operator` floor | Can only raise toward `admin`, never lower below `operator` |
-| `runners.auto.{min,max}`, `runners.pools.*.type` | deployment instance-size ladder / plan limits | Out-of-bound values clamped to the nearest in-bound size |
-| `concurrency.repo`, `.run`, `.runs` | deployment container cap | Clamped to the admin max |
-| `retention.*_days` | deployment max retention | Clamped |
-| `cache.max_size_per_repo` | deployment max | Clamped |
-| `secrets.<pipeline>` | admin secret grants (`repo_secrets`, `secret_grants`, see [auth.md](./auth.md)) | A listed name is still denied at job start if the admin has not granted it; `settings.yml` can only narrow which granted names a given pipeline file may request |
+| `runners.auto.{min,max}` | instance-size ladder the deployment makes available | out-of-bound values clamp to the nearest in-bound size |
+| `concurrency.repository` / `.pipelines` / `.pipeline` | deployment container cap | clamped to the deployment max |
+| `retention.*_days` | deployment max retention | clamped |
+| `cache.max_size_per_repo` | deployment max | clamped |
+| `ai.autofix_allow_push_to_pr_branch` | whether this installation's GitHub App has `contents: write` | if the installation lacks the permission, autofix stays capped at `suggest` regardless of this key, see [ai.md](./ai.md) |
+
+A value outside its deployment-wide bound is clamped, with a warning annotation on the
+`cloud-ci / config` check — never a hard failure, so an out-of-range value never blocks an
+otherwise-valid run. `secrets.<pipeline>` has no deployment-wide bound beyond the 50-name limit
+in Validation below: the name itself is only useful if a secret of that name exists in the
+deployment's Secrets Store, which is checked at job start, not at config-validation time.
 
 ### Field reference
 
 | Path | Type | Default | Constraint |
 | --- | --- | --- | --- |
 | `version` | int | required | `1` |
-| `checks.aggregate.enabled` | bool | `true` | |
-| `checks.aggregate.name` | string | `cloud-ci` | `^[a-z0-9][a-z0-9 ./_-]{0,63}$` |
-| `checks.name_template` | string | `"{pipeline} / {check}"` | vars: `{pipeline}`, `{check}` |
-| `pr_comment.enabled` | bool | `true` | narrow-only, see Precedence |
+| `pr_comment.enabled` | bool | `true` | |
 | `pr_comment.template` | string | `.cloud-ci/templates/pr-comment.md` | path in-repo; missing file falls back to the built-in template |
-| `pr_comment.actions` | string[] | `[rerun_failed]` | subset of `rerun_failed, rerun_all, autofix, explain` |
-| `pr_comment.coverage_report` | string | none | a report name produced by a pipeline |
-| `ai.summaries` | bool | `true` | |
-| `ai.autofix` | enum | `off` | `off, suggest, pull_request`; narrow-only, see [ai.md](./ai.md) |
+| `ai.enabled` | bool | `false` | master switch for this repo |
+| `ai.summaries` | enum | `pr` | `off, pr, all` |
+| `ai.flaky_hints` | bool | `true` | |
+| `ai.perf_suggestions` | enum | `weekly` | `off, weekly` |
+| `ai.autofix` | enum | `off` | `off, suggest, pull_request`; see [ai.md](./ai.md) |
+| `ai.autofix_allow_push_to_pr_branch` | bool | `false` | requires `ai.autofix != off`; also requires the installation's GitHub App to have `contents: write`, see [Deployment-wide limits](#deployment-wide-limits) |
+| `ai.autofix_on_forks` | enum | `off` | `off, suggest` |
 | `ai.exclude_paths` | string[] | `[]` | glob |
 | `ai.max_failures_summarized` | int | `20` | 1..100 |
+| `ai.daily_neuron_cap` | int | `20000` | |
+| `ai.model_summary` / `.model_flaky` / `.model_perf` / `.model_autofix` | string | deploy-time default | Workers AI model id starting with `@cf/`; see [ai.md](./ai.md#model-selection) |
 | `commands.roles.<rerun\|cancel\|autofix>` | enum | `operator` | `operator, admin`; raise-only |
-| `runners.default` | string | `auto` | fixed type, `auto`, or a `runners.pools` name |
+| `runners.default` | string | `auto` | fixed instance-type name, or `auto` |
 | `runners.auto.{min,max,initial}` | string | deployment default | instance-type ladder, see [parallelization.md](./parallelization.md) |
-| `runners.pools.<name>.executor` | string | | `cloudflare-containers, aws-ec2, aws-lambda, kubernetes, self-hosted` (see [ADR 0010](../adr/0010-pluggable-executors.md)) |
-| `runners.pools.<name>.type` | string | | executor-specific instance/shape identifier |
-| `concurrency.repo` | int | deployment default | 1..200 |
-| `concurrency.run` | int | deployment default | 1..100 |
-| `concurrency.runs` | int | deployment default | 1..50 |
-| `concurrency.cancel_superseded.pull_request` | bool | `true` | |
-| `concurrency.cancel_superseded.push` | bool | `false` | |
-| `shard.split` | enum | `timing` | `timing, file, count` |
-| `shard.min` / `.max` | int | `2` / `16` | lower/upper bound for `auto` shard counts |
-| `shard.target` | duration | `10m` | `ci.shard(...)` aims for this long per shard, by history |
+| `concurrency.repository` | int | deployment default | 1..200; max containers across all runs of this repo at once |
+| `concurrency.pipelines` | int | deployment default | 1..50; max concurrent pipeline runs for this repo |
+| `concurrency.pipeline` | int | deployment default | 1..100; max containers for a single pipeline run |
 | `retention.artifacts_days` | int | `30` | 1..deployment max |
 | `retention.reports_days` | int | `30` | 1..deployment max |
 | `retention.sites_days` | int | `14` | 1..deployment max |
@@ -299,8 +291,9 @@ Each error carries `line:col` and is posted as an annotation on the `cloud-ci / 
    key cannot silently pass.
 2. Semantic: enum values, name patterns, numeric bounds, and the `secrets.<pipeline>` key must
    name a file that exists in `.cloud-ci/pipelines/` at the same sha (an allow-list for a pipeline
-   that does not exist is a typo, not a no-op). Admin-ceiling clamping (see Precedence) runs after
-   this pass and only ever produces warnings, never errors.
+   that does not exist is a typo, not a no-op). Deployment-wide-bound clamping (see
+   [Deployment-wide limits](#deployment-wide-limits)) runs after this pass and only ever produces
+   warnings, never errors.
 
 Limits: 64 KiB file, 100 pipeline files per repo, 50 secret names per pipeline entry. The parser
 is a pure module with no I/O, shared by the Worker and the CLI (`cloud-ci lint`).
@@ -319,22 +312,23 @@ CREATE TABLE repo_schedules (repo_id INTEGER, file_name TEXT, idx INTEGER, cron 
 R2 keys: `runs/{run_id}/pipeline.js` (bundled pipeline source, immutable per run) and
 `runs/{run_id}/settings.json` (resolved settings, immutable per run). `RepoState` holds the
 authoritative schedule and concurrency state; D1 `repo_schedules` is a mirror for the dashboard.
-`repo_secrets`, `secret_grants`, and `cache_entries` are defined in [auth.md](./auth.md) and
-[assets.md](./assets.md) respectively — `secrets.<pipeline>` in `settings.yml` narrows which
-granted names a pipeline file may request, it does not store values.
+`cache_entries` is defined in [assets.md](./assets.md). `secrets.<pipeline>` in `settings.yml` is
+the grant list controlling which secret names a pipeline file may request; secret values
+themselves stay in Cloudflare Secrets Store and are never read into D1.
 
 ## Security considerations
 
 - Both `.ts` pipeline sources and `settings.yml` are untrusted input from anyone who can open a
   PR. Discovery evaluates only a static `on` literal, in a network-isolated sandbox, never the
   `run` function, so reading triggers cannot itself start a container or call out.
-- `ai.autofix`, `concurrency.*`, `runners.*`, `retention.*`, `cache.*`, and `commands.roles.*` are
-  all clamped to an admin ceiling that only the dashboard can raise, so a PR cannot widen its own
-  spend or secret exposure by editing `settings.yml`.
-- For fork PRs, the entire `settings.yml` is read from the base branch, so a fork PR cannot change
-  check names, comment templates, command roles, or its own secret allow-list.
-- `secrets.<pipeline>` only narrows which already-granted names a pipeline may request; it can
-  never grant a name the admin has not already placed in `repo_secrets` or `secret_grants`.
+- `settings.yml` is read only from the repo's default branch, for every event type (push, pull
+  request, schedule, manual), never from a PR's own head or base ref. A PR — same-repo or fork —
+  cannot widen `ai.autofix`, `concurrency.*`, `runners.*`, `retention.*`, `cache.*`,
+  `commands.roles.*`, or its own secret allow-list by editing `settings.yml` in that same PR; the
+  edit only takes effect once it is merged to the default branch.
+- `secrets.<pipeline>` is the complete grant list for which secret names a pipeline file may
+  request; it does not store secret values, which stay in Cloudflare Secrets Store and are only
+  resolved at job start.
 
 ## Failure modes
 
@@ -350,13 +344,7 @@ granted names a pipeline file may request, it does not store values.
 
 ## Open questions
 
-1. Shared parser/sandbox location: a module inside `cloud-ci-worker`, or a new crate shared with
-   the CLI for `cloud-ci lint`? Same open question as the execution-side bundler in
-   [dynamic-pipelines](./dynamic-pipelines.md) — likely one answer for both.
-2. Should the config-validation check (`cloud-ci / config`) be omittable from the aggregate check
-   so an admin-caused clamp warning cannot block branch protection, or should clamp warnings never
-   appear there at all (dashboard-only)?
-3. `secrets.<pipeline>` currently requires the pipeline file to exist at validation time. Does a
+1. `secrets.<pipeline>` currently requires the pipeline file to exist at validation time. Does a
    rename (`ci.ts` -> `verify.ts`) in the same PR as a `settings.yml` update race against which
    sha each is read at? Both are read at the same commit sha today, which should make this moot,
    but it is worth a Phase 0 check.
@@ -368,5 +356,5 @@ granted names a pipeline file may request, it does not store values.
 | Keep per-pipeline settings (triggers, concurrency, retention) inline in each `.ts` file | Rejected | Repo-wide policy that a PR must not be able to widen (concurrency ceilings, retention, secret allow-lists) cannot live in code a PR controls; it needs a file read the same way regardless of which pipeline is running, and in the fork-PR case, read from a different ref than the code being tested |
 | Discover pipelines by convention (any `.ts` file under `.cloud-ci/`) without an explicit directory listing call | Rejected | Would require fetching the whole tree recursively even when only one file changed; a flat `pipelines/` directory keeps discovery to one listing call plus one blob fetch per file |
 | Run each pipeline's full `run` function during discovery and discard side effects to learn `on` | Rejected | Side effects (`ci.container`, `ci.check`) are durable steps against `RunCoordinator`; there is no safe way to "discard" them, and it would mean starting containers just to decide whether to start containers |
-| Config stored in the dashboard (D1) instead of the repo | Rejected | `settings.yml` must be versioned with the code and reviewable in PRs, same reasoning as pipeline code; policy that must not be PR-editable lives in admin settings instead, as the ceiling, not by moving the whole file out of git |
+| Config stored in the dashboard (D1) instead of the repo | Rejected | `settings.yml` must be versioned with the code and reviewable in PRs, same reasoning as pipeline code; policy that must not be PR-editable is enforced by reading the file only from the default branch, not by moving it out of git or adding a separate admin-settings layer |
 | Map each schedule to a Worker Cron Trigger | Rejected | The 250-per-account cap and redeploy-to-change; `RepoState` alarms scale per repo |
