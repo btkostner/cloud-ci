@@ -1001,7 +1001,7 @@ dependencies = [
 [[package]]
 name = "worker"
 version = "0.8.7"
-source = "git+https://github.com/btkostner/workers-rs?rev=0a6f661a61f420bcce1530cec471a207367b5e8f#0a6f661a61f420bcce1530cec471a207367b5e8f"
+source = "git+https://github.com/btkostner/workers-rs?rev=df96700ab45b9e5dc400c48946f5c57951dcfd11#df96700ab45b9e5dc400c48946f5c57951dcfd11"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1031,7 +1031,7 @@ dependencies = [
 [[package]]
 name = "worker-macros"
 version = "0.8.7"
-source = "git+https://github.com/btkostner/workers-rs?rev=0a6f661a61f420bcce1530cec471a207367b5e8f#0a6f661a61f420bcce1530cec471a207367b5e8f"
+source = "git+https://github.com/btkostner/workers-rs?rev=df96700ab45b9e5dc400c48946f5c57951dcfd11#df96700ab45b9e5dc400c48946f5c57951dcfd11"
 dependencies = [
  "async-trait",
  "proc-macro2",
@@ -1046,7 +1046,7 @@ dependencies = [
 [[package]]
 name = "worker-sys"
 version = "0.8.7"
-source = "git+https://github.com/btkostner/workers-rs?rev=0a6f661a61f420bcce1530cec471a207367b5e8f#0a6f661a61f420bcce1530cec471a207367b5e8f"
+source = "git+https://github.com/btkostner/workers-rs?rev=df96700ab45b9e5dc400c48946f5c57951dcfd11#df96700ab45b9e5dc400c48946f5c57951dcfd11"
 dependencies = [
  "cfg-if",
  "js-sys",

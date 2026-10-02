@@ -30,7 +30,7 @@ worker = { version = "0.8.7", features = ["http", "d1"] }
 # git-pinned fork branch rather than a vendored copy, and what the diff
 # against the published v0.8.7 tag is.
 [patch.crates-io]
-worker = { git = "https://github.com/btkostner/workers-rs", rev = "0a6f661a61f420bcce1530cec471a207367b5e8f" }
+worker = { git = "https://github.com/btkostner/workers-rs", rev = "df96700ab45b9e5dc400c48946f5c57951dcfd11" }
 
 [lints.rust]
 unsafe_code = "forbid"
