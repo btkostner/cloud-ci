@@ -30,8 +30,18 @@
 //! ```text
 //! cloud-ci lint --file .cloud-ci/settings.yml
 //! ```
+//!
+//! and `agent`, per `docs/design/analytics.md`'s CLI section — **this
+//! round's `agent` is a scope-limited placeholder**, see `AgentArgs`' doc
+//! comment (its own `--help` text) and `crate::agent`'s module doc for the
+//! full boundary:
+//!
+//! ```text
+//! cloud-ci agent --cgroup-path /sys/fs/cgroup --duration-secs 60
+//! ```
 
 use std::fmt;
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -56,6 +66,10 @@ pub enum Command {
     Split(SplitArgs),
     /// Validate `.cloud-ci/settings.yml` (YAML + semantic checks only).
     Lint(LintArgs),
+    /// Sample cgroup v2 resource usage for a bounded duration and print the
+    /// collected samples as JSON. See `AgentArgs`' own `--help` text for
+    /// this round's scope limitation.
+    Agent(AgentArgs),
 }
 
 /// `cloud-ci lint [--file <path>]`: validates `settings.yml` against
@@ -81,6 +95,54 @@ pub struct LintArgs {
     /// Path to the settings file to validate.
     #[arg(long, default_value = ".cloud-ci/settings.yml")]
     pub file: std::path::PathBuf,
+}
+
+/// `cloud-ci agent --cgroup-path <path> --duration-secs <n>`.
+///
+/// # This round is a scope-limited placeholder, not a real job runner
+///
+/// `cloud-ci agent`'s full job per `docs/architecture.md` is "pulls its
+/// job spec, runs steps, streams logs, samples resource usage where
+/// available, and uploads reports/artifacts through the public ingest
+/// API." Only the **resource-sampling** piece exists this round:
+///
+/// - **"pulls its job spec"**: NOT implemented. `RunCoordinator` has no
+///   job-spec-serving API yet — Dynamic Pipelines, the thing that would
+///   define what steps to run, is explicitly Phase 2 and not built.
+/// - **"runs steps"**: NOT implemented, for the same reason (no
+///   `Executor`/container dispatch mechanism exists to run steps against).
+/// - **"samples resource usage"**: implemented — this command reads the
+///   cgroup v2 pseudofiles under `--cgroup-path` every 2s for
+///   `--duration-secs`, via `cloud_ci_core::cgroup`/`cloud_ci_core::sampler`
+///   (`docs/design/analytics.md`'s "What is collected" table).
+/// - **"uploads reports/artifacts"**: deferred. Uploading needs a real
+///   `Report` to attach the collected samples to (`docs/design/analytics.md`:
+///   samples are emitted "as part of the job's end-of-run Report"), which
+///   needs real step execution to produce. This command instead prints the
+///   collected samples as JSON to stdout on exit, so the sampling +
+///   credential-reading mechanism is provably exercised without inventing
+///   fake job execution.
+///
+/// The per-job token `RunCoordinator` mints and injects as `CLOUD_CI_JOB_TOKEN`
+/// (`docs/design/auth.md`'s "Per-job tokens") is read and resolved through
+/// the same `resolve_credential` path `cloud-ci upload` uses, proving the
+/// credential-reading mechanism works — but, per the deferred-upload note
+/// above, nothing is sent over the wire with it yet.
+#[derive(Debug, Parser)]
+pub struct AgentArgs {
+    /// Root of the cgroup v2 hierarchy to sample from. Defaults to the
+    /// real cgroupfs mount; override for testing against a directory of
+    /// synthetic fixture files in the same `cpu.stat`/`memory.current`/
+    /// `memory.peak`/`memory.events` format.
+    #[arg(long, default_value = "/sys/fs/cgroup")]
+    pub cgroup_path: PathBuf,
+
+    /// How long to run the 2s sampling loop before printing results and
+    /// exiting. Stands in for the real job's lifetime, since there is no
+    /// real step execution to bound this on yet — see this struct's own
+    /// doc comment.
+    #[arg(long, default_value_t = 60)]
+    pub duration_secs: u64,
 }
 
 #[derive(Debug, Parser)]

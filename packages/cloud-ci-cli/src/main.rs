@@ -1,3 +1,4 @@
+mod agent;
 mod cli;
 mod connect_client;
 mod identity;
@@ -35,6 +36,13 @@ fn main() -> ExitCode {
             Ok(false) => ExitCode::FAILURE,
             Err(err) => {
                 eprintln!("cloud-ci lint: {err}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::Agent(args) => match agent::run(&args, &RealEnv) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("cloud-ci agent: {err}");
                 ExitCode::FAILURE
             }
         },
