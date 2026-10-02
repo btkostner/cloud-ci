@@ -23,7 +23,19 @@ the full Dynamic Pipelines feature (`docs/design/dynamic-pipelines.md`).
    Object (`packages/cloud-ci-worker/src/container_probe.rs`) over the
    `CONTAINER_WORKER` service binding, which calls the patched `worker`
    crate's `Container::start()`/`exec()` (`docs/adr/0011-patching-third-party-crates.md`).
-4. Investigates forced isolate-recycle survival for a multi-step Workflow
+4. Proves a genuine DAG — fan-out/fan-in, not a sequential chain — of 3
+   dependent containers (`test/fixtures/pipeline-script-dag.js`): node A
+   runs first, B and C both depend on A and are issued as concurrent
+   `step.do` calls (joined via `Promise.all`, not individually `await`ed)
+   once A resolves, and a 4th "join" step folds both results together.
+   Each node addresses a distinct `ContainerProbe` DO instance via the
+   `?probe_id=` query parameter `cloud-ci-worker/src/lib.rs`'s
+   `handle_container_probe_exec` now reads (defaulting to the original
+   singleton `"probe"` address when absent, so the sequential fixture
+   above needs no change) — see "DAG verification" below for the real
+   result, including whether B and C actually overlapped in wall-clock
+   time.
+5. Investigates forced isolate-recycle survival for a multi-step Workflow
    instance — see "Isolate-recycle verification" below for the exact
    method and the real, partial result (completed-step persistence is
    proven; full run-to-completion survival is not, due to a local-dev
@@ -67,10 +79,6 @@ real Docker-backed container (local wrangler dev)
 - `RunCoordinator` integration for real job/shard/report state. The
   container call this round makes is a minimal proof of the access
   pattern, not real job tracking — nothing here calls `RunCoordinator`.
-- The "3 dependent containers" fan-out/DAG pattern. This round proves 2–3
-  **sequential** steps surviving a forced isolate recycle — the actual
-  content of the roadmap's recycle exit criterion clause. Fan-out is a
-  separate, later round.
 - Wiring this host Worker into `cloud-ci-worker`'s production request
   handling. There is no `/webhooks/github` → this host Worker call path —
   this stays a directly-testable, standalone service, same posture as
@@ -113,6 +121,38 @@ Returns `{"instanceId": "...", "scriptId": "..."}`. Poll status:
 ```sh
 curl -s http://127.0.0.1:8787/instances/<instanceId>
 ```
+
+### Trigger the DAG fixture
+
+```sh
+curl -s -X POST http://127.0.0.1:8787/scripts \
+  -H "content-type: application/json" \
+  -d "{\"script\": $(node -e 'console.log(JSON.stringify(require("fs").readFileSync("test/fixtures/pipeline-script-dag.js", "utf8")))')}"
+```
+
+Same polling as above. See "DAG verification" below for a real trace.
+
+## DAG verification
+
+See `/tmp/dynamic-workflows-dag-findings.txt` for the full transcript.
+Real result against a `wrangler dev` session with Docker running: both
+runs completed with distinguishable per-node output
+(`"node-a\n"`/`"node-b\n"`/`"node-c\n"`, `exitCode: 0` for all 3), and the
+fan-out gate held genuinely — node B's and node C's `startedAt` were both
+strictly after node A's `finishedAt` in every run, matching `step.do`'s
+sequential-await semantics (B/C's `step.do` calls are only issued after
+`await stepA` resolves in the script), not a fixed-duration sleep.
+
+**Concurrency finding (measured, not assumed):** node B and node C
+overlapped almost entirely in wall-clock time — run 1:
+B=[508547,509031] (484ms), C=[508549,509052] (503ms), 482ms overlap
+(~99.6%); run 2: B=[556386,556846] (460ms), C=[556387,556877] (490ms),
+459ms overlap (~99.8%). Both started within 1–3ms of each other both
+times. The local Workflows engine genuinely ran B and C concurrently once
+their `step.do` calls were issued together and joined via `Promise.all`
+(rather than individually `await`ed) — this was checked honestly via each
+node's own `Date.now()` timestamps recorded around its container `exec()`
+call, not inferred from the code shape alone.
 
 ## Isolate-recycle verification
 

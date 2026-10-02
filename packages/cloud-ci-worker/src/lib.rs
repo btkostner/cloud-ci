@@ -989,15 +989,30 @@ fn json_error(status: u16, message: &str) -> Result<Response> {
     Ok(Response::from_json(&serde_json::json!({ "error": message }))?.with_status(status))
 }
 
-/// Forwards `req`'s raw body to the singleton `ContainerProbe` Durable
-/// Object's `/exec` (src/container_probe.rs's own doc comment covers the
-/// DO itself). One DO instance total (`idFromName("probe")`) — this round
-/// proves one container round trip, not per-run/per-job addressing, so
-/// there is no identity to derive it from yet.
+/// Forwards `req`'s raw body to the `ContainerProbe` Durable Object
+/// (src/container_probe.rs's own doc comment covers the DO itself)
+/// addressed by the `probe_id` query parameter (`?probe_id=node-a`),
+/// defaulting to `"probe"` when absent — the original singleton address,
+/// kept so the existing sequential fixture (one container call) needs no
+/// change. A DAG fixture that wants 3 independently running containers
+/// passes 3 distinct `probe_id`s, landing on 3 separate DO instances (and
+/// therefore 3 separate `default`-policy containers, per
+/// `wrangler.toml`'s `[[containers]] max_instances`), each with its own
+/// container lifecycle — the smallest change that supports concurrent,
+/// independent container calls without teaching one DO instance to track
+/// multiple named containers itself.
 async fn handle_container_probe_exec(mut req: Request, env: &Env) -> Result<Response> {
+    let probe_id = match req.url() {
+        Ok(url) => url
+            .query_pairs()
+            .find(|(key, _)| key == "probe_id")
+            .map(|(_, value)| value.into_owned())
+            .unwrap_or_else(|| "probe".to_string()),
+        Err(_) => "probe".to_string(),
+    };
     let body = req.bytes().await?;
     let namespace = env.durable_object("CONTAINER_PROBE")?;
-    let id = namespace.id_from_name("probe")?;
+    let id = namespace.id_from_name(&probe_id)?;
     let stub = id.get_stub()?;
     let mut init = RequestInit::new();
     init.with_method(Method::Post).with_body(Some(body.into()));

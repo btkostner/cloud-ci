@@ -77,9 +77,15 @@ class_name = "RepoState"
 # `default`-scheduling-policy container backing `ContainerProbe`
 # (src/container_probe.rs): a Phase-0 proof fixture only, built from
 # container_probe/Dockerfile — a bare `sleep infinity` image, not this
-# repo's eventual real Containers execution image.
+# repo's eventual real Containers execution image. `max_instances = 3`:
+# the Dynamic Workflows DAG fixture
+# (cloud-ci-dynamic-workflows-host/test/fixtures/pipeline-script-dag.js)
+# addresses 3 distinct `ContainerProbe` DO instances (one per DAG node,
+# via `?probe_id=`) so its fan-out nodes can run real, independent
+# containers concurrently — 1 would serialize them at the container
+# level even if the Workflow steps themselves ran concurrently.
 [[containers]]
-max_instances = 1
+max_instances = 3
 class_name = "ContainerProbe"
 image = "./container_probe/Dockerfile"
 
