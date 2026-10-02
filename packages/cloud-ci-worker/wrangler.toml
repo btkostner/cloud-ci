@@ -13,6 +13,13 @@ database_name = "cloud-ci"
 database_id = "00000000-0000-0000-0000-000000000000"
 migrations_dir = "migrations"
 
+# Raw upload bytes (reports/artifacts/sites), per ADR 0004 and
+# docs/design/byo-ci.md's "Data model" § R2 keys. Binding name matches
+# `env.bucket("ASSETS")` in src/lib.rs.
+[[r2_buckets]]
+binding = "ASSETS"
+bucket_name = "cloud-ci-assets"
+
 # One SQLite-backed Durable Object per run (ADR 0004, docs/design/byo-ci.md).
 # Addressed by `(repo_id, sha, run_key, attempt)`, never by the run's own
 # ULID, so a redelivered or reordered BeginRun always lands on the same
