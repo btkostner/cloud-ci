@@ -425,6 +425,12 @@ struct SummaryRow {
     summary: Option<String>,
 }
 
+/// `refresh_flakiness_scores`' per-row D1 read shape.
+#[derive(Debug, Clone, Deserialize)]
+struct RecentOutcomesRow {
+    recent_outcomes: String,
+}
+
 fn trigger_db_name(trigger: Trigger) -> &'static str {
     trigger.proto_name()
 }
@@ -1226,12 +1232,242 @@ impl RunCoordinator {
         let run_row = require_run(sql)?;
         self.project_run_to_d1(&run_row).await?;
         self.finalize_check_runs(sql, &run_row).await?;
+        self.finalize_test_stats(sql, &run_row).await?;
 
         let status = run_status_of(&run_row)?;
         Response::from_json(&CloseRunOutcome {
             run_id: run_row.id,
             status,
         })
+    }
+
+    /// Applies every canonical, parsed report's test outcomes to
+    /// `test_stats`, exactly once per run (analytics.md's "D1 rollup
+    /// tables" § "Once per run" and "Idempotency"). `handle_close_run`'s
+    /// own terminal-state guard at its top is this call's only caller
+    /// path, and that guard already makes a redelivered/retried close
+    /// signal short-circuit before ever reaching this function again —
+    /// but the `test_stats_applications` D1 marker below is still the
+    /// authoritative gate, not that guard, per the doc's own framing
+    /// ("D1's own `test_stats_applications` table remains as a backstop
+    /// against ... replaying the same finalization `batch()`"): a future
+    /// Queue-based redelivery path (this round does not build a queue —
+    /// see module docs' scope boundary) would call this function directly
+    /// without going through `handle_close_run`'s guard at all, and this
+    /// function is safe under that case too.
+    ///
+    /// Default-branch scoping (parallelization.md: "`test_stats` ...
+    /// scoped to default-branch runs") is deliberately **not** enforced
+    /// here — see migration 0011's module comment for why (no branch
+    /// tracking exists on `run` yet; filtering which runs call this is
+    /// left to a future caller).
+    async fn finalize_test_stats(&self, sql: &SqlStorage, run_row: &RunRow) -> worker::Result<()> {
+        let reports = read_canonical_parsed_reports(sql)?;
+        if reports.is_empty() {
+            return Ok(());
+        }
+
+        let mut job_names: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        // (job_name, report_type, report_name, scope, r2_key) per
+        // canonical+parsed report — analytics.md's "frozen set": "for
+        // every (job_name, report_type, report_name, scope) group any job
+        // in the run produced, the current canonical content for that
+        // group". `is_canonical = 1` already guarantees at most one row
+        // per `(job_id, shard_index, kind, name)` slot; grouping by
+        // `job_name` (not `job_id`) here matches the doc's own group key,
+        // which does not include `shard_index`.
+        let mut groups = Vec::with_capacity(reports.len());
+        for report in &reports {
+            let job_name = match job_names.get(&report.job_id) {
+                Some(name) => name.clone(),
+                None => {
+                    let job = require_job_by_id(sql, &report.job_id)?;
+                    job_names.insert(report.job_id.clone(), job.job_name.clone());
+                    job.job_name
+                }
+            };
+            groups.push((
+                job_name,
+                report.kind.clone(),
+                report.name.clone(),
+                report.scope.clone(),
+                report.r2_key.clone(),
+            ));
+        }
+
+        let bucket = self.env.bucket("ASSETS")?;
+        let mut all_rows: Vec<logic::TestOutcomeRow> = Vec::new();
+        for (_, kind, _, _, r2_key) in &groups {
+            let Some(object) = bucket.get(r2_key).execute().await? else {
+                return Err(worker::Error::RustError(format!(
+                    "finalize_test_stats: report has no R2 object at its own r2_key {r2_key}"
+                )));
+            };
+            let Some(body) = object.body() else {
+                return Err(worker::Error::RustError(format!(
+                    "finalize_test_stats: report R2 object {r2_key} has no body"
+                )));
+            };
+            let bytes = body.bytes().await?;
+            if let Some(rows) = parse_test_outcomes(kind, &bytes) {
+                all_rows.extend(rows);
+            }
+        }
+        let deduped = logic::dedupe_test_outcomes(all_rows);
+
+        let now_ms = worker::Date::now().as_millis() as i64;
+        let db = self.env.d1("DB")?;
+        let mut statements = Vec::with_capacity(groups.len() + 1);
+        for (job_name, kind, name, scope, _) in &groups {
+            statements.push(
+                db.prepare(
+                    "INSERT INTO test_stats_applications \
+                     (run_id, job_name, report_type, report_name, scope, applied_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                )
+                .bind(&[
+                    JsValue::from_str(&run_row.id),
+                    JsValue::from_str(job_name),
+                    JsValue::from_str(kind),
+                    JsValue::from_str(name),
+                    JsValue::from_str(scope),
+                    JsValue::from_f64(now_ms as f64),
+                ])?,
+            );
+        }
+
+        if !deduped.is_empty() {
+            let tests_json = serde_json::to_string(
+                &deduped
+                    .iter()
+                    .map(|row| {
+                        serde_json::json!({
+                            "test_id": row.test_id,
+                            "file_path": row.file_path,
+                            "test_name": row.test_name,
+                            "duration_ms": row.duration_ms,
+                            "status": row.outcome.as_status_word(),
+                            "outcome_char": row.outcome.as_char().to_string(),
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|e| worker::Error::RustError(format!("encoding test_stats rows: {e}")))?;
+
+            // Same `json_each`/`ON CONFLICT` upsert shape as analytics.md's
+            // own documented SQL (one batched statement regardless of test
+            // count, the `WHERE true` required for the same SQLite parser
+            // reason the doc explains). This round's own, deliberate
+            // deviation: `recent_outcomes`' per-run char and
+            // `last_status`'s word are both carried pre-computed from Rust
+            // (`outcome_char`/`status`) rather than derived in SQL from a
+            // single `status` column — `TestOutcomeKind` already produces
+            // both shapes from one parsed outcome, so there is nothing to
+            // derive twice.
+            statements.push(
+                db.prepare(
+                    "INSERT INTO test_stats (repo_id, test_id, file_path, test_name, runs, duration_ewma_ms, \
+                     last_duration_ms, last_status, recent_outcomes, flakiness_score, last_run_id, last_sha, updated_at) \
+                     SELECT :repo_id, value->>'test_id', value->>'file_path', value->>'test_name', 1, \
+                            value->>'duration_ms', value->>'duration_ms', value->>'status', \
+                            value->>'outcome_char', 0, :run_id, :sha, :now \
+                     FROM json_each(:tests) \
+                     WHERE true \
+                     ON CONFLICT (repo_id, test_id) DO UPDATE SET \
+                       runs             = test_stats.runs + 1, \
+                       duration_ewma_ms = 0.2 * excluded.last_duration_ms + 0.8 * test_stats.duration_ewma_ms, \
+                       last_duration_ms = excluded.last_duration_ms, \
+                       last_status      = excluded.last_status, \
+                       recent_outcomes  = substr(test_stats.recent_outcomes || excluded.recent_outcomes, -20), \
+                       last_run_id      = excluded.last_run_id, \
+                       last_sha         = excluded.last_sha, \
+                       updated_at       = excluded.updated_at",
+                )
+                .bind(&[
+                    JsValue::from_f64(run_row.repo_id as f64),
+                    JsValue::from_str(&run_row.id),
+                    JsValue::from_str(&run_row.sha),
+                    JsValue::from_f64(now_ms as f64),
+                    JsValue::from_str(&tests_json),
+                ])?,
+            );
+        }
+
+        if let Err(e) = db.batch(statements).await {
+            let msg = e.to_string();
+            // analytics.md's Idempotency: a redelivered finalization batch
+            // hits `test_stats_applications`' PRIMARY KEY, D1 rolls back
+            // the whole transaction, and "a caller that gets this failure
+            // treats the whole batch as 'already applied,' not an error to
+            // retry".
+            if msg.contains("UNIQUE constraint failed")
+                || msg.contains("PRIMARY KEY constraint failed")
+            {
+                return Ok(());
+            }
+            return Err(e);
+        }
+
+        self.refresh_flakiness_scores(run_row.repo_id, &deduped)
+            .await
+    }
+
+    /// Recomputes `flakiness_score` for every `test_id` this run's
+    /// finalization just touched. Deliberately **not** part of the
+    /// idempotency-gated `batch()` above: analytics.md says `flakiness_score`
+    /// "is deliberately not computed inline ... the `*/15` cron
+    /// recomputes it ... off the request path" — this round builds no
+    /// cron (module docs' scope boundary), so until one exists this is a
+    /// best-effort inline refresh rather than a permanently-zero column.
+    /// It is safe to run redundantly or to fail silently-ish (logged, not
+    /// propagated) because it is a pure function of `test_stats`'
+    /// already-durable `recent_outcomes`, the same "recompute from current
+    /// state, always converges" property the doc uses to justify
+    /// `report_summaries`' own recompute-wholesale semantics — recomputing
+    /// it twice, or a run apart from when `recent_outcomes` changed,
+    /// always yields the same answer as the current string, never a
+    /// double-count the way `runs`/`duration_ewma_ms` would double-count
+    /// under a non-gated retry.
+    async fn refresh_flakiness_scores(
+        &self,
+        repo_id: i64,
+        touched: &[logic::TestOutcomeRow],
+    ) -> worker::Result<()> {
+        if touched.is_empty() {
+            return Ok(());
+        }
+        let db = self.env.d1("DB")?;
+        let mut updates = Vec::with_capacity(touched.len());
+        for row in touched {
+            let Some(current) = db
+                .prepare(
+                    "SELECT recent_outcomes FROM test_stats WHERE repo_id = ?1 AND test_id = ?2",
+                )
+                .bind(&[
+                    JsValue::from_f64(repo_id as f64),
+                    JsValue::from_str(&row.test_id),
+                ])?
+                .first::<RecentOutcomesRow>(None)
+                .await?
+            else {
+                continue;
+            };
+            let score = logic::flakiness_score(&current.recent_outcomes);
+            updates.push(
+                db.prepare("UPDATE test_stats SET flakiness_score = ?1 WHERE repo_id = ?2 AND test_id = ?3")
+                    .bind(&[
+                        JsValue::from_f64(score),
+                        JsValue::from_f64(repo_id as f64),
+                        JsValue::from_str(&row.test_id),
+                    ])?,
+            );
+        }
+        if updates.is_empty() {
+            return Ok(());
+        }
+        db.batch(updates).await?;
+        Ok(())
     }
 
     /// `startNode(run_id, node_id, spec_hash)` — module docs' Nodes
@@ -2514,6 +2750,23 @@ fn read_report_by_identity(
     Ok(rows.into_iter().next())
 }
 
+/// Every canonical, parsed report this run's DO storage currently has —
+/// `finalize_test_stats`'s input. This DO instance *is* one run, so no
+/// `run_id` filter is needed (same "run_id implicit" pattern as every
+/// other DO-local query in this module). `is_canonical = 1` already
+/// resolves to the highest-`accepted_seq` content per slot
+/// ([`unset_other_canonical_reports`]'s only caller flips the rest), and
+/// `parsed = 1` excludes raw unparsed blobs/coverage reports, which carry
+/// no per-test-case data (analytics.md's "Raw, unparsed blob uploads
+/// never reach this array").
+fn read_canonical_parsed_reports(sql: &SqlStorage) -> worker::Result<Vec<ReportRow>> {
+    sql.exec(
+        &format!("SELECT {REPORT_COLUMNS} FROM report WHERE is_canonical = 1 AND parsed = 1"),
+        None,
+    )?
+    .to_array()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn insert_report(
     sql: &SqlStorage,
@@ -2828,6 +3081,56 @@ fn parse_report(kind: &str, bytes: &[u8]) -> (i64, Option<String>) {
         Some(json) => (1, Some(json)),
         None => (0, None),
     }
+}
+
+/// Extracts per-test-case outcomes from a report's full bytes, for
+/// `finalize_test_stats` — a richer sibling of [`parse_report`] above:
+/// that function only keeps aggregate counts and failing-test
+/// names/messages (`reports.summary`'s JSON shape), which is not enough
+/// for `test_stats`' per-test duration/status/history columns
+/// (analytics.md's D1 rollup tables: `report_uploads`/`reports.summary`
+/// never retains individual durations). `lcov` (and any other kind with
+/// no `TestSuites`-shaped parser) returns `None` — coverage reports have
+/// no pass/fail test-case concept to contribute.
+fn parse_test_outcomes(kind: &str, bytes: &[u8]) -> Option<Vec<logic::TestOutcomeRow>> {
+    let suites = match kind.to_ascii_lowercase().as_str() {
+        "junit" => cloud_ci_reports::junit::parse(bytes).ok()?,
+        "vitest" => cloud_ci_reports::vitest::parse(bytes).ok()?,
+        "playwright" => cloud_ci_reports::playwright::parse(bytes).ok()?,
+        _ => return None,
+    };
+    let mut rows = Vec::new();
+    for suite in &suites.suites {
+        for tc in &suite.test_cases {
+            // `file` is populated by Vitest/Playwright always, and by
+            // JUnit writers that follow xUnit's legacy `file` attribute
+            // (see `cloud_ci_reports::TestCase::file`'s doc comment); when
+            // absent, the enclosing `<testsuite>`'s name is the closest
+            // stand-in cloud-ci-reports gives us for "what file/module is
+            // this test in".
+            let file_path = tc.file.clone().unwrap_or_else(|| suite.name.clone());
+            let full_name = logic::full_test_name(tc.classname.as_deref(), &tc.name);
+            let test_id = logic::test_id(&file_path, &full_name);
+            let duration_ms = (tc.time.unwrap_or(0.0) * 1000.0).round() as i64;
+            let outcome = match &tc.outcome {
+                cloud_ci_reports::Outcome::Passed => logic::TestOutcomeKind::Passed,
+                // `Errored` folds into `Failed` — see `TestOutcomeKind`'s
+                // doc comment.
+                cloud_ci_reports::Outcome::Failed(_) | cloud_ci_reports::Outcome::Errored(_) => {
+                    logic::TestOutcomeKind::Failed
+                }
+                cloud_ci_reports::Outcome::Skipped(_) => logic::TestOutcomeKind::Skipped,
+            };
+            rows.push(logic::TestOutcomeRow {
+                test_id,
+                file_path,
+                test_name: tc.name.clone(),
+                duration_ms,
+                outcome,
+            });
+        }
+    }
+    Some(rows)
 }
 
 fn summarize_test_suites(suites: cloud_ci_reports::TestSuites) -> String {
