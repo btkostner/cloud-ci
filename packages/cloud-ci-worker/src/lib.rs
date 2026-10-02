@@ -3,6 +3,7 @@ pub mod coordinator;
 pub mod github_app;
 pub mod ingest_token;
 pub mod ulid;
+pub mod webhook;
 
 use cloud_ci_proto::ingest::v1::{
     BeginRunRequest, BeginRunResponse, CompleteShardRequest, CompleteShardResponse,
