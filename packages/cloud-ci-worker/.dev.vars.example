@@ -1,0 +1,9 @@
+# Copy to .dev.vars (gitignored) for `mise run //packages/cloud-ci-worker:dev`.
+# wrangler dev loads .dev.vars as Worker secret/var bindings automatically.
+#
+# Any non-empty value works for local dev; the only requirement is that it's
+# present, since BeginRun refuses to mint an ingest token at all when
+# INGEST_TOKEN_SECRET is unset (src/ingest_token.rs — there is no hardcoded
+# fallback). In production this is `wrangler secret put INGEST_TOKEN_SECRET`,
+# pending ADR 0004's Secrets Store wiring.
+INGEST_TOKEN_SECRET=local-dev-ingest-token-secret

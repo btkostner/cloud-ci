@@ -8,22 +8,22 @@
 //! Pure string/crypto logic with no `worker` dependency, so it is
 //! unit-testable natively.
 //!
-//! # Dev-only signing key
+//! # Signing key
 //!
-//! [`DEV_SECRET`] is a static, hardcoded signing key. This is a deliberate,
-//! honest scope boundary for this round, not a stub: token minting is fully
-//! implemented and works end-to-end, but the key is not yet pulled from
-//! Cloudflare Secrets Store (ADR 0004 names Secrets Store as the eventual
-//! home for "GitHub App key, webhook secret, token root key"). Every token
-//! minted with this key must be treated as minted by a dev deployment;
-//! revisit before any production deployment.
+//! There is no hardcoded or default signing key anywhere in this module —
+//! [`mint`] takes the key as a parameter and the caller (`lib.rs`) is
+//! required to resolve it from the Worker's `INGEST_TOKEN_SECRET` secret
+//! binding (`env.secret("INGEST_TOKEN_SECRET")`), failing the request if
+//! it isn't configured. A hardcoded fallback here would mean anyone who
+//! reads this source (this repository is public) could forge a valid
+//! ingest token for any `repo_id`/`run_id` against a real deployment. Local
+//! dev sets this via `.dev.vars` (see `.dev.vars.example`); production sets
+//! it via `wrangler secret put INGEST_TOKEN_SECRET`, pending ADR 0004's
+//! eventual Secrets Store wiring.
 
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-
-/// Dev-only static HMAC signing key. See module docs.
-const DEV_SECRET: &[u8] = b"cloud-ci-dev-ingest-token-secret-do-not-use-in-production";
 
 const INGEST_TOKEN_TTL_SECONDS: u64 = 3600;
 
@@ -49,13 +49,12 @@ impl std::fmt::Display for TokenError {
 impl std::error::Error for TokenError {}
 
 /// Mints an ingest token for `repo_id`/`run_id`, expiring `INGEST_TOKEN_TTL_SECONDS`
-/// after `now_unix_s`. `now_unix_s` is a parameter (not read from a clock
-/// internally) so minting is deterministic and unit-testable.
-pub fn mint(repo_id: u64, run_id: &str, now_unix_s: u64) -> Result<String, TokenError> {
-    mint_with_secret(DEV_SECRET, repo_id, run_id, now_unix_s)
-}
-
-fn mint_with_secret(
+/// after `now_unix_s`, signed with `secret`. `now_unix_s` is a parameter
+/// (not read from a clock internally) so minting is deterministic and
+/// unit-testable. `secret` is a parameter (never a constant in this module)
+/// so there is no key anywhere in source control that could sign a real
+/// token — see module docs.
+pub fn mint(
     secret: &[u8],
     repo_id: u64,
     run_id: &str,
@@ -91,7 +90,7 @@ mod tests {
 
     #[test]
     fn mints_two_dot_separated_base64url_parts() -> Result<(), TokenError> {
-        let token = mint_with_secret(
+        let token = mint(
             b"test-secret",
             1_296_269,
             "01ARZ3NDEKTSV4RRFFQ69G5FAV",
@@ -106,23 +105,23 @@ mod tests {
 
     #[test]
     fn same_inputs_mint_identical_tokens() -> Result<(), TokenError> {
-        let a = mint_with_secret(b"test-secret", 1, "run-a", 500)?;
-        let b = mint_with_secret(b"test-secret", 1, "run-a", 500)?;
+        let a = mint(b"test-secret", 1, "run-a", 500)?;
+        let b = mint(b"test-secret", 1, "run-a", 500)?;
         assert_eq!(a, b);
         Ok(())
     }
 
     #[test]
     fn different_secrets_mint_different_signatures() -> Result<(), TokenError> {
-        let a = mint_with_secret(b"secret-a", 1, "run-a", 500)?;
-        let b = mint_with_secret(b"secret-b", 1, "run-a", 500)?;
+        let a = mint(b"secret-a", 1, "run-a", 500)?;
+        let b = mint(b"secret-b", 1, "run-a", 500)?;
         assert_ne!(a, b);
         Ok(())
     }
 
     #[test]
     fn payload_decodes_to_expected_claims() -> Result<(), Box<dyn std::error::Error>> {
-        let token = mint_with_secret(b"test-secret", 42, "run-x", 1_000)?;
+        let token = mint(b"test-secret", 42, "run-x", 1_000)?;
         let payload_b64 = token.split('.').next().ok_or("missing payload segment")?;
         use base64::Engine as _;
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload_b64)?;

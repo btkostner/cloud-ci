@@ -88,6 +88,12 @@ async fn handle_begin_run(
     env: &Env,
 ) -> std::result::Result<Vec<u8>, ConnectError> {
     let req: BeginRunRequest = codec.decode(body)?;
+
+    // Resolved before touching the Durable Object so a misconfigured
+    // deployment fails the whole call up front, rather than creating/
+    // updating the run and only then discovering it cannot mint a token.
+    let secret = ingest_token_secret(env)?;
+
     let do_name = coordinator::do_name(
         req.key.repo_id,
         &req.key.sha,
@@ -98,7 +104,7 @@ async fn handle_begin_run(
     let outcome = store.begin_run(&req).await.map_err(coordinator_error)?;
 
     let now_s = Date::now().as_millis() / 1000;
-    let ingest_token = ingest_token::mint(req.key.repo_id, &outcome.run_id, now_s)
+    let ingest_token = ingest_token::mint(&secret, req.key.repo_id, &outcome.run_id, now_s)
         .map_err(|e| ConnectError::new(Code::Internal, format!("cannot mint ingest token: {e}")))?;
 
     let resp = BeginRunResponse {
@@ -108,6 +114,21 @@ async fn handle_begin_run(
         ..Default::default()
     };
     codec.encode(&resp)
+}
+
+/// Resolves the ingest-token HMAC signing key from the Worker's
+/// `INGEST_TOKEN_SECRET` secret binding (`wrangler secret put` in
+/// production, `.dev.vars` locally — see `.dev.vars.example`). There is no
+/// fallback value: an unconfigured deployment must fail loudly here, not
+/// silently mint tokens signed with a value anyone could read from source.
+fn ingest_token_secret(env: &Env) -> std::result::Result<Vec<u8>, ConnectError> {
+    let secret = env.secret("INGEST_TOKEN_SECRET").map_err(|e| {
+        ConnectError::new(
+            Code::Internal,
+            format!("INGEST_TOKEN_SECRET is not configured: {e}"),
+        )
+    })?;
+    Ok(secret.to_string().into_bytes())
 }
 
 async fn handle_start_job(
