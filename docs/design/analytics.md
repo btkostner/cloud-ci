@@ -455,6 +455,21 @@ or retry reuses that same snapshot. A single Durable Object instance alone is no
 exactly-once guarantee: asynchronous requests can interleave, so pending projection work is
 processed in order, and D1's atomic markers below prevent duplicate history updates.
 
+**This implementation's snapshot.** `cloud-ci-worker`'s `RunCoordinator` does not write a
+separate, explicit "frozen report IDs" record before dispatching the finalization batch, despite
+the general description above. It instead re-queries its own durable DO SQLite storage for
+`report WHERE is_canonical = 1 AND parsed = 1` directly at finalization time, on every
+invocation, including after a restart. This is a deliberate, reasoned choice, not an
+approximation: `RunCoordinator`'s `SubmitReport` RPC already rejects (409) any call once the run
+is terminal (`upload_allowed_for_shard`'s `run_terminal` check), which structurally prevents the
+in-flux-canonical-selection scenario the general "persist a frozen snapshot" mechanism exists to
+guard against. By the time finalization runs, the run is already terminal, so no further report
+can ever be accepted — the live query's result set is therefore identical on every call for a
+given run, by construction, making it equivalent to reusing a persisted snapshot without the
+added complexity and D1 writes a separate snapshot table would cost. This equivalence is specific
+to this codebase's data model (the terminal-rejection gate existing at all); a design without
+that gate would still need the explicit snapshot the general paragraph above describes.
+
 D1's own `test_stats_applications` table remains as a backstop against Queue redelivery replaying
 the same finalization `batch()` (not against two independent coordinators racing, which the
 Durable Object model already rules out). The finalization batch's first statements are plain

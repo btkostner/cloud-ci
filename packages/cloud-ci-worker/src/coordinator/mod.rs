@@ -2759,6 +2759,17 @@ fn read_report_by_identity(
 /// `parsed = 1` excludes raw unparsed blobs/coverage reports, which carry
 /// no per-test-case data (analytics.md's "Raw, unparsed blob uploads
 /// never reach this array").
+///
+/// **No separate frozen-report-IDs snapshot.** analytics.md's Idempotency
+/// section's "This implementation's snapshot" addendum (right after its
+/// general "persists the frozen report IDs ... before dispatching"
+/// description) explains why this live re-query — not a separately
+/// persisted snapshot — is restart-safe here: `handle_submit_report`
+/// rejects (409) once the run is terminal
+/// (`logic::upload_allowed_for_shard`'s `run_terminal` check), and
+/// `finalize_test_stats` only ever runs after that terminal transition,
+/// so this `SELECT`'s result set is already frozen by construction
+/// before it is ever read.
 fn read_canonical_parsed_reports(sql: &SqlStorage) -> worker::Result<Vec<ReportRow>> {
     sql.exec(
         &format!("SELECT {REPORT_COLUMNS} FROM report WHERE is_canonical = 1 AND parsed = 1"),
