@@ -90,23 +90,29 @@ pub struct VerifiedClaims {
 }
 
 /// Verifies an ingest token minted by [`mint`]: re-derives the HMAC over the
-/// payload segment (constant-time compare), checks `typ`/`scope`, and
-/// rejects an expired token. `now_unix_s` is a parameter for the same
-/// determinism/testability reason as [`mint`]'s.
+/// payload segment and checks it against the token's signature via
+/// [`Mac::verify_slice`] (constant-time comparison, backed by
+/// `subtle::ConstantTimeEq` inside the `hmac`/`digest` crates — never a
+/// hand-rolled `==` on the encoded signature, which would leak timing
+/// information byte-by-byte), checks `typ`/`scope`, and rejects an expired
+/// token. `now_unix_s` is a parameter for the same determinism/testability
+/// reason as [`mint`]'s.
 pub fn verify(secret: &[u8], token: &str, now_unix_s: u64) -> Result<VerifiedClaims, TokenError> {
     let (payload_b64, signature_b64) = token
         .split_once('.')
         .ok_or_else(|| TokenError("malformed ingest token".to_string()))?;
 
+    use base64::Engine as _;
+    let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(signature_b64)
+        .map_err(|e| TokenError(format!("cannot decode ingest token signature: {e}")))?;
+
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret)
         .map_err(|e| TokenError(format!("invalid HMAC key: {e}")))?;
     mac.update(payload_b64.as_bytes());
-    let expected_signature_b64 = base64_url_encode(&mac.finalize().into_bytes());
-    if expected_signature_b64 != signature_b64 {
-        return Err(TokenError("ingest token signature mismatch".to_string()));
-    }
+    mac.verify_slice(&signature)
+        .map_err(|_| TokenError("ingest token signature mismatch".to_string()))?;
 
-    use base64::Engine as _;
     let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload_b64)
         .map_err(|e| TokenError(format!("cannot decode ingest token payload: {e}")))?;
@@ -220,6 +226,26 @@ mod tests {
             .ok_or(TokenError("bad token".to_string()))?;
         let tampered = format!("{}.{sig}", base64_url_encode(b"{\"typ\":\"ingest\"}"));
         assert!(verify(b"test-secret", &tampered, 1_000).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn verify_rejects_a_tampered_signature() -> Result<(), TokenError> {
+        let token = mint(b"test-secret", 42, "run-x", 1_000)?;
+        let (payload, sig) = token
+            .split_once('.')
+            .ok_or(TokenError("bad token".to_string()))?;
+        // Flip the signature to one computed over different payload bytes
+        // (not a manual byte mutation, which could coincidentally decode to
+        // invalid base64url) so `verify_slice` must reject it on content,
+        // not on a decode failure.
+        let other = mint(b"test-secret", 42, "run-y", 1_000)?;
+        let (_, other_sig) = other
+            .split_once('.')
+            .ok_or(TokenError("bad token".to_string()))?;
+        assert_ne!(sig, other_sig);
+        let forged = format!("{payload}.{other_sig}");
+        assert!(verify(b"test-secret", &forged, 1_000).is_err());
         Ok(())
     }
 
