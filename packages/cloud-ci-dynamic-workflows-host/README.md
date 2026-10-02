@@ -186,3 +186,23 @@ sleeping Workflow step's wake timer after the reload, and no documented
 local hook exists to force or diagnose that directly. Full
 run-to-completion recycle survival therefore stays **unproven locally**;
 completed-step persistence across a forced reload is **proven**.
+
+**Re-verified against the latest available `wrangler` (2026-10-02):** the
+pinned version was 4.145.0; `npm view wrangler versions --json` showed
+4.146.0 and 4.147.0 as newer releases. Neither release's changelog
+(github.com/cloudflare/workers-sdk/releases/tag/wrangler%404.146.0 and
+.../wrangler%404.147.0, checked 2026-10-02) mentions any Workflows
+sleep/timer/hot-reload fix: 4.146.0 adds local-dev support for the
+`createBatch()` API, and 4.147.0 only adds CLI-level retry for transient
+API failures in `wrangler workflows instances list`/`describe` (unrelated
+to the engine's wake-timer behavior). The exact repro above was re-run
+against wrangler 4.147.0 anyway: `step1-plan` again completed and
+survived the forced `touch src/index.ts` reload unchanged, but
+`pause-for-recycle-window` was still stuck "💤 Sleeping" at 3 minutes
+against its 30-second target, while an identical un-reloaded control run
+under the same 4.147.0 session completed normally in 30 seconds,
+container exec included — the same failure signature as 4.145.0. The
+version pin was left at 4.145.0 (the bump was reverted after the retest)
+since the newer version fixes nothing here. This limitation stays open;
+re-check again only once a future `wrangler` changelog actually mentions
+a Workflows sleep/timer/resume fix.
