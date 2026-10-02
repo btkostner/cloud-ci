@@ -336,7 +336,7 @@ themselves stay in Cloudflare Secrets Store and are never read into D1.
 | --- | --- |
 | Contents/blob API 5xx / rate limited | Queue retry with backoff (max 5); then `cloud-ci / config` = `failure` with "could not fetch config" |
 | `settings.yml` invalid | `cloud-ci / config` = `failure` with annotations; deployment defaults used for that commit so pipelines can still run |
-| A pipeline file's `on` export invalid or not statically evaluable | `cloud-ci / config` = `failure` with an annotation naming the file; other pipeline files still discovered and run |
+| A pipeline file's `on` export is invalid, or `on(ctx)` throws, times out, or exceeds its budget | That pipeline does not run for the event; `cloud-ci / config` = `failure` with an annotation naming the file; other pipeline files still discovered and run |
 | No `.cloud-ci/pipelines/` directory | No managed pipelines; external runs still work |
 | No `settings.yml` | Deployment defaults apply; no config-validation failure |
 | Schedule alarm lost | Re-armed by the 15-minute safety Cron Trigger; at most one occurrence delayed, never double-fired |

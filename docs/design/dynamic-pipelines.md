@@ -125,8 +125,9 @@ nothing else: no network, no secrets. Discovery evaluates `on` without ever call
 static form it just reads the object; for the function form it loads the script once per event
 into a Dynamic Worker isolate with egress blocked and a CPU budget
 `[unverified: exact CPU budget]`, and calls `on(ctx)`. A function that throws, times out, or
-exceeds the budget counts as "does not match" and is logged, not treated as a fatal discovery
-error. The static form stays the fast path: the host can decide to start a pipeline without
+exceeds the budget means the pipeline does not run for that event, and discovery reports it as a
+`cloud-ci / config` failure annotation naming the file. Other pipeline files are not affected.
+The static form stays the fast path: the host can decide to start a pipeline without
 spinning up an isolate at all, and can cache the decision by the script's blob sha.
 
 `turbo.execute` is ordinary library code, roughly:
@@ -561,7 +562,7 @@ are not coordinated with each other beyond sharing the PR comment's run list
 
 | Failure | Behavior |
 | --- | --- |
-| Script throws | Run `failed`; running nodes are cancelled; `cloud-ci / script` check shows the stack trace |
+| Script throws | Run `failed`; running nodes are cancelled; every unsealed check the script created concludes `failure` with the stack trace in its summary |
 | Nondeterministic replay | Run `failed` with the first diverging call |
 | Isolate recycled or Worker redeployed | Workflow resumes; finished steps are not repeated |
 | Container lost | Coordinator marks the node failed and sends its event; the script decides whether to retry |
