@@ -26,6 +26,7 @@ task.source_freshness_hash_contents = true
 
 [tasks.check]
 description = "Run every repo-wide check"
+depends = ["//packages/*:check"]
 run = """
 hk check --all \
   --step taplo \
@@ -37,6 +38,7 @@ hk check --all \
 
 [tasks.fix]
 description = "Fix every repo-wide check"
+depends = ["//packages/*:fix"]
 run = """
 hk fix --all \
   --step taplo \

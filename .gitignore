@@ -14,6 +14,7 @@ node_modules/
 # mise
 .mise.local.toml
 mise.local.toml
+/.mise/locks
 
 # Local secrets and machine-specific config
 .env

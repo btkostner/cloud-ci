@@ -1,0 +1,7 @@
+version: v2
+plugins:
+  - local: protoc-gen-buffa
+    out: ../cloud-ci-proto-rust/generated
+    opt:
+      - file_per_package=true
+      - json=true

@@ -1,0 +1,153 @@
+syntax = "proto3";
+
+package cloud_ci.ingest.v1;
+
+import "google/protobuf/duration.proto";
+
+// Control plane for bring-your-own-CI uploads. Upload part bytes travel over a
+// plain PUT, not this service.
+service IngestService {
+  rpc BeginRun(BeginRunRequest) returns (BeginRunResponse);
+  rpc StartJob(StartJobRequest) returns (StartJobResponse);
+  rpc CreateUpload(CreateUploadRequest) returns (CreateUploadResponse);
+  rpc CompleteUpload(CompleteUploadRequest) returns (CompleteUploadResponse);
+  rpc SubmitReport(SubmitReportRequest) returns (SubmitReportResponse);
+  rpc CompleteShard(CompleteShardRequest) returns (CompleteShardResponse);
+  rpc GetRun(GetRunRequest) returns (GetRunResponse);
+}
+
+enum Trigger {
+  TRIGGER_UNSPECIFIED = 0;
+  TRIGGER_PUSH = 1;
+  TRIGGER_PULL_REQUEST = 2;
+  TRIGGER_MANUAL = 3;
+}
+
+enum UploadKind {
+  UPLOAD_KIND_UNSPECIFIED = 0;
+  UPLOAD_KIND_REPORT = 1;
+  UPLOAD_KIND_ARTIFACT = 2;
+  UPLOAD_KIND_SITE = 3;
+}
+
+enum Conclusion {
+  CONCLUSION_UNSPECIFIED = 0;
+  CONCLUSION_SUCCESS = 1;
+  CONCLUSION_FAILURE = 2;
+  CONCLUSION_CANCELLED = 3;
+  CONCLUSION_SKIPPED = 4;
+}
+
+enum RunStatus {
+  RUN_STATUS_UNSPECIFIED = 0;
+  RUN_STATUS_QUEUED = 1;
+  RUN_STATUS_IN_PROGRESS = 2;
+  RUN_STATUS_COMPLETED = 3;
+}
+
+// Identifies a run by (repo_id, sha, run_key, attempt).
+message RunKey {
+  // GitHub's numeric repository id.
+  uint64 repo_id = 1;
+  string sha = 2;
+  string run_key = 3;
+  uint32 attempt = 4;
+}
+
+message BeginRunRequest {
+  RunKey key = 1;
+  Trigger trigger = 2;
+  string external_url = 3;
+  repeated string expect_jobs = 4;
+  google.protobuf.Duration timeout = 5;
+}
+
+message BeginRunResponse {
+  string run_id = 1;
+  RunStatus status = 2;
+  // Run-scoped token for every later call in this run.
+  string ingest_token = 3;
+}
+
+message StartJobRequest {
+  string run_id = 1;
+  string job_name = 2;
+  uint32 shard_total = 3;
+  string runner_label = 4;
+  repeated string check_names = 5;
+}
+
+message StartJobResponse {
+  string job_id = 1;
+}
+
+message CreateUploadRequest {
+  string job_id = 1;
+  uint32 shard_index = 2;
+  UploadKind kind = 3;
+  string name = 4;
+  string scope = 5;
+  string content_type = 6;
+  uint64 size_bytes = 7;
+  string sha256 = 8;
+}
+
+message CreateUploadResponse {
+  string upload_id = 1;
+  // Zero when the upload already exists with the same identity.
+  uint32 part_count = 2;
+  uint64 part_size_bytes = 3;
+  bool already_complete = 4;
+}
+
+message UploadPart {
+  uint32 number = 1;
+  string etag = 2;
+}
+
+message CompleteUploadRequest {
+  string upload_id = 1;
+  repeated UploadPart parts = 2;
+}
+
+message CompleteUploadResponse {}
+
+message SubmitReportRequest {
+  string job_id = 1;
+  uint32 shard_index = 2;
+  string report_kind = 3;
+  string name = 4;
+  string scope = 5;
+  oneof source {
+    bytes inline_data = 6;
+    string upload_id = 7;
+  }
+}
+
+message SubmitReportResponse {}
+
+message CompleteShardRequest {
+  string job_id = 1;
+  uint32 shard_index = 2;
+  Conclusion conclusion = 3;
+  string external_url = 4;
+}
+
+message CompleteShardResponse {}
+
+message GetRunRequest {
+  RunKey key = 1;
+}
+
+message JobState {
+  string job_id = 1;
+  string job_name = 2;
+  uint32 shard_total = 3;
+  repeated uint32 completed_shards = 4;
+}
+
+message GetRunResponse {
+  string run_id = 1;
+  RunStatus status = 2;
+  repeated JobState jobs = 3;
+}
