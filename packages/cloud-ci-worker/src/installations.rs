@@ -23,10 +23,14 @@ use worker::wasm_bindgen::JsValue;
 /// `installation.account` per
 /// docs.github.com/en/webhooks/webhook-events-and-payloads#installation
 /// (accessed 2026-10-02). GitHub's payload has many more fields
-/// (`id`, `node_id`, `avatar_url`, ...); only `login`/`type` are needed
-/// here, and `serde` ignores the rest.
+/// (`node_id`, `avatar_url`, ...); `id`/`login`/`type` are needed here —
+/// `id` is the numeric account id docs/design/byo-ci.md § Auth requires
+/// matching a `repository_owner_id` OIDC claim against (logins are
+/// mutable across renames/transfers; the numeric id is not) — and `serde`
+/// ignores the rest.
 #[derive(Debug, Clone, Deserialize)]
 pub struct InstallationAccount {
+    pub id: u64,
     pub login: String,
     #[serde(rename = "type")]
     pub account_type: String,
@@ -103,20 +107,23 @@ pub async fn upsert_installation(
     installation_id: u64,
     account_login: &str,
     account_type: &str,
+    account_id: u64,
     installed_at_s: i64,
 ) -> worker::Result<()> {
     let db = env.d1("DB")?;
     db.prepare(
-        "INSERT INTO installations (installation_id, account_login, account_type, suspended_at, installed_at) \
-         VALUES (?1, ?2, ?3, NULL, ?4) \
+        "INSERT INTO installations (installation_id, account_login, account_type, account_id, suspended_at, installed_at) \
+         VALUES (?1, ?2, ?3, ?4, NULL, ?5) \
          ON CONFLICT (installation_id) DO UPDATE SET \
              account_login = excluded.account_login, \
-             account_type = excluded.account_type",
+             account_type = excluded.account_type, \
+             account_id = excluded.account_id",
     )
     .bind(&[
         JsValue::from_f64(installation_id as f64),
         JsValue::from_str(account_login),
         JsValue::from_str(account_type),
+        JsValue::from_f64(account_id as f64),
         JsValue::from_f64(installed_at_s as f64),
     ])?
     .run()
@@ -191,6 +198,91 @@ pub async fn delete_repo(env: &Env, repo_id: u64) -> worker::Result<()> {
         .bind(&[JsValue::from_f64(repo_id as f64)])?
         .run()
         .await?;
+    Ok(())
+}
+
+/// The `repos`/`installations` join row `BeginRun`'s OIDC path needs to
+/// decide whether a claimed `repository_id` belongs to an allowlisted,
+/// non-suspended installation (docs/design/byo-ci.md § Auth).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepoInstallationRow {
+    pub account_id: u64,
+    pub suspended_at: Option<i64>,
+}
+
+/// Looks up the `installations` row that owns `repo_id`, via the
+/// `repos` -> `installations` join on `installation_id`. `None` means no
+/// `repos` row exists for this id — distinct from a row existing but
+/// failing the allowlist check, which [`AllowlistError::OwnerMismatch`]/
+/// [`AllowlistError::Suspended`] cover.
+pub async fn lookup_repo_installation(
+    env: &Env,
+    repo_id: u64,
+) -> worker::Result<Option<RepoInstallationRow>> {
+    let db = env.d1("DB")?;
+    let row = db
+        .prepare(
+            "SELECT installations.account_id, installations.suspended_at \
+             FROM repos JOIN installations \
+                 ON repos.installation_id = installations.installation_id \
+             WHERE repos.repo_id = ?1",
+        )
+        .bind(&[JsValue::from_f64(repo_id as f64)])?
+        .first::<serde_json::Value>(None)
+        .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let account_id = row
+        .get("account_id")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| {
+            worker::Error::RustError("repos/installations row missing account_id".into())
+        })?;
+    let suspended_at = row.get("suspended_at").and_then(|v| v.as_i64());
+    Ok(Some(RepoInstallationRow {
+        account_id,
+        suspended_at,
+    }))
+}
+
+/// Why an OIDC-claimed repository failed the allowlist check
+/// (docs/design/byo-ci.md § Auth) — the caller (`lib.rs::handle_begin_run`)
+/// maps every variant to a rejected `BeginRun` call; none of them ever
+/// fall through to success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllowlistError {
+    /// No `repos` row exists for the claimed `repository_id` — either the
+    /// repo was never discovered via the `installation_repositories`
+    /// webhook, or the App was uninstalled/the repo was removed since.
+    RepoNotFound,
+    /// A `repos` row exists, but its owning installation's numeric
+    /// `account_id` does not match the claim's `repository_owner_id` —
+    /// the exact renames/transfers case docs/design/byo-ci.md § Auth
+    /// calls out matching on the name string would get wrong.
+    OwnerMismatch,
+    /// The owning installation exists and the owner matches, but it is
+    /// currently suspended (`installations.suspended_at IS NOT NULL`).
+    Suspended,
+}
+
+/// Pure "does this OIDC claim match an allowlisted, non-suspended
+/// installation" decision (docs/design/byo-ci.md § Auth), given the
+/// `repos`/`installations` row already fetched by
+/// [`lookup_repo_installation`] for the claim's `repository_id`. Kept
+/// separate from the D1 fetch so it is unit-testable with plain
+/// `cargo test`, same layering as [`is_allowed_org`].
+pub fn check_allowlist(
+    repository_owner_id: u64,
+    row: Option<RepoInstallationRow>,
+) -> Result<(), AllowlistError> {
+    let row = row.ok_or(AllowlistError::RepoNotFound)?;
+    if row.account_id != repository_owner_id {
+        return Err(AllowlistError::OwnerMismatch);
+    }
+    if row.suspended_at.is_some() {
+        return Err(AllowlistError::Suspended);
+    }
     Ok(())
 }
 
@@ -315,5 +407,46 @@ mod tests {
         assert_eq!(event.repositories_removed[0].id, 2);
         assert!(event.repositories_added.is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn check_allowlist_rejects_missing_repo_row() {
+        assert_eq!(
+            check_allowlist(67890, None),
+            Err(AllowlistError::RepoNotFound)
+        );
+    }
+
+    #[test]
+    fn check_allowlist_rejects_owner_mismatch() {
+        let row = RepoInstallationRow {
+            account_id: 11111,
+            suspended_at: None,
+        };
+        assert_eq!(
+            check_allowlist(67890, Some(row)),
+            Err(AllowlistError::OwnerMismatch)
+        );
+    }
+
+    #[test]
+    fn check_allowlist_rejects_suspended_installation() {
+        let row = RepoInstallationRow {
+            account_id: 67890,
+            suspended_at: Some(1_700_000_000),
+        };
+        assert_eq!(
+            check_allowlist(67890, Some(row)),
+            Err(AllowlistError::Suspended)
+        );
+    }
+
+    #[test]
+    fn check_allowlist_accepts_matching_non_suspended_installation() {
+        let row = RepoInstallationRow {
+            account_id: 67890,
+            suspended_at: None,
+        };
+        assert_eq!(check_allowlist(67890, Some(row)), Ok(()));
     }
 }
