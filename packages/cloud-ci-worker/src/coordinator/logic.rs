@@ -411,6 +411,75 @@ pub fn run_state_from_conclusion(conclusion: Conclusion) -> RunState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Check Runs (`StartJob.check_names`, `CompleteShard`, run close),
+// docs/design/byo-ci.md "Checks and scopes" and docs/design/pr-comment.md
+// "Check Runs". Deliberately independent of `pr_comment.rs`'s template/
+// context (see `coordinator` module docs' scope boundary) — this is its
+// own simpler shard-table markdown.
+// ---------------------------------------------------------------------------
+
+/// Which of `incoming` check names this run has not already created a
+/// Check Run for, per byo-ci.md's "Checks and scopes": "the Worker
+/// creates any check name it hasn't seen yet for this run on the first
+/// `StartJob` that names it" — first-seen-wins, keyed by `(run,
+/// check_name)`. Also dedupes `incoming` against itself, so one
+/// `StartJob` call naming the same check twice only creates it once.
+/// Order-preserving.
+pub fn new_check_names(existing: &[String], incoming: &[String]) -> Vec<String> {
+    let mut seen: std::collections::HashSet<&str> = existing.iter().map(String::as_str).collect();
+    let mut result = Vec::new();
+    for name in incoming {
+        if seen.insert(name.as_str()) {
+            result.push(name.clone());
+        }
+    }
+    result
+}
+
+/// One job's row in a Check Run's shard-table summary
+/// (pr-comment.md's "Check Runs": "A shard group maps to a single Check
+/// Run, and the summary holds a shard table" — "if a check name is
+/// shared by several jobs, the summary covers all of them"). `None`
+/// `conclusion` means the job is still running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckSummaryJobRow {
+    pub job_name: String,
+    pub completed_shards: u32,
+    pub shard_total: u32,
+    pub conclusion: Option<Conclusion>,
+}
+
+fn conclusion_label(c: Conclusion) -> &'static str {
+    match c {
+        Conclusion::CONCLUSION_SUCCESS => "success",
+        Conclusion::CONCLUSION_FAILURE => "failure",
+        Conclusion::CONCLUSION_CANCELLED => "cancelled",
+        Conclusion::CONCLUSION_SKIPPED => "skipped",
+        Conclusion::CONCLUSION_UNSPECIFIED => "unknown",
+    }
+}
+
+/// Builds the markdown shard table a Check Run's `output.summary` holds
+/// (pr-comment.md's "Check Runs": "the summary holds a shard table").
+/// Rows are emitted in the order `rows` is given — this function does no
+/// sorting, same as every other pure formatter in this module; the
+/// caller controls row order.
+pub fn render_check_summary(rows: &[CheckSummaryJobRow]) -> String {
+    let mut out = String::from("| Job | Shards | Conclusion |\n| --- | --- | --- |\n");
+    for row in rows {
+        let conclusion = match row.conclusion {
+            Some(c) => conclusion_label(c),
+            None => "running",
+        };
+        out.push_str(&format!(
+            "| {} | {}/{} | {} |\n",
+            row.job_name, row.completed_shards, row.shard_total, conclusion
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -829,5 +898,83 @@ mod tests {
         ] {
             assert_eq!(run_state_from_conclusion(conclusion), RunState::Failed);
         }
+    }
+
+    #[test]
+    fn new_check_names_returns_only_names_not_already_created() {
+        let existing = vec!["lint".to_string()];
+        let incoming = vec!["lint".to_string(), "e2e".to_string()];
+        assert_eq!(
+            new_check_names(&existing, &incoming),
+            vec!["e2e".to_string()]
+        );
+    }
+
+    #[test]
+    fn new_check_names_dedupes_repeats_within_incoming() {
+        let incoming = vec!["e2e".to_string(), "e2e".to_string(), "lint".to_string()];
+        assert_eq!(
+            new_check_names(&[], &incoming),
+            vec!["e2e".to_string(), "lint".to_string()]
+        );
+    }
+
+    #[test]
+    fn new_check_names_empty_incoming_is_a_no_op() {
+        assert_eq!(
+            new_check_names(&["lint".to_string()], &[]),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn new_check_names_preserves_incoming_order() {
+        let incoming = vec!["c".to_string(), "a".to_string(), "b".to_string()];
+        assert_eq!(new_check_names(&[], &incoming), incoming);
+    }
+
+    #[test]
+    fn render_check_summary_shows_running_for_unconcluded_jobs() {
+        let rows = [CheckSummaryJobRow {
+            job_name: "e2e".to_string(),
+            completed_shards: 2,
+            shard_total: 4,
+            conclusion: None,
+        }];
+        let summary = render_check_summary(&rows);
+        assert!(summary.contains("| e2e | 2/4 | running |"));
+    }
+
+    #[test]
+    fn render_check_summary_shows_conclusion_label_once_a_job_concludes() {
+        let rows = [CheckSummaryJobRow {
+            job_name: "unit".to_string(),
+            completed_shards: 4,
+            shard_total: 4,
+            conclusion: Some(Conclusion::CONCLUSION_FAILURE),
+        }];
+        let summary = render_check_summary(&rows);
+        assert!(summary.contains("| unit | 4/4 | failure |"));
+    }
+
+    #[test]
+    fn render_check_summary_covers_every_job_sharing_a_check() {
+        let rows = [
+            CheckSummaryJobRow {
+                job_name: "unit".to_string(),
+                completed_shards: 4,
+                shard_total: 4,
+                conclusion: Some(Conclusion::CONCLUSION_SUCCESS),
+            },
+            CheckSummaryJobRow {
+                job_name: "e2e".to_string(),
+                completed_shards: 1,
+                shard_total: 4,
+                conclusion: None,
+            },
+        ];
+        let summary = render_check_summary(&rows);
+        assert!(summary.contains("unit"));
+        assert!(summary.contains("e2e"));
     }
 }

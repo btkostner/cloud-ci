@@ -56,15 +56,24 @@
 //! repo/PR/installation token exists in this environment to call them
 //! against.
 //!
-//! Nothing in `lib.rs` calls any of these functions yet — webhook
-//! handling, the coordinator's check-sealing logic, and
-//! `PullRequestState`'s flush loop, their real callers, don't exist yet.
+//! [`create_check_run`]/[`update_check_run`] now have their first real
+//! caller: `coordinator::mod`'s `RunCoordinator` calls them from
+//! `StartJob` (create, first time a job names a check),
+//! `CompleteShard` (update, shard-table progress), and run close
+//! (update, final `completed`/conclusion) — see that module's doc
+//! comment for the storage design and idempotency mechanism. The issue
+//! (PR sticky-comment) comment functions below still have no caller:
+//! webhook handling and `PullRequestState`'s flush loop don't exist yet.
 //! Templating/rendering a `PrReport` into the markdown these functions'
-//! `body`/`output.summary` fields carry is explicitly out of scope this
-//! round too (pr-comment.md's "Template rendering" section flags
-//! rendering via MiniJinja as `[unverified]` for `wasm32-unknown-unknown`
-//! pending its own Phase 0 spike) — this module is a capability check for
-//! the wire calls alone, same as `github_app.rs` was for App-level auth.
+//! `body`/`output.summary` fields carry is still out of scope — the
+//! Check Run caller builds its own independent shard-table markdown
+//! rather than routing through `pr_comment::render_pr_report`
+//! (pr-comment.md's "Template rendering" section flags rendering via
+//! MiniJinja as `[unverified]` for `wasm32-unknown-unknown` pending its
+//! own Phase 0 spike, and that cross-module wiring is bigger later
+//! work once a real run's aggregate data is available in the right
+//! shape) — this module remains a capability check for the wire calls
+//! themselves, same as `github_app.rs` was for App-level auth.
 
 use serde::{Deserialize, Serialize};
 

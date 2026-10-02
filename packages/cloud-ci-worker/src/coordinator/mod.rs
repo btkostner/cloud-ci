@@ -14,9 +14,59 @@
 //! directly. This module is the thin, storage-wired shell around it —
 //! exercised only by the live smoke test (`mise run //packages/cloud-ci-worker:dev`),
 //! since `cargo test` cannot run a real Durable Object.
+//!
+//! ## Check Runs
+//!
+//! `StartJob.check_names`/`CompleteShard`/run close wire into GitHub
+//! Check Runs (docs/design/byo-ci.md's "Checks and scopes",
+//! docs/design/pr-comment.md's "Check Runs" table), via
+//! [`crate::github_checks`]'s create/update calls:
+//!
+//! - **Storage.** The DO's own SQLite (`check_run` table, see
+//!   [`ensure_schema`]) is authoritative, keyed by `check_name` — unique
+//!   per run, since a `RunCoordinator` instance *is* one run, matching
+//!   byo-ci.md's "(run, check_name)" dedupe key exactly. A D1 table
+//!   (`check_runs`, migration 0008) projects it, same
+//!   authoritative-DO/projected-D1 split as `runs`/`jobs`/`job_shards`.
+//!   Which jobs attach to a check is derived, not stored separately:
+//!   each job's existing `check_names` JSON column is scanned
+//!   ([`check_summary_rows`]) rather than maintaining a second join
+//!   table.
+//! - **Idempotency.** A check-run row is only inserted after its
+//!   `POST /check-runs` call actually succeeds, so a redelivered
+//!   `StartJob` naming an already-created check sees the row and makes
+//!   no second create call ([`RunCoordinator::create_check_runs_for_job`],
+//!   via [`logic::new_check_names`]). A redelivered `CompleteShard`/close
+//!   recomputes the same shard-table summary from the DO's own state and
+//!   re-`PATCH`es it — idempotent by construction (same inputs, same
+//!   output), not by skipping the call outright. `finalize_check_runs`
+//!   additionally skips a check already `status = "completed"`, so a
+//!   redelivered close signal cannot re-finalize one.
+//! - **Scope boundary.** The Check Run `output.summary` built here is
+//!   its own independent, simpler shard-table markdown
+//!   ([`logic::render_check_summary`]: job name, shard N/total,
+//!   conclusion) — it is deliberately **not** routed through
+//!   `pr_comment::render_pr_report`'s template/context, even though
+//!   pr-comment.md's "Check Runs" section describes the summary as
+//!   eventually being "built from the same template context". That
+//!   cross-module wiring is bigger later work, once a real run's
+//!   aggregate data exists in the shape `pr_comment.rs`'s `PrReport`
+//!   needs; see `github_checks.rs`'s module docs for the matching note
+//!   on its caller side.
+//! - **GitHub auth.** Every call resolves an installation token via
+//!   [`crate::roles::lookup_repo_owner`] +
+//!   [`crate::roles::installation_token_for_repo`] — the same lookup
+//!   chain `roles.rs`'s role resolution already uses, not reinvented
+//!   here ([`RunCoordinator::check_run_auth`]). Failure anywhere in that
+//!   chain (repo not registered, secrets missing, GitHub API error)
+//!   logs and is swallowed rather than failing the whole
+//!   `StartJob`/`CompleteShard`/close-run call — a Check Run is a
+//!   best-effort side channel, the same degrade-and-log posture
+//!   `reconcile.rs`'s uninstall-of-disallowed-org already uses.
 
 pub mod logic;
 
+use crate::github_checks;
 use buffa::Enumeration;
 use cloud_ci_proto::ingest::v1::{
     BeginRunRequest, CompleteShardRequest, CompleteUploadRequest, Conclusion, CreateUploadRequest,
@@ -169,6 +219,19 @@ struct JobShardRow {
     conclusion: Option<String>,
     external_url: String,
     completed_at: Option<i64>,
+}
+
+/// One Check Run this run has created (`check_run` table — see
+/// `coordinator` module docs' storage design). Keyed by `check_name`,
+/// unique within this DO instance (one run): `(run, check_name)`
+/// first-seen-wins per byo-ci.md's "Checks and scopes".
+#[derive(Debug, Clone, Deserialize)]
+struct CheckRunRow {
+    check_name: String,
+    github_check_run_id: i64,
+    status: String,
+    conclusion: Option<String>,
+    created_at: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -435,6 +498,8 @@ impl RunCoordinator {
 
         self.project_run_to_d1(&run_row).await?;
         self.project_job_to_d1(&run_row.id, &job_row).await?;
+        self.create_check_runs_for_job(sql, &run_row, &req.check_names)
+            .await?;
 
         Response::from_json(&StartJobOutcome { job_id })
     }
@@ -796,6 +861,10 @@ impl RunCoordinator {
             }
         }
 
+        let check_names = decode_string_list(&job_row.check_names)?;
+        self.update_check_runs_for_job(sql, &run_row, &check_names)
+            .await?;
+
         Response::from_json(&CompleteShardOutcome {})
     }
 
@@ -873,6 +942,7 @@ impl RunCoordinator {
         update_run_status(sql, &run_row.id, next_state)?;
         let run_row = require_run(sql)?;
         self.project_run_to_d1(&run_row).await?;
+        self.finalize_check_runs(sql, &run_row).await?;
 
         let status = run_status_of(&run_row)?;
         Response::from_json(&CloseRunOutcome {
@@ -1061,6 +1131,311 @@ impl RunCoordinator {
         .await?;
         Ok(())
     }
+
+    async fn project_check_run_to_d1(&self, run_id: &str, row: &CheckRunRow) -> worker::Result<()> {
+        let db = self.env.d1("DB")?;
+        let now_ms = worker::Date::now().as_millis();
+        let id = crate::ulid::generate(now_ms)
+            .map_err(|e| worker::Error::RustError(format!("ulid generation failed: {e}")))?;
+        db.prepare(
+            "INSERT INTO check_runs (id, run_id, check_name, github_check_run_id, status, conclusion, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+             ON CONFLICT (run_id, check_name) DO UPDATE SET \
+               status = excluded.status, \
+               conclusion = excluded.conclusion",
+        )
+        .bind(&[
+            JsValue::from_str(&id),
+            JsValue::from_str(run_id),
+            JsValue::from_str(&row.check_name),
+            JsValue::from_f64(row.github_check_run_id as f64),
+            JsValue::from_str(&row.status),
+            row.conclusion
+                .clone()
+                .map_or(JsValue::NULL, |v| JsValue::from_str(&v)),
+            JsValue::from_f64(row.created_at as f64),
+        ])?
+        .run()
+        .await?;
+        Ok(())
+    }
+
+    /// Best-effort resolution of the installation token needed to call
+    /// GitHub's Check Run API for `repo_id` — the same
+    /// `roles::lookup_repo_owner` + App-JWT-mint + installation-token
+    /// lookup chain `roles.rs`'s role resolution already uses (see
+    /// `roles::installation_token_for_repo`'s doc comment), reused rather
+    /// than reinvented. Returns `None` and logs rather than failing the
+    /// whole `StartJob`/`CompleteShard`/close-run call on any failure
+    /// (repo not registered, secrets missing, GitHub API error): a Check
+    /// Run is a best-effort side channel here, the same degrade-and-log
+    /// posture `reconcile.rs`'s uninstall-of-disallowed-org and `lib.rs`'s
+    /// own best-effort uninstall calls already use on GitHub API failure.
+    async fn check_run_auth(&self, repo_id: u64) -> Option<(String, String, String)> {
+        let owner_row = match crate::roles::lookup_repo_owner(&self.env, repo_id).await {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                worker::console_log!(
+                    "check run: repo {repo_id} is not registered with this deployment"
+                );
+                return None;
+            }
+            Err(e) => {
+                worker::console_log!("check run: repo owner lookup failed for {repo_id}: {e}");
+                return None;
+            }
+        };
+        let now_s = (worker::Date::now().as_millis() / 1000) as i64;
+        match crate::roles::installation_token_for_repo(&self.env, &owner_row, now_s).await {
+            Ok(token) => Some((token.token, owner_row.owner_login, owner_row.repo_name)),
+            Err(e) => {
+                worker::console_log!(
+                    "check run: installation token exchange failed for repo {repo_id}: {e}"
+                );
+                None
+            }
+        }
+    }
+
+    /// Creates any name in `check_names` this run has not already
+    /// created a Check Run for (byo-ci.md's "Checks and scopes": "the
+    /// Worker creates any check name it hasn't seen yet for this run on
+    /// the first `StartJob` that names it"). `check_names` empty, or
+    /// every named check already created, makes no GitHub API call at
+    /// all — the happy "no checks" path stays a no-op (round scope item
+    /// 4).
+    async fn create_check_runs_for_job(
+        &self,
+        sql: &SqlStorage,
+        run_row: &RunRow,
+        check_names: &[String],
+    ) -> worker::Result<()> {
+        if check_names.is_empty() {
+            return Ok(());
+        }
+        let already_created: Vec<String> = read_all_check_runs(sql)?
+            .into_iter()
+            .map(|r| r.check_name)
+            .collect();
+        let new_names = logic::new_check_names(&already_created, check_names);
+        if new_names.is_empty() {
+            return Ok(());
+        }
+        let Some((token, owner, repo)) = self.check_run_auth(run_row.repo_id as u64).await else {
+            return Ok(());
+        };
+        for name in new_names {
+            let request = github_checks::CreateCheckRunRequest {
+                name: name.clone(),
+                head_sha: run_row.sha.clone(),
+                status: Some(github_checks::CheckRunStatus::Queued),
+                conclusion: None,
+                details_url: (!run_row.external_url.is_empty())
+                    .then(|| run_row.external_url.clone()),
+                output: Some(github_checks::CheckRunOutput {
+                    title: name.clone(),
+                    summary: "Waiting for jobs to report.".to_string(),
+                    text: None,
+                }),
+            };
+            match github_checks::create_check_run(&token, &owner, &repo, &request).await {
+                Ok(check_run) => {
+                    let now_ms = worker::Date::now().as_millis() as i64;
+                    insert_check_run(sql, &name, check_run.id, "queued", now_ms)?;
+                    if let Some(row) = read_check_run(sql, &name)? {
+                        self.project_check_run_to_d1(&run_row.id, &row).await?;
+                    }
+                }
+                Err(e) => {
+                    worker::console_log!("check run: create {name} failed: {e}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Updates every already-created Check Run named in `check_names`
+    /// with a fresh shard-table summary covering every job attached to
+    /// it (pr-comment.md's "Check Runs": "if a check name is shared by
+    /// several jobs, the summary covers all of them"), reading the
+    /// DO's own state, not `pr_comment.rs`'s template (round scope
+    /// boundary — see `coordinator` module docs). A name with no
+    /// check-run row yet (not created by `StartJob`, which should never
+    /// happen since `CompleteShard` only names checks a job already
+    /// declared) is silently skipped rather than created here —
+    /// creation only ever happens from `StartJob`.
+    async fn update_check_runs_for_job(
+        &self,
+        sql: &SqlStorage,
+        run_row: &RunRow,
+        check_names: &[String],
+    ) -> worker::Result<()> {
+        let mut to_update = Vec::new();
+        for name in check_names {
+            if read_check_run(sql, name)?.is_some() {
+                to_update.push(name.clone());
+            }
+        }
+        if to_update.is_empty() {
+            return Ok(());
+        }
+        let Some((token, owner, repo)) = self.check_run_auth(run_row.repo_id as u64).await else {
+            return Ok(());
+        };
+        for name in to_update {
+            let Some(check_run_row) = read_check_run(sql, &name)? else {
+                continue;
+            };
+            let rows = check_summary_rows(sql, &name)?;
+            let request = github_checks::UpdateCheckRunRequest {
+                status: Some(github_checks::CheckRunStatus::InProgress),
+                output: Some(github_checks::CheckRunOutput {
+                    title: name.clone(),
+                    summary: logic::render_check_summary(&rows),
+                    text: None,
+                }),
+                ..Default::default()
+            };
+            match github_checks::update_check_run(
+                &token,
+                &owner,
+                &repo,
+                check_run_row.github_check_run_id as u64,
+                &request,
+            )
+            .await
+            {
+                Ok(_) => {
+                    update_check_run_state(sql, &name, "in_progress", None)?;
+                    if let Some(row) = read_check_run(sql, &name)? {
+                        self.project_check_run_to_d1(&run_row.id, &row).await?;
+                    }
+                }
+                Err(e) => {
+                    worker::console_log!("check run: update {name} failed: {e}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Finalizes every Check Run this run created (`handle_close_run`'s
+    /// only caller): `status: completed`, `conclusion` scoped to just the
+    /// jobs attached to that check (pr-comment.md: "there is no aggregate
+    /// check ... a check only reflects the jobs that named it"), computed
+    /// via [`logic::run_conclusion_from_jobs`] — the same worst-of logic
+    /// `handle_close_run` already uses for the run's own conclusion, not
+    /// duplicated here. Idempotent: a check already `completed` (an
+    /// earlier close attempt that got this far before a redelivered
+    /// close signal arrived) is skipped.
+    async fn finalize_check_runs(&self, sql: &SqlStorage, run_row: &RunRow) -> worker::Result<()> {
+        let check_runs = read_all_check_runs(sql)?;
+        if check_runs.is_empty() {
+            return Ok(());
+        }
+        let Some((token, owner, repo)) = self.check_run_auth(run_row.repo_id as u64).await else {
+            return Ok(());
+        };
+        for check_run_row in check_runs {
+            if check_run_row.status == "completed" {
+                continue;
+            }
+            let rows = check_summary_rows(sql, &check_run_row.check_name)?;
+            let conclusion = logic::run_conclusion_from_jobs(
+                &rows.iter().filter_map(|r| r.conclusion).collect::<Vec<_>>(),
+            );
+            let request = github_checks::UpdateCheckRunRequest {
+                status: Some(github_checks::CheckRunStatus::Completed),
+                conclusion: Some(check_run_conclusion_of(conclusion)),
+                output: Some(github_checks::CheckRunOutput {
+                    title: check_run_row.check_name.clone(),
+                    summary: logic::render_check_summary(&rows),
+                    text: None,
+                }),
+                ..Default::default()
+            };
+            match github_checks::update_check_run(
+                &token,
+                &owner,
+                &repo,
+                check_run_row.github_check_run_id as u64,
+                &request,
+            )
+            .await
+            {
+                Ok(_) => {
+                    update_check_run_state(
+                        sql,
+                        &check_run_row.check_name,
+                        "completed",
+                        Some(conclusion_db_name(conclusion)),
+                    )?;
+                    if let Some(row) = read_check_run(sql, &check_run_row.check_name)? {
+                        self.project_check_run_to_d1(&run_row.id, &row).await?;
+                    }
+                }
+                Err(e) => {
+                    worker::console_log!(
+                        "check run: finalize {} failed: {e}",
+                        check_run_row.check_name
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Every job attached to `check_name` (its `check_names` JSON column
+/// contains it), as rows for [`logic::render_check_summary`] — the data
+/// `update_check_runs_for_job`/`finalize_check_runs` read, independent
+/// of `pr_comment.rs`'s template context (`coordinator` module docs'
+/// scope boundary).
+fn check_summary_rows(
+    sql: &SqlStorage,
+    check_name: &str,
+) -> worker::Result<Vec<logic::CheckSummaryJobRow>> {
+    let mut rows = Vec::new();
+    for job in read_all_jobs(sql)? {
+        let names = decode_string_list(&job.check_names)?;
+        if !names.iter().any(|n| n == check_name) {
+            continue;
+        }
+        let completed_shards = count_uploaded_shards(sql, &job.id)? as u32;
+        let conclusion = job
+            .conclusion
+            .as_deref()
+            .map(|c| {
+                conclusion_from_db_str(c).ok_or_else(|| {
+                    worker::Error::RustError(format!("unknown stored conclusion {c}"))
+                })
+            })
+            .transpose()?;
+        rows.push(logic::CheckSummaryJobRow {
+            job_name: job.job_name,
+            completed_shards,
+            shard_total: job.shard_total as u32,
+            conclusion,
+        });
+    }
+    Ok(rows)
+}
+
+/// Maps the proto [`Conclusion`] `finalize_check_runs` computes (via
+/// [`logic::run_conclusion_from_jobs`]) to the GitHub REST
+/// [`github_checks::CheckRunConclusion`] value the `PATCH` request
+/// carries. `CONCLUSION_UNSPECIFIED` maps to `Neutral` — GitHub's own
+/// "none of the above" value — though it is never actually reached here:
+/// a check only reaches [`finalize_check_runs`] once every job attached
+/// to it has concluded with a real conclusion.
+fn check_run_conclusion_of(c: Conclusion) -> github_checks::CheckRunConclusion {
+    match c {
+        Conclusion::CONCLUSION_SUCCESS => github_checks::CheckRunConclusion::Success,
+        Conclusion::CONCLUSION_FAILURE => github_checks::CheckRunConclusion::Failure,
+        Conclusion::CONCLUSION_CANCELLED => github_checks::CheckRunConclusion::Cancelled,
+        Conclusion::CONCLUSION_SKIPPED => github_checks::CheckRunConclusion::Skipped,
+        Conclusion::CONCLUSION_UNSPECIFIED => github_checks::CheckRunConclusion::Neutral,
+    }
 }
 
 fn run_state_of(row: &RunRow) -> worker::Result<RunState> {
@@ -1146,6 +1521,16 @@ fn ensure_schema(sql: &SqlStorage) -> worker::Result<()> {
             is_canonical INTEGER NOT NULL DEFAULT 1, \
             parsed INTEGER NOT NULL DEFAULT 0, \
             summary TEXT \
+        )",
+        None,
+    )?;
+    sql.exec(
+        "CREATE TABLE IF NOT EXISTS check_run ( \
+            check_name TEXT PRIMARY KEY, \
+            github_check_run_id INTEGER NOT NULL, \
+            status TEXT NOT NULL, \
+            conclusion TEXT, \
+            created_at INTEGER NOT NULL \
         )",
         None,
     )?;
@@ -1669,6 +2054,73 @@ fn unset_other_canonical_reports(
             SqlStorageValue::from(keep_id),
         ],
     )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Check Runs
+// ---------------------------------------------------------------------------
+
+const CHECK_RUN_COLUMNS: &str = "check_name, github_check_run_id, status, conclusion, created_at";
+
+fn read_check_run(sql: &SqlStorage, check_name: &str) -> worker::Result<Option<CheckRunRow>> {
+    let rows: Vec<CheckRunRow> = sql
+        .exec(
+            &format!("SELECT {CHECK_RUN_COLUMNS} FROM check_run WHERE check_name = ?1"),
+            vec![SqlStorageValue::from(check_name)],
+        )?
+        .to_array()?;
+    Ok(rows.into_iter().next())
+}
+
+fn read_all_check_runs(sql: &SqlStorage) -> worker::Result<Vec<CheckRunRow>> {
+    sql.exec(&format!("SELECT {CHECK_RUN_COLUMNS} FROM check_run"), None)?
+        .to_array()
+}
+
+fn insert_check_run(
+    sql: &SqlStorage,
+    check_name: &str,
+    github_check_run_id: u64,
+    status: &str,
+    created_at_ms: i64,
+) -> worker::Result<()> {
+    sql.exec(
+        "INSERT INTO check_run (check_name, github_check_run_id, status, conclusion, created_at) \
+         VALUES (?1, ?2, ?3, NULL, ?4)",
+        vec![
+            SqlStorageValue::from(check_name),
+            SqlStorageValue::try_from_i64(github_check_run_id as i64)?,
+            SqlStorageValue::from(status),
+            SqlStorageValue::try_from_i64(created_at_ms)?,
+        ],
+    )?;
+    Ok(())
+}
+
+fn update_check_run_state(
+    sql: &SqlStorage,
+    check_name: &str,
+    status: &str,
+    conclusion: Option<&str>,
+) -> worker::Result<()> {
+    match conclusion {
+        Some(c) => sql.exec(
+            "UPDATE check_run SET status = ?1, conclusion = ?2 WHERE check_name = ?3",
+            vec![
+                SqlStorageValue::from(status),
+                SqlStorageValue::from(c),
+                SqlStorageValue::from(check_name),
+            ],
+        )?,
+        None => sql.exec(
+            "UPDATE check_run SET status = ?1 WHERE check_name = ?2",
+            vec![
+                SqlStorageValue::from(status),
+                SqlStorageValue::from(check_name),
+            ],
+        )?,
+    };
     Ok(())
 }
 

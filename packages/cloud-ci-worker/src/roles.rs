@@ -389,17 +389,19 @@ pub async fn resolve_role(
     }
 }
 
-/// The GitHub-calling half of [`resolve_role`]'s cache-miss path: mints
-/// an App JWT, exchanges it for the owning installation's token, calls
-/// the collaborator-permission endpoint, and maps the result. Split out
-/// so [`resolve_role`]'s fallback logic (step 3 above) has one `Err` path
-/// to catch, regardless of which sub-step failed.
-async fn resolve_role_from_github(
+/// Mints an App JWT and exchanges it for the installation token owning
+/// `owner_row`'s repo — the common first half every GitHub-REST-calling
+/// path in this crate needs once it has resolved a `repo_id` to its
+/// owning installation ([`lookup_repo_owner`]). Shared by
+/// [`resolve_role_from_github`] (below) and `coordinator`'s Check Run
+/// wiring (docs/design/byo-ci.md's "Checks and scopes"), so both reuse
+/// one GitHub-App-JWT-minting + installation-token-exchange
+/// implementation instead of duplicating it.
+pub async fn installation_token_for_repo(
     env: &Env,
     owner_row: &RepoOwnerRow,
-    github_login: &str,
     now_s: i64,
-) -> Result<Role, RolesError> {
+) -> Result<crate::github_app::InstallationToken, RolesError> {
     let private_key_pem = env
         .secret("GITHUB_APP_PRIVATE_KEY")
         .map_err(|e| RolesError(format!("GITHUB_APP_PRIVATE_KEY is not configured: {e}")))?
@@ -413,10 +415,23 @@ async fn resolve_role_from_github(
     let app_jwt = crate::github_app::mint_app_jwt(&private_key_pem, app_id, now_s)
         .await
         .map_err(|e| RolesError(e.to_string()))?;
-    let installation_token =
-        crate::github_app::fetch_installation_token(&app_jwt, owner_row.installation_id)
-            .await
-            .map_err(|e| RolesError(e.to_string()))?;
+    crate::github_app::fetch_installation_token(&app_jwt, owner_row.installation_id)
+        .await
+        .map_err(|e| RolesError(e.to_string()))
+}
+
+/// The GitHub-calling half of [`resolve_role`]'s cache-miss path: mints
+/// an App JWT, exchanges it for the owning installation's token, calls
+/// the collaborator-permission endpoint, and maps the result. Split out
+/// so [`resolve_role`]'s fallback logic (step 3 above) has one `Err` path
+/// to catch, regardless of which sub-step failed.
+async fn resolve_role_from_github(
+    env: &Env,
+    owner_row: &RepoOwnerRow,
+    github_login: &str,
+    now_s: i64,
+) -> Result<Role, RolesError> {
+    let installation_token = installation_token_for_repo(env, owner_row, now_s).await?;
     let permission = fetch_collaborator_permission(
         &installation_token.token,
         &owner_row.owner_login,
