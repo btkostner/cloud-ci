@@ -66,7 +66,7 @@ pub struct GetRunOutcome {
     pub jobs: Vec<JobState>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct ErrorBody {
     error: String,
 }
@@ -637,7 +637,11 @@ impl RunCoordinatorStore {
             200..=299 => response.json::<R>().await.map_err(|e| stub_error(path, e)),
             404 => Err(CoordinatorError::NotFound),
             409 => {
-                let detail = response.text().await.unwrap_or_default();
+                let detail = response
+                    .json::<ErrorBody>()
+                    .await
+                    .map(|b| b.error)
+                    .unwrap_or_else(|_| "shard_total or expect_jobs conflict".to_string());
                 Err(CoordinatorError::Conflict(detail))
             }
             status => {
