@@ -1,10 +1,14 @@
 //! Domain model for third-party CI report parsing.
 //!
-//! JUnit XML, Vitest's JSON reporter, and Playwright's JSON reporter are in scope so far; other
-//! report kinds named in `docs/architecture.md`'s package table (lcov, cobertura, ...) are later
-//! work and intentionally have no surface here yet.
+//! JUnit XML, Vitest's JSON reporter, and Playwright's JSON reporter share one domain model
+//! ([`TestSuites`] and friends) because they all report test pass/fail outcomes. `lcov` reports
+//! coverage data instead — which lines executed, not which tests passed — so [`lcov`] has its
+//! own, separate domain model ([`LcovReport`] and friends); see that module's doc comment for
+//! why. Other report kinds named in `docs/architecture.md`'s package table (cobertura, ...) are
+//! later work and intentionally have no surface here yet.
 
 pub mod junit;
+pub mod lcov;
 pub mod playwright;
 pub mod vitest;
 
@@ -93,6 +97,63 @@ pub struct Failure {
     pub message: Option<String>,
     /// Element text content, typically a stack trace.
     pub stack_trace: Option<String>,
+}
+
+/// A parsed lcov tracefile: coverage data for zero or more source files. See [`lcov`]'s module
+/// doc comment for why this is a separate model from [`TestSuites`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct LcovReport {
+    pub source_files: Vec<SourceFile>,
+}
+
+/// One `SF:`/`KF:`-delimited section: one source file's coverage data.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourceFile {
+    /// The `TN:` record preceding this section, if the tracefile had one. Names the testcase
+    /// the section's data belongs to; `None` when the tracefile never emits `TN:` at all (the
+    /// common case for a single `lcov --capture` run with no `--test-name`).
+    pub test_name: Option<String>,
+    /// `SF:`/`KF:` record value: path to the source file.
+    pub path: String,
+    /// `DA:` records: per-line execution counts. This is the data
+    /// `docs/design/byo-ci.md`'s "Native: line-hit union" merge strategy needs.
+    pub lines: Vec<LineCoverage>,
+    /// `FNDA:` records: per-function execution counts.
+    pub functions: Vec<FunctionCoverage>,
+    /// `BRDA:` records: per-branch execution counts.
+    pub branches: Vec<BranchCoverage>,
+}
+
+/// One `DA:` record: a source line's execution count.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LineCoverage {
+    pub line: u32,
+    pub hit_count: u64,
+    /// Optional MD5 checksum of the line's source text, present only when the writer ran with
+    /// checksum generation enabled (`geninfo --checksum`; off by default).
+    pub checksum: Option<String>,
+}
+
+/// One `FNDA:` record: a function's execution count.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FunctionCoverage {
+    pub name: String,
+    pub hit_count: u64,
+}
+
+/// One `BRDA:` record: a branch's execution count.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BranchCoverage {
+    pub line: u32,
+    /// `<block>` field, with its optional leading exception/fallthrough/unreachable flag
+    /// (`e`/`f`/`U`) stripped; see [`lcov`]'s module doc comment.
+    pub block: u32,
+    /// `<branch>` field: an index or a human-readable string identifying this edge, depending
+    /// on the toolchain that produced the tracefile.
+    pub branch: String,
+    /// `<taken>` field: `None` when the branch's containing block never executed (`-` on the
+    /// wire); `Some` with the hit count otherwise.
+    pub taken: Option<u64>,
 }
 
 #[cfg(test)]
