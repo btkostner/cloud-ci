@@ -1,4 +1,8 @@
 mod cli;
+// Wired into `upload` orchestration in a later commit; exercised by its own
+// tests until then.
+#[allow(dead_code)]
+mod connect_client;
 mod identity;
 
 use std::process::ExitCode;
