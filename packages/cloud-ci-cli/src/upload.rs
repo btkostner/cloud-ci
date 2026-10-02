@@ -399,6 +399,11 @@ fn fetch_github_actions_oidc_token(request_url: &str, bearer: &str) -> Result<St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::ReportArg;
+    use std::collections::HashMap;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn expand_glob_errors_when_nothing_matches() {
@@ -436,5 +441,301 @@ mod tests {
         let env = crate::identity::MapEnv::new(&[]);
         let token = resolve_credential(None, &env);
         assert_eq!(token, Ok(None));
+    }
+
+    const FIXTURE_ETAG: &str = "etag-abc123";
+
+    struct CapturedRequest {
+        method: String,
+        path: String,
+        headers: HashMap<String, String>,
+        body: Vec<u8>,
+    }
+
+    fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    /// Reads one HTTP/1.1 request off a real socket: request line, headers,
+    /// and a `content-length` body. Minimal by design, matching
+    /// `connect_client.rs`'s `serve_once` approach rather than pulling in a
+    /// test-only HTTP server dependency.
+    fn read_request(stream: &mut TcpStream) -> std::io::Result<CapturedRequest> {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let header_end = loop {
+            let n = stream.read(&mut chunk)?;
+            if n == 0 {
+                break buf.len();
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
+                break pos + 4;
+            }
+        };
+
+        let header_text = String::from_utf8_lossy(&buf[..header_end.min(buf.len())]).into_owned();
+        let mut lines = header_text.split("\r\n");
+        let request_line = lines.next().unwrap_or_default();
+        let mut request_parts = request_line.split_whitespace();
+        let method = request_parts.next().unwrap_or_default().to_string();
+        let path = request_parts.next().unwrap_or_default().to_string();
+
+        let mut headers = HashMap::new();
+        for line in lines {
+            if let Some((key, value)) = line.split_once(':') {
+                headers.insert(key.trim().to_lowercase(), value.trim().to_string());
+            }
+        }
+
+        let content_length: usize = headers
+            .get("content-length")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+
+        let mut body = buf[header_end.min(buf.len())..].to_vec();
+        while body.len() < content_length {
+            let n = stream.read(&mut chunk)?;
+            if n == 0 {
+                break;
+            }
+            body.extend_from_slice(&chunk[..n]);
+        }
+        body.truncate(content_length);
+
+        Ok(CapturedRequest {
+            method,
+            path,
+            headers,
+            body,
+        })
+    }
+
+    fn write_response(
+        stream: &mut TcpStream,
+        status: u16,
+        extra_headers: &[(&str, String)],
+        body: &[u8],
+    ) -> std::io::Result<()> {
+        let mut response = format!(
+            "HTTP/1.1 {status} OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n",
+            body.len()
+        );
+        for (key, value) in extra_headers {
+            response.push_str(&format!("{key}: {value}\r\n"));
+        }
+        response.push_str("\r\n");
+        stream.write_all(response.as_bytes())?;
+        stream.write_all(body)?;
+        stream.flush()
+    }
+
+    /// Canned responses for the full `BeginRun` -> `CompleteShard` sequence
+    /// one `--report` upload produces. Response bodies are built by
+    /// serializing the real generated proto response types (not hand-written
+    /// JSON strings), so the shape is guaranteed to match what the real
+    /// client decodes.
+    fn fixture_response(request: &CapturedRequest) -> (u16, Vec<(&'static str, String)>, Vec<u8>) {
+        match (request.method.as_str(), request.path.as_str()) {
+            ("POST", "/cloud_ci.ingest.v1.IngestService/BeginRun") => (
+                200,
+                vec![],
+                serde_json::to_vec(&BeginRunResponse {
+                    run_id: "run-1".into(),
+                    ingest_token: "ingest-token-1".into(),
+                    ..Default::default()
+                })
+                .unwrap_or_default(),
+            ),
+            ("POST", "/cloud_ci.ingest.v1.IngestService/StartJob") => (
+                200,
+                vec![],
+                serde_json::to_vec(&StartJobResponse {
+                    job_id: "job-1".into(),
+                    ..Default::default()
+                })
+                .unwrap_or_default(),
+            ),
+            ("POST", "/cloud_ci.ingest.v1.IngestService/CreateUpload") => (
+                200,
+                vec![],
+                serde_json::to_vec(&CreateUploadResponse {
+                    upload_id: "upload-1".into(),
+                    part_count: 1,
+                    part_size_bytes: MAX_SINGLE_PART_BYTES,
+                    already_complete: false,
+                    ..Default::default()
+                })
+                .unwrap_or_default(),
+            ),
+            ("PUT", "/ingest/v1/uploads/upload-1/parts/1") => {
+                (200, vec![("etag", FIXTURE_ETAG.to_string())], Vec::new())
+            }
+            ("POST", "/cloud_ci.ingest.v1.IngestService/CompleteUpload") => (
+                200,
+                vec![],
+                serde_json::to_vec(&CompleteUploadResponse::default()).unwrap_or_default(),
+            ),
+            ("POST", "/cloud_ci.ingest.v1.IngestService/SubmitReport") => (
+                200,
+                vec![],
+                serde_json::to_vec(&SubmitReportResponse::default()).unwrap_or_default(),
+            ),
+            ("POST", "/cloud_ci.ingest.v1.IngestService/CompleteShard") => (
+                200,
+                vec![],
+                serde_json::to_vec(&CompleteShardResponse::default()).unwrap_or_default(),
+            ),
+            _ => (
+                404,
+                vec![],
+                br#"{"code":"not_found","message":"unhandled fixture path"}"#.to_vec(),
+            ),
+        }
+    }
+
+    /// Starts a background server that accepts exactly `request_count` real
+    /// socket connections, parses each request, replies from
+    /// `fixture_response`, and records every request it saw for later
+    /// assertions.
+    fn start_fixture_server(
+        request_count: usize,
+    ) -> std::io::Result<(String, Arc<Mutex<Vec<CapturedRequest>>>)> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let captured: Arc<Mutex<Vec<CapturedRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_for_thread = Arc::clone(&captured);
+
+        std::thread::spawn(move || {
+            for _ in 0..request_count {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let Ok(request) = read_request(&mut stream) else {
+                    continue;
+                };
+                let (status, headers, body) = fixture_response(&request);
+                let _ = write_response(&mut stream, status, &headers, &body);
+                if let Ok(mut log) = captured_for_thread.lock() {
+                    log.push(request);
+                }
+            }
+        });
+
+        Ok((format!("http://{addr}"), captured))
+    }
+
+    /// Proves the whole `BeginRun` -> `StartJob` -> `CreateUpload` -> `PUT`
+    /// -> `CompleteUpload` -> `SubmitReport` -> `CompleteShard` sequence
+    /// actually executes over real sockets with the real glob/scope
+    /// resolution and a real file on disk, not just that the calls are
+    /// wired in the right order by inspection.
+    #[test]
+    fn full_upload_sequence_executes_against_a_real_http_fixture() -> Result<(), String> {
+        let (base_url, captured) = start_fixture_server(7).map_err(|e| e.to_string())?;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "cloud-ci-cli-upload-fixture-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&tmp);
+        let report_path = tmp.join("junit.xml");
+        std::fs::write(
+            &report_path,
+            b"<testsuite name=\"smoke\" tests=\"1\" failures=\"0\">\
+              <testcase classname=\"smoke\" name=\"it_works\"/></testsuite>",
+        )
+        .map_err(|e| e.to_string())?;
+
+        let args = UploadArgs {
+            job: Some("smoke".to_string()),
+            reports: vec![ReportArg {
+                kind: "junit".to_string(),
+                glob: report_path.to_string_lossy().into_owned(),
+            }],
+            sites: vec![],
+            checks: vec![],
+            conclusion: Some(Conclusion::Success),
+            sha: Some("deadbeef".to_string()),
+            run_key: Some("manual/fixture".to_string()),
+            attempt: Some(1),
+            repo_id: Some(1),
+            server_url: Some(base_url),
+            token: Some("initial-token".to_string()),
+        };
+        let env = crate::identity::MapEnv::new(&[]);
+
+        let result = run(&args, &env);
+        let _ = std::fs::remove_dir_all(&tmp);
+        result.map_err(|e| format!("expected Ok(()), got Err: {e}"))?;
+
+        let log = captured
+            .lock()
+            .map_err(|_| "captured request log poisoned".to_string())?;
+        assert_eq!(log.len(), 7, "expected 7 requests, got {}", log.len());
+
+        // BeginRun authenticates with the original --token; every later call
+        // must switch to the run-scoped ingest_token BeginRun returned.
+        let put = log
+            .iter()
+            .find(|r| r.method == "PUT")
+            .ok_or_else(|| "no PUT request captured".to_string())?;
+        assert_eq!(
+            put.headers.get("authorization").map(String::as_str),
+            Some("Bearer ingest-token-1"),
+            "PUT must carry the BeginRun-issued ingest token, not the original --token"
+        );
+        assert!(
+            put.body.starts_with(b"<testsuite"),
+            "PUT body should be the report file's own bytes"
+        );
+
+        let begin_run = log
+            .iter()
+            .find(|r| r.path == "/cloud_ci.ingest.v1.IngestService/BeginRun")
+            .ok_or_else(|| "no BeginRun request captured".to_string())?;
+        assert_eq!(
+            begin_run.headers.get("authorization").map(String::as_str),
+            Some("Bearer initial-token"),
+            "BeginRun must carry the original --token"
+        );
+
+        // The ETag the PUT fixture response returned must flow, unmodified,
+        // into CompleteUpload's parts[0].etag.
+        let complete_upload = log
+            .iter()
+            .find(|r| r.path == "/cloud_ci.ingest.v1.IngestService/CompleteUpload")
+            .ok_or_else(|| "no CompleteUpload request captured".to_string())?;
+        let complete_upload_body: serde_json::Value =
+            serde_json::from_slice(&complete_upload.body).map_err(|e| e.to_string())?;
+        let parts = complete_upload_body
+            .get("parts")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| "CompleteUpload had no parts array".to_string())?;
+        assert_eq!(parts.len(), 1);
+        assert_eq!(
+            parts[0].get("number").and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            parts[0].get("etag").and_then(|v| v.as_str()),
+            Some(FIXTURE_ETAG),
+            "CompleteUpload must forward the exact ETag the PUT response returned, not a hardcoded placeholder"
+        );
+
+        let complete_shard = log
+            .iter()
+            .find(|r| r.path == "/cloud_ci.ingest.v1.IngestService/CompleteShard")
+            .ok_or_else(|| "no CompleteShard request captured".to_string())?;
+        let complete_shard_body: serde_json::Value =
+            serde_json::from_slice(&complete_shard.body).map_err(|e| e.to_string())?;
+        assert_eq!(
+            complete_shard_body
+                .get("conclusion")
+                .and_then(|v| v.as_str()),
+            Some("CONCLUSION_SUCCESS")
+        );
+
+        Ok(())
     }
 }
