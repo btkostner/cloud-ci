@@ -539,12 +539,6 @@ impl PullRequestStateStore {
         self.call(Method::Post, "/notify-dirty", Some(req)).await
     }
 
-    /// `GET /get-state` — see [`PullRequestState::handle_get_state`]'s
-    /// doc comment; debug/smoke-test introspection only.
-    pub async fn get_state(&self) -> Result<serde_json::Value, PullRequestStateError> {
-        self.call(Method::Get, "/get-state", None::<&()>).await
-    }
-
     pub async fn update_head_sha(
         &self,
         req: &UpdateHeadShaRequest,

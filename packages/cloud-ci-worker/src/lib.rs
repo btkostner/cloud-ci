@@ -27,7 +27,6 @@ use cloud_ci_proto::ingest::v1::{
 };
 use connect::{Code, Codec, ConnectError, NegotiationError, negotiate};
 use coordinator::{CoordinatorError, RunCoordinatorStore};
-use pull_request_state::PullRequestStateStore;
 use worker::{Context, Date, Env, Headers, Method, Request, Response, Result, event};
 
 #[event(fetch)]
@@ -44,14 +43,6 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // verified before anything else touches the request).
     if req.method() == Method::Post && req.path() == "/webhooks/github" {
         return handle_github_webhook(req, &env).await;
-    }
-    // Debug-only introspection of a `PullRequestState` instance's row
-    // (no auth, no production use — smoke-test convenience, same
-    // posture as `PullRequestState`'s own `/get-state` DO route, which
-    // this just exposes over HTTP so it's reachable without a direct DO
-    // binding).
-    if req.method() == Method::Get && req.path().starts_with("/debug/pull-request-state/") {
-        return handle_pull_request_state_debug(&req, &env).await;
     }
     // Human login (docs/design/auth.md § "Human auth: GitHub OAuth"), not
     // a Connect RPC — plain browser-navigated GET requests.
@@ -1227,36 +1218,6 @@ async fn handle_pull_request_event(raw_body: &[u8], env: &Env) -> Result<Respons
             Err(worker::Error::RustError(e.to_string()))
         }
     }
-}
-
-/// `GET /debug/pull-request-state/{repo_id}/{pr_number}` — smoke-test-only
-/// introspection of one `PullRequestState` instance's row, via
-/// [`pull_request_state::PullRequestStateStore::get_state`]. No auth; not
-/// part of any documented API surface.
-async fn handle_pull_request_state_debug(req: &Request, env: &Env) -> Result<Response> {
-    let path = req.path();
-    let mut segments = path
-        .strip_prefix("/debug/pull-request-state/")
-        .unwrap_or_default()
-        .split('/');
-    let (Some(repo_id), Some(pr_number)) = (
-        segments.next().and_then(|s| s.parse::<u64>().ok()),
-        segments.next().and_then(|s| s.parse::<u64>().ok()),
-    ) else {
-        return Response::error(
-            "expected /debug/pull-request-state/{repo_id}/{pr_number}",
-            400,
-        );
-    };
-    let store = PullRequestStateStore::new(env, &pull_request_state::do_name(repo_id, pr_number))
-        .map_err(|e| {
-        worker::Error::RustError(format!("pull request state unavailable: {e}"))
-    })?;
-    let state = store
-        .get_state()
-        .await
-        .map_err(|e| worker::Error::RustError(format!("get_state failed: {e}")))?;
-    Response::from_json(&state)
 }
 
 fn coordinator_error(err: CoordinatorError) -> ConnectError {
