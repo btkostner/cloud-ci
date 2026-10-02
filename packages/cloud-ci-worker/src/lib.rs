@@ -5,8 +5,11 @@ pub mod github_app;
 pub mod github_checks;
 pub mod ingest_token;
 pub mod installations;
+pub mod oauth;
 pub mod oidc;
 pub mod reconcile;
+pub mod roles;
+pub mod session;
 pub mod ulid;
 pub mod webhook;
 
@@ -34,6 +37,14 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // verified before anything else touches the request).
     if req.method() == Method::Post && req.path() == "/webhooks/github" {
         return handle_github_webhook(req, &env).await;
+    }
+    // Human login (docs/design/auth.md § "Human auth: GitHub OAuth"), not
+    // a Connect RPC — plain browser-navigated GET requests.
+    if req.method() == Method::Get && req.path() == "/login" {
+        return handle_login(&req, &env).await;
+    }
+    if req.method() == Method::Get && req.path() == "/oauth/callback" {
+        return handle_oauth_callback(&req, &env).await;
     }
     if req.method() != Method::Post {
         return Response::error("method not allowed", 405);
@@ -671,6 +682,161 @@ async fn handle_upload_part(mut req: Request, env: &Env) -> Result<Response> {
     let headers = Headers::new();
     headers.set("etag", &info.sha256)?;
     Ok(Response::empty()?.with_headers(headers))
+}
+
+/// `GET /login` (docs/design/auth.md § "Human auth: GitHub OAuth"):
+/// builds the `github.com/login/oauth/authorize` redirect URL
+/// ([`oauth::authorize_url`]) with a fresh CSRF `state`
+/// ([`oauth::generate_state`]), stashes that state in a short-lived
+/// `cc_oauth_state` cookie, and 302-redirects the browser to GitHub.
+/// Fails closed (503) if `GITHUB_APP_CLIENT_ID` isn't configured yet —
+/// same posture as the webhook/OIDC paths before `cloud-ci setup
+/// github-app` has run (auth.md § "GitHub App setup": "the deployed
+/// Worker's webhook handler, OAuth callback, and OIDC/ingest paths all
+/// fail closed (503, 'not yet configured')").
+async fn handle_login(req: &Request, env: &Env) -> Result<Response> {
+    let client_id = match env.var("GITHUB_APP_CLIENT_ID") {
+        Ok(v) => v.to_string(),
+        Err(_) => return Response::error("GITHUB_APP_CLIENT_ID is not configured", 503),
+    };
+    let redirect_uri = match oauth_callback_url(req) {
+        Ok(url) => url,
+        Err(e) => return Response::error(format!("cannot build redirect_uri: {e}"), 500),
+    };
+    let state = match oauth::generate_state() {
+        Ok(s) => s,
+        Err(e) => return Response::error(format!("cannot generate oauth state: {e}"), 500),
+    };
+    let authorize_url = oauth::authorize_url(&client_id, &redirect_uri, &state);
+    // `Response::redirect` builds on `web_sys::Response::redirect()`, whose
+    // Fetch-spec "guard" is `immutable` — any attempt to add a header
+    // (e.g. `Set-Cookie`) afterward throws `TypeError: Can't modify
+    // immutable headers` (confirmed live under `wrangler dev`). Building
+    // the 302 from `Response::empty()` + a fresh, mutable `Headers`
+    // instead avoids that guard entirely.
+    let response_headers = Headers::new();
+    response_headers.set("location", &authorize_url)?;
+    response_headers.set(
+        "set-cookie",
+        &format!(
+            "{}={state}; Secure; HttpOnly; SameSite=Lax; Path=/; Max-Age={}",
+            oauth::OAUTH_STATE_COOKIE_NAME,
+            oauth::OAUTH_STATE_TTL_SECONDS
+        ),
+    )?;
+    Ok(Response::empty()?
+        .with_status(302)
+        .with_headers(response_headers))
+}
+
+/// `GET /oauth/callback` (docs/design/auth.md § "Human auth: GitHub
+/// OAuth"): verifies the `state` query parameter against the
+/// `cc_oauth_state` cookie [`handle_login`] set (CSRF — see
+/// `oauth.rs`'s module docs), exchanges the `code` for a user access
+/// token ([`oauth::exchange_code`]), calls `GET /user`
+/// ([`oauth::fetch_github_user`]), upserts the `users` row
+/// ([`oauth::upsert_user`]), creates a session
+/// ([`session::create_session`]), and sets the `__Host-cc_session`
+/// cookie exactly as auth.md specifies
+/// ([`session::build_set_cookie_header`]). Every failure path (missing/
+/// mismatched state, missing `code`, a rejected code exchange, a failed
+/// `GET /user` call) fails the request before any session is created —
+/// mirrors `handle_begin_run`'s "every failure path rejects the whole
+/// call" posture for machine auth.
+async fn handle_oauth_callback(req: &Request, env: &Env) -> Result<Response> {
+    let url = match req.url() {
+        Ok(u) => u,
+        Err(e) => return Response::error(format!("cannot parse request url: {e}"), 400),
+    };
+    let mut code: Option<String> = None;
+    let mut state: Option<String> = None;
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "code" => code = Some(value.into_owned()),
+            "state" => state = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+    let Some(code) = code else {
+        return Response::error("missing code query parameter", 400);
+    };
+    let Some(state) = state else {
+        return Response::error("missing state query parameter", 400);
+    };
+
+    let cookie_header = req.headers().get("cookie")?.unwrap_or_default();
+    let cookie_state = session::parse_cookie_header(&cookie_header, oauth::OAUTH_STATE_COOKIE_NAME);
+    // Ordinary equality compare, not constant-time — see oauth.rs's
+    // module docs "CSRF state" for why that's the right call here.
+    if cookie_state.as_deref() != Some(state.as_str()) {
+        return Response::error("oauth state mismatch", 400);
+    }
+
+    let client_id = match env.var("GITHUB_APP_CLIENT_ID") {
+        Ok(v) => v.to_string(),
+        Err(_) => return Response::error("GITHUB_APP_CLIENT_ID is not configured", 503),
+    };
+    let client_secret = match env.secret("GITHUB_APP_CLIENT_SECRET") {
+        Ok(v) => v.to_string(),
+        Err(_) => return Response::error("GITHUB_APP_CLIENT_SECRET is not configured", 503),
+    };
+    let redirect_uri = match oauth_callback_url(req) {
+        Ok(url) => url,
+        Err(e) => return Response::error(format!("cannot build redirect_uri: {e}"), 500),
+    };
+
+    let token = match oauth::exchange_code(&client_id, &client_secret, &code, &redirect_uri).await {
+        Ok(t) => t,
+        Err(e) => return Response::error(format!("oauth code exchange failed: {e}"), 400),
+    };
+    let github_user = match oauth::fetch_github_user(&token.access_token).await {
+        Ok(u) => u,
+        Err(e) => return Response::error(format!("GET /user failed: {e}"), 400),
+    };
+
+    let now_s = (Date::now().as_millis() / 1000) as i64;
+    let user_id = oauth::upsert_user(
+        env,
+        github_user.id,
+        &github_user.login,
+        github_user.email.as_deref(),
+        now_s,
+    )
+    .await?;
+
+    let session_id = match session::generate_session_id() {
+        Ok(id) => id,
+        Err(e) => return Response::error(format!("cannot generate session id: {e}"), 500),
+    };
+    let id_hash = session::hash_session_id(&session_id);
+    let expires_at = now_s + session::SESSION_TTL_SECONDS;
+    session::create_session(env, &id_hash, &user_id, now_s, expires_at).await?;
+
+    let mut response = Response::ok(format!("Logged in as {}", github_user.login))?;
+    response.headers_mut().append(
+        "set-cookie",
+        &session::build_set_cookie_header(&session_id, session::SESSION_TTL_SECONDS),
+    )?;
+    response.headers_mut().append(
+        "set-cookie",
+        &format!(
+            "{}=; Secure; HttpOnly; SameSite=Lax; Path=/; Max-Age=0",
+            oauth::OAUTH_STATE_COOKIE_NAME
+        ),
+    )?;
+    Ok(response)
+}
+
+/// This deployment's own `/oauth/callback` URL, derived from the
+/// incoming request — must exactly match what [`handle_login`] passed as
+/// `redirect_uri` to GitHub, since GitHub validates the callback's
+/// `redirect_uri` against the one used to start the flow.
+fn oauth_callback_url(req: &Request) -> std::result::Result<String, String> {
+    let url = req.url().map_err(|e| e.to_string())?;
+    let mut callback = url.clone();
+    callback.set_path("/oauth/callback");
+    callback.set_query(None);
+    Ok(callback.to_string())
 }
 
 /// `POST /webhooks/github` (docs/design/auth.md § "Webhook signature

@@ -45,3 +45,21 @@ GITHUB_APP_ID=999999
 # later, same as the other not-yet-built-setup-flow vars.
 CLOUD_CI_INGEST_AUDIENCE=https://ci.example.com/exchange
 GITHUB_ALLOWED_ORGS=acme-corp
+
+# Same [vars]-but-overridable-via-.dev.vars pattern as GITHUB_APP_ID
+# above (docs/design/auth.md § "Human auth: GitHub OAuth"): not secret
+# — src/oauth.rs's authorize-URL builder takes it as a plain argument.
+# Any value works for local dev; it does not need to match a real
+# GitHub App's client id.
+GITHUB_APP_CLIENT_ID=Iv1.localdevclientid
+
+# Required secret, same fail-loudly-if-unset pattern as
+# GITHUB_WEBHOOK_SECRET above: src/lib.rs's `GET /oauth/callback` route
+# refuses to exchange a `code` (503) when this is unset. Any non-empty
+# value works for local dev — the real code-exchange HTTP call to
+# github.com cannot be exercised without a real GitHub App's client
+# secret anyway (see docs/design/auth.md § "Human auth: GitHub OAuth"
+# and the round's report on what is/isn't live-verified). In production
+# this becomes a Secrets Store binding once `cloud-ci setup github-app`
+# exists.
+GITHUB_APP_CLIENT_SECRET=local-dev-oauth-client-secret

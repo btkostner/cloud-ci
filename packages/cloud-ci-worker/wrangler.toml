@@ -11,6 +11,7 @@ compatibility_date = "2026-09-01"
 # calls fail loudly rather than silently).
 [vars]
 GITHUB_APP_ID = ""
+GITHUB_APP_CLIENT_ID = ""
 GITHUB_ALLOWED_ORGS = ""
 # Public URL identifier `BeginRun`'s OIDC path matches a GitHub Actions
 # `id-token: write` JWT's `aud` claim against (docs/design/byo-ci.md §
