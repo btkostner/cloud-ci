@@ -9,6 +9,7 @@ pub mod oauth;
 pub mod oidc;
 pub mod pr_comment;
 pub mod pull_request_state;
+pub mod pull_request_webhook;
 pub mod reconcile;
 pub mod roles;
 pub mod session;
@@ -977,12 +978,14 @@ fn json_error(status: u16, message: &str) -> Result<Response> {
 /// `X-Hub-Signature-256` via [`webhook::verify_signature`], and rejects
 /// with 401 *before* parsing anything or touching D1 on any failure —
 /// the doc's explicit ordering requirement. `installation`,
-/// `installation_repositories` (see `src/installations.rs`), and
+/// `installation_repositories` (see `src/installations.rs`),
 /// `workflow_run` (see `src/workflow_run.rs` — only its `completed`
 /// action does anything, per docs/design/byo-ci.md's "Completion
-/// semantics") are handled this round; any other `X-GitHub-Event` gets a
-/// 200 "not handled" ack so GitHub does not retry-storm an event type
-/// this deployment doesn't act on yet
+/// semantics"), and `pull_request` (see `src/pull_request_webhook.rs` —
+/// `opened`/`synchronize`/`closed` are handled, per pr-comment.md's
+/// `PullRequestState` section) are handled this round; any other
+/// `X-GitHub-Event` gets a 200 "not handled" ack so GitHub does not
+/// retry-storm an event type this deployment doesn't act on yet
 /// (docs.github.com/en/webhooks/using-webhooks/handling-webhook-deliveries,
 /// accessed 2026-10-02: a non-2xx response causes GitHub to retry
 /// delivery).
@@ -1006,6 +1009,7 @@ async fn handle_github_webhook(mut req: Request, env: &Env) -> Result<Response> 
             handle_installation_repositories_event(&raw_body, env).await
         }
         Some("workflow_run") => handle_workflow_run_event(&raw_body, env).await,
+        Some("pull_request") => handle_pull_request_event(&raw_body, env).await,
         _ => Response::ok("event not handled"),
     }
 }
@@ -1193,6 +1197,27 @@ async fn handle_workflow_run_event(raw_body: &[u8], env: &Env) -> Result<Respons
         .map_err(|e| worker::Error::RustError(format!("close_run failed: {e}")))?;
 
     Response::ok("ok")
+}
+
+/// `pull_request` `opened`/`synchronize`/`closed` (docs/design/pr-comment.md
+/// § "`PullRequestState`: one writer per PR"; see
+/// `src/pull_request_webhook.rs` module docs for the full action-dispatch
+/// decision, the `closed`-no-op rationale, and why a redelivered `opened`
+/// is already idempotent). A malformed body is a 400; a DO-call failure
+/// propagates as a `worker::Error` so the Worker's default error response
+/// surfaces it — same posture as `handle_workflow_run_event`'s own `?`
+/// propagation on `RunCoordinatorStore` failures. Every other outcome
+/// (including the documented `closed`/unhandled-action no-ops) acks 200.
+async fn handle_pull_request_event(raw_body: &[u8], env: &Env) -> Result<Response> {
+    match pull_request_webhook::handle_pull_request_event(env, raw_body).await {
+        Ok(()) => Response::ok("ok"),
+        Err(pull_request_webhook::PullRequestWebhookError::MalformedPayload(msg)) => {
+            Response::error(format!("malformed pull_request payload: {msg}"), 400)
+        }
+        Err(e @ pull_request_webhook::PullRequestWebhookError::DoCall(_)) => {
+            Err(worker::Error::RustError(e.to_string()))
+        }
+    }
 }
 
 fn coordinator_error(err: CoordinatorError) -> ConnectError {
