@@ -1,10 +1,13 @@
 //! Derives the `(repo_id, sha, run_key, attempt)` run identity, per
-//! `docs/design/byo-ci.md`'s "Run identity" table, plus the ingest server URL.
+//! `docs/design/byo-ci.md`'s "Run identity" table, plus the ingest server URL
+//! and the job name.
 //!
 //! Precedence for every field: explicit CLI flag > `CLOUD_CI_*` environment
 //! variable > GitHub Actions auto-detection > hard error. `attempt` is the
 //! only field with a further fallback (`1`) once every other source is
-//! exhausted, matching the table's "defaults to 1" note.
+//! exhausted, matching the table's "defaults to 1" note. The job name
+//! follows the same precedence via [`resolve_job_name`], kept separate from
+//! [`RunIdentity`] since it isn't part of the run-identity tuple.
 //!
 //! Resolution reads environment variables and (for `sha` on `pull_request`
 //! events) one JSON file through [`EnvSource`] rather than `std::env`/`std::fs`
@@ -130,6 +133,25 @@ pub fn resolve_run_identity(
         repo_id: repo_id.unwrap_or_default(),
         server_url: server_url.unwrap_or_default(),
     })
+}
+
+/// Resolves the job name: explicit `--job` flag > `CLOUD_CI_JOB` env var >
+/// `$GITHUB_JOB` when running in GitHub Actions > hard error. Kept separate
+/// from [`RunIdentity`] because the job name is not part of the
+/// `(repo_id, sha, run_key, attempt)` run-identity tuple, but it follows the
+/// same flag > `CLOUD_CI_*` env > GitHub Actions auto-detect > error
+/// precedence through the same testable [`EnvSource`].
+pub fn resolve_job_name(flag: Option<&str>, env: &dyn EnvSource) -> Result<String, String> {
+    let in_github_actions = env.var("GITHUB_ACTIONS").as_deref() == Some("true");
+
+    flag.map(str::to_string)
+        .or_else(|| non_empty(env.var("CLOUD_CI_JOB")))
+        .or_else(|| {
+            in_github_actions
+                .then(|| non_empty(env.var("GITHUB_JOB")))
+                .flatten()
+        })
+        .ok_or_else(|| "--job (or CLOUD_CI_JOB)".to_string())
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
@@ -328,6 +350,44 @@ mod tests {
                 "--repo-id (or CLOUD_CI_REPO_ID)".to_string(),
                 "--server-url (or CLOUD_CI_SERVER_URL)".to_string(),
             ])
+        );
+    }
+
+    #[test]
+    fn job_name_flag_wins_over_everything() {
+        let env = MapEnv::new(&[
+            ("GITHUB_ACTIONS", "true"),
+            ("CLOUD_CI_JOB", "env-job"),
+            ("GITHUB_JOB", "gha-job"),
+        ]);
+        assert_eq!(
+            resolve_job_name(Some("flag-job"), &env),
+            Ok("flag-job".to_string())
+        );
+    }
+
+    #[test]
+    fn job_name_cloud_ci_env_wins_over_github_actions_auto_detect() {
+        let env = MapEnv::new(&[
+            ("GITHUB_ACTIONS", "true"),
+            ("CLOUD_CI_JOB", "env-job"),
+            ("GITHUB_JOB", "gha-job"),
+        ]);
+        assert_eq!(resolve_job_name(None, &env), Ok("env-job".to_string()));
+    }
+
+    #[test]
+    fn job_name_falls_back_to_github_job_in_actions() {
+        let env = MapEnv::new(&[("GITHUB_ACTIONS", "true"), ("GITHUB_JOB", "gha-job")]);
+        assert_eq!(resolve_job_name(None, &env), Ok("gha-job".to_string()));
+    }
+
+    #[test]
+    fn job_name_errors_when_nothing_set() {
+        let env = MapEnv::new(&[]);
+        assert_eq!(
+            resolve_job_name(None, &env),
+            Err("--job (or CLOUD_CI_JOB)".to_string())
         );
     }
 }

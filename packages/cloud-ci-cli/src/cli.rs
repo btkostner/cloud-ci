@@ -35,9 +35,10 @@ pub enum Command {
 
 #[derive(Debug, Parser)]
 pub struct UploadArgs {
-    /// Job name. Default on GitHub Actions is `$GITHUB_JOB`.
+    /// Job name. Required outside GitHub Actions, or sourced from
+    /// `CLOUD_CI_JOB`; defaults to `$GITHUB_JOB` on GitHub Actions.
     #[arg(long)]
-    pub job: String,
+    pub job: Option<String>,
 
     /// `<kind>:<glob>`, repeatable. For example `--report junit:'reports/*.xml'`.
     #[arg(long = "report", value_name = "KIND:GLOB")]
@@ -214,7 +215,7 @@ mod tests {
             "success",
         ]);
         let Command::Upload(args) = cli.command;
-        assert_eq!(args.job, "test");
+        assert_eq!(args.job, Some("test".to_string()));
         assert_eq!(args.reports.len(), 2);
         assert_eq!(args.conclusion, Some(Conclusion::Success));
     }

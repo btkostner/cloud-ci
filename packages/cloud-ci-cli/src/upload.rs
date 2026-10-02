@@ -72,6 +72,8 @@ struct MatchedFile {
 pub fn run(args: &UploadArgs, env: &dyn EnvSource) -> Result<(), UploadError> {
     let identity = resolve_run_identity(&args.run_identity_flags(), env)
         .map_err(|missing| UploadError::new("resolve run identity", missing.join(", ")))?;
+    let job_name = crate::identity::resolve_job_name(args.job.as_deref(), env)
+        .map_err(|e| UploadError::new("resolve job name", e))?;
     let token = resolve_credential(args.token.as_deref(), env)
         .map_err(|e| UploadError::new("resolve credential", e))?;
 
@@ -109,7 +111,7 @@ pub fn run(args: &UploadArgs, env: &dyn EnvSource) -> Result<(), UploadError> {
             "StartJob",
             &StartJobRequest {
                 run_id: begin.run_id,
-                job_name: args.job.clone(),
+                job_name,
                 shard_total: 1,
                 check_names: args.checks.clone(),
                 ..Default::default()
