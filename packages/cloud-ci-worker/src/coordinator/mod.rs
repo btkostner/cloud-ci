@@ -1155,12 +1155,29 @@ impl RunCoordinator {
     /// timeout marks it `missing` and the run moves to `abandoned`" —
     /// not a computed conclusion.
     ///
-    /// Idempotent: a run already in a terminal state is a no-op ack,
-    /// covering GitHub's at-least-once webhook redelivery, a redelivered
-    /// `--expect-jobs` satisfaction, and a DO alarm that fires after the
-    /// run already closed by another trigger microseconds earlier,
-    /// without re-running (and potentially re-emitting side effects
-    /// from) the close logic a second time.
+    /// The run/job/shard mutation block (marking shards missing,
+    /// recomputing job/run conclusions, re-transitioning state, Check Run
+    /// finalization) is idempotent by never re-running once the run is
+    /// terminal: a redelivered webhook, a redelivered `--expect-jobs`
+    /// satisfaction, or a DO alarm firing after the run already closed
+    /// microseconds earlier all short-circuit that block.
+    ///
+    /// `finalize_test_stats` does NOT share that short-circuit, by
+    /// design — see the terminal-state branch below. It has its own,
+    /// separate D1-level idempotency gate (`test_stats_applications`'s
+    /// PRIMARY KEY), cheap and safe to hit redundantly, so every call to
+    /// this function — terminal or not — attempts it. Without this, a
+    /// `finalize_test_stats` failure (a transient R2 read error, a
+    /// transient D1 outage — anything other than the expected
+    /// "already applied" PK-conflict no-op) occurring *after*
+    /// `update_run_status`/`project_run_to_d1` already committed the
+    /// run's terminal state would be unrecoverable: every subsequent
+    /// close-trigger would hit the terminal guard and never attempt
+    /// `finalize_test_stats` again, silently and permanently losing that
+    /// run's `test_stats` contribution. Retrying it on every
+    /// already-terminal call instead gives every redelivery/refire a
+    /// free retry of exactly the failed work, at the cost of one cheap,
+    /// no-op-shaped D1 round trip when it already succeeded.
     async fn handle_close_run(
         &self,
         sql: &SqlStorage,
@@ -1170,6 +1187,12 @@ impl RunCoordinator {
             return error_response(404, "run not found");
         };
         if run_state_of(&run_row)?.is_terminal() {
+            // Run/job/shard mutation is skipped (already applied, see
+            // doc comment above) but `finalize_test_stats` still runs —
+            // its own `test_stats_applications` marker makes this an
+            // instant no-op if finalization already succeeded, and does
+            // the previously-failed work if it didn't.
+            self.finalize_test_stats(sql, &run_row).await?;
             let status = run_status_of(&run_row)?;
             return Response::from_json(&CloseRunOutcome {
                 run_id: run_row.id,
