@@ -1,8 +1,9 @@
-//! GitHub App JWT minting and RS256 signing (docs/roadmap.md Phase 0
-//! "GitHub App JWT" spike; docs/design/auth.md § "GitHub App setup"
-//! "App-level authentication" paragraph).
+//! GitHub App JWT minting, RS256 signing, and installation access token
+//! exchange (docs/roadmap.md Phase 0 "GitHub App JWT" spike;
+//! docs/design/auth.md § "GitHub App setup" "App-level authentication"
+//! paragraph).
 //!
-//! This module has two layers so far, in increasing order of "needs the
+//! This module has three layers, in increasing order of "needs the
 //! Workers runtime to actually run":
 //!
 //! 1. [`build_claims`] / [`signing_input`] — pure claim construction and
@@ -13,9 +14,20 @@
 //!    runtime's WebCrypto `SubtleCrypto.sign()`. This one genuinely needs
 //!    the `wasm32` Workers runtime to execute (see "Why WebCrypto" below)
 //!    and is only smoke-tested under `wrangler dev`, not `cargo test`.
+//! 3. [`fetch_installation_token`] — exchanges a signed App JWT for an
+//!    installation access token
+//!    (docs.github.com/en/rest/apps/apps#create-an-installation-access-token-for-an-app,
+//!    accessed 2026-10-01). Its URL/header construction
+//!    ([`installation_access_token_url`]/[`installation_access_token_headers`])
+//!    and [`InstallationToken`] response parsing are pure enough to unit
+//!    test; the actual HTTP call is **not** live-verified against
+//!    GitHub, since no real GitHub App installation exists yet (full
+//!    `cloud-ci setup github-app` is a later round's work — this module
+//!    is a capability check, not the setup flow).
 //!
-//! The installation access token exchange that consumes the signed JWT
-//! lands in a later commit.
+//! Nothing in `lib.rs` calls [`fetch_installation_token`] yet — webhook
+//! handling and Check-Run posting, its real callers, don't exist yet. It
+//! is intentionally dead code from the router's perspective this round.
 //!
 //! # Claim shape and TTL
 //!
@@ -306,6 +318,89 @@ fn base64_url_encode(bytes: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
+/// `X-GitHub-Api-Version` for the installation access token endpoint
+/// (docs.github.com/en/rest/apps/apps#create-an-installation-access-token-for-an-app,
+/// accessed 2026-10-01).
+const GITHUB_API_VERSION: &str = "2022-11-28";
+
+/// An installation access token — docs.github.com/en/rest/apps/apps#create-an-installation-access-token-for-an-app
+/// (accessed 2026-10-01) returns more fields (e.g. `permissions`), but
+/// `token` and `expires_at` are the only two callers in this codebase
+/// need so far.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct InstallationToken {
+    pub token: String,
+    pub expires_at: String,
+}
+
+/// The installation access token endpoint's URL, with `installation_id`
+/// interpolated — pure string construction, unit-testable without the
+/// Workers runtime.
+fn installation_access_token_url(installation_id: u64) -> String {
+    format!("https://api.github.com/app/installations/{installation_id}/access_tokens")
+}
+
+/// The three headers GitHub's docs specify for this endpoint
+/// (`Authorization: Bearer <app jwt>`, `Accept`, `X-GitHub-Api-Version`) —
+/// pure construction, unit-testable without the Workers runtime.
+fn installation_access_token_headers(app_jwt: &str) -> [(&'static str, String); 3] {
+    [
+        ("authorization", format!("Bearer {app_jwt}")),
+        ("accept", "application/vnd.github+json".to_string()),
+        ("x-github-api-version", GITHUB_API_VERSION.to_string()),
+    ]
+}
+
+/// Exchanges a signed App JWT ([`sign_rs256`]'s output) for an
+/// installation access token:
+/// `POST /app/installations/{installation_id}/access_tokens`
+/// (docs.github.com/en/rest/apps/apps#create-an-installation-access-token-for-an-app,
+/// accessed 2026-10-01). Installation tokens expire one hour after
+/// creation (same doc).
+///
+/// Nothing in `lib.rs` calls this yet — see module docs. It is exercised
+/// by this module's unit tests (URL/header construction,
+/// [`InstallationToken`] response parsing) but **not** live-verified
+/// against GitHub: no real GitHub App installation exists in this
+/// environment to call it against.
+pub async fn fetch_installation_token(
+    app_jwt: &str,
+    installation_id: u64,
+) -> Result<InstallationToken, GithubAppError> {
+    let url = installation_access_token_url(installation_id);
+    let headers = worker::Headers::new();
+    for (name, value) in installation_access_token_headers(app_jwt) {
+        headers
+            .set(name, &value)
+            .map_err(|e| GithubAppError(format!("cannot set {name} header: {e}")))?;
+    }
+
+    let mut init = worker::RequestInit::new();
+    init.with_method(worker::Method::Post);
+    init.with_headers(headers);
+
+    let request = worker::Request::new_with_init(&url, &init)
+        .map_err(|e| GithubAppError(format!("cannot build installation token request: {e}")))?;
+
+    let mut response = worker::Fetch::Request(request)
+        .send()
+        .await
+        .map_err(|e| GithubAppError(format!("installation token request failed: {e}")))?;
+
+    if response.status_code() != 201 {
+        let body = response.text().await.unwrap_or_default();
+        return Err(GithubAppError(format!(
+            "installation token exchange failed: {} {body}",
+            response.status_code()
+        )));
+    }
+
+    response
+        .json::<InstallationToken>()
+        .await
+        .map_err(|e| GithubAppError(format!("cannot decode installation token response: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,5 +515,48 @@ mod tests {
     fn unsupported_pem_label_is_rejected() {
         let pem = pem_block("EC PRIVATE KEY", "AA==");
         assert!(pkcs8_der_from_pem(&pem).is_err());
+    }
+
+    #[test]
+    fn installation_token_url_interpolates_installation_id() {
+        assert_eq!(
+            installation_access_token_url(42),
+            "https://api.github.com/app/installations/42/access_tokens"
+        );
+    }
+
+    #[test]
+    fn installation_token_headers_carry_bearer_jwt_and_api_version() {
+        let headers = installation_access_token_headers("my.jwt.value");
+        assert_eq!(
+            headers[0],
+            ("authorization", "Bearer my.jwt.value".to_string())
+        );
+        assert_eq!(
+            headers[1],
+            ("accept", "application/vnd.github+json".to_string())
+        );
+        assert_eq!(
+            headers[2],
+            ("x-github-api-version", GITHUB_API_VERSION.to_string())
+        );
+    }
+
+    #[test]
+    fn installation_token_response_parses_documented_shape() -> Result<(), serde_json::Error> {
+        // Realistic shape per docs.github.com/en/rest/apps/apps
+        // #create-an-installation-access-token-for-an-app (extra fields
+        // like `permissions`/`repository_selection` are present on the
+        // real response and must be ignored, not rejected).
+        let body = r#"{
+            "token": "ghs_16C7e42F292c6912E7710c838347Ae178B4a",
+            "expires_at": "2026-10-01T12:00:00Z",
+            "permissions": { "issues": "write", "contents": "read" },
+            "repository_selection": "all"
+        }"#;
+        let parsed: InstallationToken = serde_json::from_str(body)?;
+        assert_eq!(parsed.token, "ghs_16C7e42F292c6912E7710c838347Ae178B4a");
+        assert_eq!(parsed.expires_at, "2026-10-01T12:00:00Z");
+        Ok(())
     }
 }
