@@ -7,3 +7,12 @@
 # fallback). In production this is `wrangler secret put INGEST_TOKEN_SECRET`,
 # pending ADR 0004's Secrets Store wiring.
 INGEST_TOKEN_SECRET=local-dev-ingest-token-secret
+
+# Any non-empty PEM works for local dev (src/github_app.rs's claims
+# construction/encoding don't touch the key). The real RS256 WebCrypto
+# signing path needs a real RSA private key to succeed — generate a
+# throwaway one with `openssl genrsa -out /tmp/test-key.pem 2048` for
+# manual smoke testing; there is no hardcoded fallback. In production
+# this becomes a Secrets Store binding once `cloud-ci setup github-app`
+# exists (docs/design/auth.md § "GitHub App setup").
+GITHUB_APP_PRIVATE_KEY=
