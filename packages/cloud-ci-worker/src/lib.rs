@@ -11,6 +11,7 @@ pub mod reconcile;
 pub mod roles;
 pub mod session;
 pub mod template_spike;
+pub mod token_issuance;
 pub mod ulid;
 pub mod webhook;
 pub mod workflow_run;
@@ -47,6 +48,13 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     }
     if req.method() == Method::Get && req.path() == "/oauth/callback" {
         return handle_oauth_callback(&req, &env).await;
+    }
+    // Admin-only token issuance (docs/design/auth.md § "Scoped API
+    // tokens", "Role model and permission matrix"), not a Connect RPC —
+    // a plain JSON POST gated by session cookie + per-repo admin role
+    // rather than a bearer credential.
+    if req.method() == Method::Post && req.path() == "/v1/tokens" {
+        return handle_issue_token(&mut req, &env).await;
     }
     if req.method() != Method::Post {
         return Response::error("method not allowed", 405);
@@ -839,6 +847,124 @@ fn oauth_callback_url(req: &Request) -> std::result::Result<String, String> {
     callback.set_path("/oauth/callback");
     callback.set_query(None);
     Ok(callback.to_string())
+}
+
+/// `POST /v1/tokens` (docs/design/auth.md § "Scoped API tokens", "Role
+/// model and permission matrix": "Issue, list, revoke scoped API tokens |
+/// admin"). The first real issuance path for scoped API tokens — see
+/// `src/token_issuance.rs`'s module doc comment for why earlier rounds
+/// deliberately shipped no mint function anywhere in this crate, and why
+/// this round is different.
+///
+/// # Auth
+///
+/// - **Authentication**: a valid `__Host-cc_session` cookie
+///   ([`session::check_session`]) — missing/invalid/expired is `401`.
+/// - **Authorization**: `admin` role ([`roles::resolve_role`]) on every
+///   repo id the request needs it for:
+///   - A finite `repo_allowlist`: admin on every id in that list.
+///   - A `null` `repo_allowlist` ("all repos visible to `created_by`,
+///     which may span installations" — auth.md's "Data model", a
+///     strictly broader grant than any finite list): admin on *every*
+///     repo this deployment knows about
+///     ([`installations::list_all_repo_ids`]), not just the repos the
+///     issuer happens to use. Any repo failing this check is `403`
+///     ([`token_issuance::authorize`]).
+///
+/// On success, mints the token ([`token_issuance::generate_token`]),
+/// hashes it ([`api_tokens::hash_token`] — reused, never duplicated), and
+/// inserts the row with `created_by` set to the caller's real
+/// `users.id` ([`token_issuance::insert_token_row`]). The plaintext
+/// token is returned once in the response body and never stored.
+async fn handle_issue_token(req: &mut Request, env: &Env) -> Result<Response> {
+    let cookie_header = req.headers().get("cookie")?.unwrap_or_default();
+    let Some(session_id) =
+        session::parse_cookie_header(&cookie_header, session::SESSION_COOKIE_NAME)
+    else {
+        return json_error(401, "missing session cookie");
+    };
+    let id_hash = session::hash_session_id(&session_id);
+    let now_s = (Date::now().as_millis() / 1000) as i64;
+    let session_row = session::lookup_session(env, &id_hash).await?;
+    let verified = match session::check_session(session_row.as_ref(), now_s) {
+        Ok(v) => v,
+        Err(_) => return json_error(401, "invalid or expired session"),
+    };
+
+    let body = req.bytes().await?;
+    let request: token_issuance::IssueTokenRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => return json_error(400, &format!("invalid request body: {e}")),
+    };
+    if let Err(e) = token_issuance::validate_request(&request, now_s) {
+        return json_error(400, &format!("{e}"));
+    }
+
+    // Which repo ids the issuer must be admin on — see
+    // `token_issuance::authorize`'s doc comment for why a `null`
+    // allowlist means "every repo this deployment knows about", not
+    // merely the repos the issuer happens to use.
+    let repo_ids: Vec<u64> = match &request.repo_allowlist {
+        Some(ids) => ids.clone(),
+        None => installations::list_all_repo_ids(env).await?,
+    };
+
+    let mut checked = Vec::with_capacity(repo_ids.len());
+    for repo_id in &repo_ids {
+        let role = roles::resolve_role(
+            env,
+            &verified.user_id,
+            *repo_id,
+            &verified.github_login,
+            now_s,
+        )
+        .await?;
+        checked.push((*repo_id, role));
+    }
+    if let Err(token_issuance::NotAdminOnRepo(repo_id)) = token_issuance::authorize(&checked) {
+        return json_error(
+            403,
+            &format!("admin role required on repo {repo_id} to issue this token"),
+        );
+    }
+
+    let plaintext = match token_issuance::generate_token() {
+        Ok(t) => t,
+        Err(e) => return json_error(500, &format!("cannot generate token: {e}")),
+    };
+    let hash = api_tokens::hash_token(&plaintext);
+    let id = match ulid::generate(Date::now().as_millis()) {
+        Ok(id) => id,
+        Err(e) => return json_error(500, &format!("cannot generate token id: {e}")),
+    };
+    token_issuance::insert_token_row(
+        env,
+        &id,
+        &hash,
+        &request.name,
+        &request.scopes,
+        request.repo_allowlist.as_deref(),
+        &verified.user_id,
+        now_s,
+        request.expires_at,
+    )
+    .await?;
+
+    Response::from_json(&token_issuance::IssueTokenResponse {
+        id,
+        name: request.name,
+        token: plaintext,
+        scopes: request.scopes,
+        repo_allowlist: request.repo_allowlist,
+        expires_at: request.expires_at,
+    })
+}
+
+/// Builds a `{"error": message}` JSON response with `status` — this
+/// endpoint's uniform failure shape, since it is a plain JSON POST, not a
+/// Connect RPC (`connect_error` is that family's equivalent).
+fn json_error(status: u16, message: &str) -> Result<Response> {
+    Ok(Response::from_json(&serde_json::json!({ "error": message }))?.with_status(status))
 }
 
 /// `POST /webhooks/github` (docs/design/auth.md § "Webhook signature

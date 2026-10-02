@@ -226,6 +226,31 @@ pub async fn list_installation_ids(env: &Env) -> worker::Result<Vec<u64>> {
         .collect()
 }
 
+/// Every `repo_id` this deployment knows about, across every
+/// installation — used by `POST /v1/tokens`'s `null`-`repo_allowlist`
+/// issuance path (`src/token_issuance.rs::authorize`'s doc comment,
+/// docs/design/auth.md § "Data model": a `null` allowlist means "all
+/// repos visible to `created_by`"). Minting a `null`-allowlist token is a
+/// strictly broader grant than any finite list, so the issuing admin must
+/// be admin on every repo in this result, not just the ones they happen
+/// to use. Same `f64`-over-the-JS-boundary reasoning as
+/// [`list_installation_ids`].
+pub async fn list_all_repo_ids(env: &Env) -> worker::Result<Vec<u64>> {
+    let db = env.d1("DB")?;
+    let rows: Vec<serde_json::Value> = db
+        .prepare("SELECT repo_id FROM repos")
+        .all()
+        .await?
+        .results()?;
+    rows.into_iter()
+        .map(|row| {
+            row.get("repo_id")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| worker::Error::RustError("repos row missing repo_id".into()))
+        })
+        .collect()
+}
+
 /// The `repos`/`installations` join row `BeginRun`'s OIDC path needs to
 /// decide whether a claimed `repository_id` belongs to an allowlisted,
 /// non-suspended installation (docs/design/byo-ci.md § Auth).
