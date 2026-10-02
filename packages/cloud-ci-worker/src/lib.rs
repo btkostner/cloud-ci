@@ -17,6 +17,7 @@ pub mod repo_state;
 pub mod roles;
 pub mod session;
 pub mod template_spike;
+pub mod test_stats;
 pub mod token_issuance;
 pub mod ulid;
 pub mod webhook;
@@ -25,8 +26,8 @@ pub mod workflow_run;
 use cloud_ci_proto::ingest::v1::{
     BeginRunRequest, BeginRunResponse, CompleteShardRequest, CompleteShardResponse,
     CompleteUploadRequest, CompleteUploadResponse, CreateUploadRequest, CreateUploadResponse,
-    GetRunRequest, GetRunResponse, StartJobRequest, StartJobResponse, SubmitReportRequest,
-    SubmitReportResponse,
+    FileTiming, GetRunRequest, GetRunResponse, GetTestTimingsRequest, GetTestTimingsResponse,
+    StartJobRequest, StartJobResponse, SubmitReportRequest, SubmitReportResponse,
 };
 use connect::{Code, Codec, ConnectError, NegotiationError, negotiate};
 use coordinator::{CoordinatorError, RunCoordinatorStore};
@@ -145,6 +146,9 @@ async fn route(
         }
         "/cloud_ci.ingest.v1.IngestService/StartJob" => handle_start_job(codec, body, env).await,
         "/cloud_ci.ingest.v1.IngestService/GetRun" => handle_get_run(codec, body, env).await,
+        "/cloud_ci.ingest.v1.IngestService/GetTestTimings" => {
+            handle_get_test_timings(codec, body, env, bearer).await
+        }
         "/cloud_ci.ingest.v1.IngestService/CreateUpload" => {
             handle_create_upload(codec, body, env).await
         }
@@ -166,10 +170,11 @@ async fn route(
 
 /// # Auth (docs/design/auth.md § "Machine auth", "Scoped API tokens")
 ///
-/// `BeginRun` is the only call that authenticates with something other
-/// than an ingest token. Two credential shapes are valid — a GitHub
-/// Actions OIDC JWT, or a scoped API token for non-GitHub-Actions CI
-/// systems — and presenting one of them is now **mandatory**:
+/// `BeginRun` and `GetTestTimings` are the only calls that authenticate
+/// with something other than an ingest token. Two credential shapes are
+/// valid — a GitHub Actions OIDC JWT, or a scoped API token for
+/// non-GitHub-Actions CI systems — and presenting one of them is now
+/// **mandatory** for both calls:
 ///
 /// - **No `Authorization` header at all**: rejected with
 ///   `Code::Unauthenticated` before anything else runs — no Durable
@@ -408,6 +413,65 @@ async fn handle_get_run(
         run_id: outcome.run_id,
         status: outcome.status.into(),
         jobs: outcome.jobs,
+        ..Default::default()
+    };
+    codec.encode(&resp)
+}
+
+/// `GetTestTimings`'s auth is the same `BeginRun` credential model
+/// (module doc comment on [`handle_begin_run`]), not the run-scoped
+/// ingest token every other call after `BeginRun` uses: `cloud-ci split`
+/// runs *before* `BeginRun` in the BYO CI flow (it is the step that
+/// decides each matrix leg's file list, per
+/// docs/design/parallelization.md's "`cloud-ci split` authenticates with
+/// the same machine credentials as `cloud-ci upload`"), so there is no
+/// run yet to have minted an ingest token from. Reuses
+/// [`verify_oidc_begin_run_credential`]/
+/// [`verify_scoped_api_token_begin_run_credential`] directly rather than
+/// duplicating that logic — both already take a bare `repo_id`, which is
+/// all `GetTestTimingsRequest` carries (no `RunKey`/`BeginRun` call is
+/// involved). A scoped API token used here needs the same `ingest:write`
+/// scope `cloud-ci upload` needs, not a separate read scope — the two
+/// commands are documented as sharing one credential, and a deployment
+/// that already trusts a token to write ingest data for a repo has no
+/// reason to withhold that repo's own historical timing from the same
+/// token.
+async fn handle_get_test_timings(
+    codec: Codec,
+    body: &[u8],
+    env: &Env,
+    bearer: Option<&str>,
+) -> std::result::Result<Vec<u8>, ConnectError> {
+    let req: GetTestTimingsRequest = codec.decode(body)?;
+
+    match bearer {
+        Some(bearer) if oidc::looks_like_jwt(bearer) => {
+            verify_oidc_begin_run_credential(env, bearer, req.repo_id).await?;
+        }
+        Some(bearer) => {
+            verify_scoped_api_token_begin_run_credential(env, bearer, req.repo_id).await?;
+        }
+        None => {
+            return Err(ConnectError::new(
+                Code::Unauthenticated,
+                "GetTestTimings requires a credential: GitHub Actions OIDC JWT or a scoped API token",
+            ));
+        }
+    }
+
+    let rows = test_stats::lookup_file_timings(env, req.repo_id, &req.file_paths)
+        .await
+        .map_err(|e| ConnectError::new(Code::Internal, format!("test_stats lookup failed: {e}")))?;
+
+    let resp = GetTestTimingsResponse {
+        timings: rows
+            .into_iter()
+            .map(|row| FileTiming {
+                file_path: row.file_path,
+                duration_ms: row.duration_ms,
+                ..Default::default()
+            })
+            .collect(),
         ..Default::default()
     };
     codec.encode(&resp)
