@@ -1225,6 +1225,10 @@ fn coordinator_error(err: CoordinatorError) -> ConnectError {
     match err {
         CoordinatorError::NotFound => ConnectError::new(Code::NotFound, "run not found"),
         CoordinatorError::Conflict(msg) => ConnectError::new(Code::FailedPrecondition, msg),
+        CoordinatorError::NondeterministicReplay => ConnectError::new(
+            Code::FailedPrecondition,
+            "start_node spec hash differs from a prior start for this node id",
+        ),
         CoordinatorError::Internal(msg) => ConnectError::new(Code::Internal, msg),
     }
 }
@@ -1250,6 +1254,10 @@ mod tests {
         );
         assert_eq!(
             coordinator_error(CoordinatorError::Conflict("x".into())).code,
+            Code::FailedPrecondition
+        );
+        assert_eq!(
+            coordinator_error(CoordinatorError::NondeterministicReplay).code,
             Code::FailedPrecondition
         );
         assert_eq!(

@@ -589,6 +589,206 @@ pub fn render_check_summary(rows: &[CheckSummaryJobRow]) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Nodes (`startNode`/completion/`ack`, dynamic-pipelines.md's "### Execution
+// model" idempotency table). Pure decision logic only this round, backing
+// `RunCoordinator`'s node RPCs — see `coordinator` module docs' scope
+// boundary for what is and is not built yet.
+// ---------------------------------------------------------------------------
+
+/// A node's lifecycle state, per dynamic-pipelines.md's `startNode`/
+/// completion/timeout rows: `Pending`/`Running` are non-terminal;
+/// `Succeeded`/`Failed`/`Skipped`/`Cancelled`/`TimedOut` are terminal.
+/// Matches D1 `nodes.status`'s documented values
+/// (`pending`/`cached`/`running`/`succeeded`/`failed`/`skipped`) plus
+/// `cancelled`/`timed_out` from the failure-modes table — `Cached` is not
+/// included here: it is `turbo.execute`'s own cache-hit skip decision
+/// (dynamic-pipelines.md's "User experience" `ci.cached`), never a state
+/// `startNode`/`completeNode` themselves transition a node through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeState {
+    Pending,
+    Running,
+    Succeeded,
+    Failed,
+    Skipped,
+    Cancelled,
+    TimedOut,
+}
+
+impl NodeState {
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+            Self::Cancelled => "cancelled",
+            Self::TimedOut => "timed_out",
+        }
+    }
+
+    pub fn from_db_str(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(Self::Pending),
+            "running" => Some(Self::Running),
+            "succeeded" => Some(Self::Succeeded),
+            "failed" => Some(Self::Failed),
+            "skipped" => Some(Self::Skipped),
+            "cancelled" => Some(Self::Cancelled),
+            "timed_out" => Some(Self::TimedOut),
+            _ => None,
+        }
+    }
+
+    /// `Cancelled`/`TimedOut` are terminal alongside the three ordinary
+    /// conclusions, per the failure-modes table: a cancelled or
+    /// timed-out node never has further work done to it (completion
+    /// events for it are dropped — see [`resolve_complete_node`]).
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded | Self::Failed | Self::Skipped | Self::Cancelled | Self::TimedOut
+        )
+    }
+}
+
+/// The row already occupying `node_id` within this run, if one exists —
+/// [`resolve_start_node`]'s only input besides the incoming spec hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExistingNode {
+    pub spec_hash: String,
+    pub status: NodeState,
+}
+
+/// What a `startNode` call should do, once an existing row (if any) has
+/// been looked up by `node_id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartNodeDecision {
+    /// No row existed for this `node_id` yet: create one and start the
+    /// node for real. (This round: just the row — see module docs.)
+    Started,
+    /// A row already exists with the same spec hash: per
+    /// "`startNode` retried after the container already started ->
+    /// returns the existing node; never starts a second container",
+    /// this is the idempotent replay path. Never starts anything a
+    /// second time, including this round's row-only "start".
+    AlreadyStarted { status: NodeState },
+}
+
+/// A `startNode` call named an id that already has a *different* spec
+/// hash recorded — "`startNode` with the same id but a different spec
+/// hash -> Rejected as nondeterministic; run fails". This function
+/// itself never fails the run: see [`resolve_start_node`]'s doc comment
+/// for why that is deliberately the caller's job, not this one's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NondeterministicReplay;
+
+/// Resolves a `startNode(run_id, node_id, spec_hash)` call against
+/// whatever row (if any) already exists for `node_id` in this run,
+/// implementing dynamic-pipelines.md's idempotency table's first two
+/// rows exactly.
+///
+/// **Who fails the run on `Err`.** The doc says a spec-hash mismatch is
+/// "rejected as nondeterministic; run fails". This function returns a
+/// typed [`NondeterministicReplay`] error and does *not* itself decide
+/// to transition the whole run to a failed terminal state — there is no
+/// real Dynamic Workflow caller yet (see `coordinator` module docs'
+/// scope boundary) to have asked for that, and guessing at the shape of
+/// "the run is now failed" (does the workflow instance get terminated?
+/// do other in-flight nodes get cancelled too, same as
+/// [`nodes_to_cancel`]?) without that caller would be exactly the kind
+/// of speculative API this round must not build. The future
+/// Workflow-integration round's caller owns turning this error into an
+/// actual run failure, once it exists to decide how.
+pub fn resolve_start_node(
+    existing: Option<&ExistingNode>,
+    incoming_spec_hash: &str,
+) -> Result<StartNodeDecision, NondeterministicReplay> {
+    match existing {
+        None => Ok(StartNodeDecision::Started),
+        Some(node) if node.spec_hash == incoming_spec_hash => {
+            Ok(StartNodeDecision::AlreadyStarted {
+                status: node.status,
+            })
+        }
+        Some(_) => Err(NondeterministicReplay),
+    }
+}
+
+/// A `completeNode` call supplied a terminal status that conflicts with
+/// one already recorded for this node (not the cancelled-drop case —
+/// see [`resolve_complete_node`]'s `DroppedCancelled` arm for that).
+/// Mirrors `CompleteShardError::ConflictingConclusion`'s "same shape,
+/// different domain" pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompleteNodeError {
+    ConflictingStatus,
+}
+
+/// What `completeNode` should do, once the node's current status is
+/// known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompleteNodeDecision {
+    /// Record `incoming_status` as this node's terminal state (a no-op
+    /// rewrite if it already matches — "calling it again with the same
+    /// conclusion is a no-op", same idempotency shape as
+    /// `resolve_complete_shard`).
+    Recorded,
+    /// The node is already `Cancelled`: "late completion events for
+    /// cancelled nodes are dropped". The caller must not overwrite the
+    /// `Cancelled` status with `incoming_status`, and must treat this
+    /// as a successful ack-worthy no-op, not an error — a redelivered
+    /// completion for a cancelled node is expected, not exceptional.
+    DroppedCancelled,
+}
+
+/// Resolves a `completeNode(run_id, node_id, status, result)` call
+/// against the node's current status, implementing dynamic-pipelines.md's
+/// "Run cancelled" row's drop clause and the general "completion event
+/// delivered twice" idempotency: `incoming_status` must itself already be
+/// one of [`NodeState::is_terminal`]'s terminal values — validating that
+/// is the caller's job, since a `completeNode` call can never report a
+/// node as still `Pending`/`Running`.
+pub fn resolve_complete_node(
+    current_status: NodeState,
+    incoming_status: NodeState,
+) -> Result<CompleteNodeDecision, CompleteNodeError> {
+    if current_status == NodeState::Cancelled {
+        return Ok(CompleteNodeDecision::DroppedCancelled);
+    }
+    if current_status.is_terminal() && current_status != incoming_status {
+        return Err(CompleteNodeError::ConflictingStatus);
+    }
+    Ok(CompleteNodeDecision::Recorded)
+}
+
+/// Resolves an `ackNode` call against the node's current `acked` flag.
+/// Returns whether the caller needs to write `acked = true` at all:
+/// `false` once a node is already acked, so a redelivered `ack` (the
+/// doc's "`ack` is recorded on the node by the next step after
+/// `waitForEvent`") never issues a second write. Always `Ok` — acking
+/// an already-terminal, or even an already-cancelled, node is never a
+/// conflict; unlike [`resolve_complete_node`], there is no status to
+/// disagree about here.
+pub fn resolve_ack_node(current_acked: bool) -> bool {
+    !current_acked
+}
+
+/// Which of `nodes`' ids a run cancellation should mark `Cancelled` —
+/// "Coordinator stops containers, marks nodes `cancelled`...". Only
+/// non-terminal nodes are affected: a node that already reached
+/// `Succeeded`/`Failed`/`Skipped`/`TimedOut` keeps that real outcome,
+/// never gets relabeled `Cancelled` after the fact. Order-preserving.
+pub fn nodes_to_cancel(nodes: &[(String, NodeState)]) -> Vec<String> {
+    nodes
+        .iter()
+        .filter(|(_, status)| !status.is_terminal())
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1180,5 +1380,116 @@ mod tests {
             run_state_for_close(true, Conclusion::CONCLUSION_FAILURE),
             RunState::Abandoned
         );
+    }
+
+    #[test]
+    fn start_node_creates_fresh_row_when_none_exists() {
+        assert_eq!(
+            resolve_start_node(None, "hash-1"),
+            Ok(StartNodeDecision::Started)
+        );
+    }
+
+    #[test]
+    fn start_node_is_idempotent_for_a_retry_with_the_same_spec_hash() {
+        let existing = ExistingNode {
+            spec_hash: "hash-1".into(),
+            status: NodeState::Running,
+        };
+        assert_eq!(
+            resolve_start_node(Some(&existing), "hash-1"),
+            Ok(StartNodeDecision::AlreadyStarted {
+                status: NodeState::Running
+            })
+        );
+    }
+
+    #[test]
+    fn start_node_rejects_a_different_spec_hash_as_nondeterministic() {
+        let existing = ExistingNode {
+            spec_hash: "hash-1".into(),
+            status: NodeState::Running,
+        };
+        assert_eq!(
+            resolve_start_node(Some(&existing), "hash-2"),
+            Err(NondeterministicReplay)
+        );
+    }
+
+    #[test]
+    fn complete_node_records_a_fresh_terminal_status() {
+        assert_eq!(
+            resolve_complete_node(NodeState::Running, NodeState::Succeeded),
+            Ok(CompleteNodeDecision::Recorded)
+        );
+    }
+
+    #[test]
+    fn complete_node_is_a_no_op_replay_of_the_same_status() {
+        assert_eq!(
+            resolve_complete_node(NodeState::Succeeded, NodeState::Succeeded),
+            Ok(CompleteNodeDecision::Recorded)
+        );
+    }
+
+    #[test]
+    fn complete_node_rejects_a_conflicting_terminal_status() {
+        assert_eq!(
+            resolve_complete_node(NodeState::Succeeded, NodeState::Failed),
+            Err(CompleteNodeError::ConflictingStatus)
+        );
+    }
+
+    #[test]
+    fn complete_node_drops_late_completions_for_cancelled_nodes() {
+        // "late completion events for cancelled nodes are dropped" —
+        // and never relabels the node back to a different terminal
+        // status, regardless of what the late event claims.
+        assert_eq!(
+            resolve_complete_node(NodeState::Cancelled, NodeState::Succeeded),
+            Ok(CompleteNodeDecision::DroppedCancelled)
+        );
+        assert_eq!(
+            resolve_complete_node(NodeState::Cancelled, NodeState::Failed),
+            Ok(CompleteNodeDecision::DroppedCancelled)
+        );
+    }
+
+    #[test]
+    fn ack_node_is_idempotent() {
+        // Not yet acked: the caller must write `acked = true`.
+        assert!(resolve_ack_node(false));
+        // Already acked: a redelivered ack issues no second write.
+        assert!(!resolve_ack_node(true));
+    }
+
+    #[test]
+    fn nodes_to_cancel_only_affects_non_terminal_nodes() {
+        let nodes = vec![
+            ("pending-node".to_string(), NodeState::Pending),
+            ("running-node".to_string(), NodeState::Running),
+            ("done-node".to_string(), NodeState::Succeeded),
+            ("failed-node".to_string(), NodeState::Failed),
+            ("already-cancelled".to_string(), NodeState::Cancelled),
+        ];
+        assert_eq!(
+            nodes_to_cancel(&nodes),
+            vec!["pending-node".to_string(), "running-node".to_string()]
+        );
+    }
+
+    #[test]
+    fn node_state_round_trips_through_db_string() {
+        for state in [
+            NodeState::Pending,
+            NodeState::Running,
+            NodeState::Succeeded,
+            NodeState::Failed,
+            NodeState::Skipped,
+            NodeState::Cancelled,
+            NodeState::TimedOut,
+        ] {
+            assert_eq!(NodeState::from_db_str(state.as_db_str()), Some(state));
+        }
     }
 }

@@ -64,6 +64,61 @@
 //!   best-effort side channel, the same degrade-and-log posture
 //!   `reconcile.rs`'s uninstall-of-disallowed-org already uses.
 
+//! ## Nodes (node identity/idempotency, ahead of its full caller)
+//!
+//! docs/design/dynamic-pipelines.md's "### Execution model" describes
+//! `ci.container`'s two-step protocol — `step.do("start:" + id)` then
+//! `step.waitForEvent("done:" + id)` — and the idempotency table a
+//! Dynamic Workflow's retried steps need `RunCoordinator` to enforce
+//! around `(run_id, node_id)`. This round builds exactly that table as
+//! new `RunCoordinator` RPCs — [`RunCoordinator::handle_start_node`],
+//! [`RunCoordinator::handle_complete_node`],
+//! [`RunCoordinator::handle_ack_node`],
+//! [`RunCoordinator::handle_cancel_run`] — and nothing else. **It does
+//! not build:**
+//!
+//! - Any Dynamic Workflow integration, Cloudflare Workflows binding, or
+//!   `step.do`/`step.waitForEvent` wiring. That is a separate, much
+//!   larger round; these RPCs are the foundation a future caller would
+//!   use, same "foundation ahead of its full caller" pattern as
+//!   `repo_state`'s and `pull_request_state`'s rounds.
+//! - Any actual container starting. No Executor exists yet; `startNode`
+//!   only creates/returns a `node` row, never a real container.
+//! - Script execution of any kind.
+//! - A redelivery timer. The doc's "the coordinator tracks delivery per
+//!   `(run_id, node_id)` and keeps re-sending until the script
+//!   acknowledges it" needs a DO alarm, similar to this DO's existing
+//!   timeout alarm. This round only tracks the `acked` bit correctly
+//!   ([`RunCoordinator::handle_ack_node`]) — it does not build the
+//!   on-a-timer re-send mechanism that bit would eventually drive.
+//!
+//! **Who fails the run on a nondeterministic replay.** The doc says a
+//! `startNode` retry with a different spec hash is "rejected as
+//! nondeterministic; run fails". [`logic::resolve_start_node`] returns a
+//! typed [`logic::NondeterministicReplay`] error; this round's RPC
+//! surfaces it as a `409` with `code: "nondeterministic_replay"|("" +
+//! String)` (see [`CoordinatorError::NondeterministicReplay`]) rather
+//! than itself transitioning the whole run to a failed terminal state —
+//! see [`logic::resolve_start_node`]'s doc comment for why that is
+//! deliberately deferred to the future Workflow-integration caller.
+//!
+//! **Storage.** A `node` table (see [`ensure_schema`]) is authoritative,
+//! keyed by `node_id` alone — this DO instance *is* one run, the same
+//! "run_id is implicit, not a column" pattern `job`/`job_shard` already
+//! use. A `nodes` D1 table (migration 0010) projects it, keyed by
+//! `(run_id, node_id)` since D1 is shared across runs, same
+//! authoritative-DO/projected-D1 split as every other table here.
+//!
+//! **Run cancellation.** No RPC in this DO set a run to `RunState::Cancelled`
+//! before this round — only the enum variant existed. `handle_cancel_run`
+//! is the minimal hook this round adds: it moves the run to `Cancelled`
+//! and marks every non-terminal node `Cancelled`
+//! ([`logic::nodes_to_cancel`]). A `completeNode` call for an already-
+//! `Cancelled` node afterward is a documented no-op
+//! ([`logic::resolve_complete_node`]'s `DroppedCancelled` arm) — "late
+//! completion events for cancelled nodes are dropped" — rather than an
+//! error or a relabel.
+
 pub mod logic;
 
 use crate::github_checks;
@@ -174,9 +229,80 @@ pub struct CloseRunOutcome {
     pub status: RunStatus,
 }
 
+/// `startNode(run_id, node_id, spec_hash)`'s request (module docs'
+/// Nodes section). `check_name` is carried through to the `node` row
+/// for the future caller's own bookkeeping — this round never creates a
+/// Check Run from it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartNodeRequest {
+    pub node_id: String,
+    pub spec_hash: String,
+    #[serde(default)]
+    pub check_name: Option<String>,
+}
+
+/// `started: true` only on the fresh-row path
+/// ([`logic::StartNodeDecision::Started`]); `false` on the idempotent
+/// replay path. `status` is always the node's current status after this
+/// call, same either way.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartNodeOutcome {
+    pub node_id: String,
+    pub started: bool,
+    pub status: String,
+}
+
+/// `completeNode(run_id, node_id, status, result)`'s request. `status`
+/// must already be one of [`logic::NodeState::is_terminal`]'s terminal
+/// db-string values; `result` is the opaque, caller-supplied result
+/// payload (module docs: "a plain result object"), stored but never
+/// interpreted by this round.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompleteNodeRequest {
+    pub node_id: String,
+    pub status: String,
+    #[serde(default)]
+    pub result: Option<String>,
+}
+
+/// `dropped: true` on [`logic::CompleteNodeDecision::DroppedCancelled`]
+/// — `status` then reports the node's actual (unchanged, `Cancelled`)
+/// status, not the status the completion event claimed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompleteNodeOutcome {
+    pub node_id: String,
+    pub status: String,
+    pub dropped: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AckNodeRequest {
+    pub node_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AckNodeOutcome {
+    pub node_id: String,
+    pub acked: bool,
+}
+
+/// `handle_cancel_run`'s minimal hook (module docs' "Run cancellation").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancelRunOutcome {
+    pub run_id: String,
+    pub cancelled_nodes: Vec<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct ErrorBody {
     error: String,
+    /// Set only for errors a caller must distinguish by kind, not just
+    /// HTTP status — currently just `"nondeterministic_replay"` (see
+    /// [`CoordinatorError::NondeterministicReplay`]). `#[serde(default)]`
+    /// so every other `error_response` call (which never sets it) still
+    /// deserializes cleanly on the client side.
+    #[serde(default)]
+    code: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -233,6 +359,22 @@ struct CheckRunRow {
     status: String,
     conclusion: Option<String>,
     created_at: i64,
+}
+
+/// One node this run's (future) Dynamic Workflow has started, keyed by
+/// `node_id` alone — this DO instance *is* one run, same "run_id
+/// implicit" pattern as `JobRow`/`JobShardRow` (module docs' Nodes
+/// section).
+#[derive(Debug, Clone, Deserialize)]
+struct NodeRow {
+    node_id: String,
+    spec_hash: String,
+    status: String,
+    check_name: Option<String>,
+    result: Option<String>,
+    started_at: i64,
+    completed_at: Option<i64>,
+    acked: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -306,6 +448,11 @@ fn shard_state_of(row: &JobShardRow) -> worker::Result<logic::ShardState> {
     }
 }
 
+fn node_state_of(row: &NodeRow) -> worker::Result<logic::NodeState> {
+    logic::NodeState::from_db_str(&row.status)
+        .ok_or_else(|| worker::Error::RustError(format!("unknown node state {}", row.status)))
+}
+
 fn hex_sha256(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut hasher = Sha256::new();
@@ -363,6 +510,19 @@ impl DurableObject for RunCoordinator {
                 self.handle_complete_shard(&sql, body).await
             }
             (Method::Post, "/close-run") => self.handle_close_run(&sql, false).await,
+            (Method::Post, "/start-node") => {
+                let body: StartNodeRequest = req.json().await?;
+                self.handle_start_node(&sql, body).await
+            }
+            (Method::Post, "/complete-node") => {
+                let body: CompleteNodeRequest = req.json().await?;
+                self.handle_complete_node(&sql, body).await
+            }
+            (Method::Post, "/ack-node") => {
+                let body: AckNodeRequest = req.json().await?;
+                self.handle_ack_node(&sql, body).await
+            }
+            (Method::Post, "/cancel-run") => self.handle_cancel_run(&sql).await,
             _ => error_response(404, "unknown RunCoordinator route"),
         }
     }
@@ -1046,6 +1206,185 @@ impl RunCoordinator {
         })
     }
 
+    /// `startNode(run_id, node_id, spec_hash)` — module docs' Nodes
+    /// section, dynamic-pipelines.md's idempotency table's first two
+    /// rows. This round never starts a real container ([`logic::StartNodeDecision::Started`]'s
+    /// doc comment): the "start" here is entirely the `node` row itself.
+    async fn handle_start_node(
+        &self,
+        sql: &SqlStorage,
+        req: StartNodeRequest,
+    ) -> worker::Result<Response> {
+        if read_run(sql)?.is_none() {
+            return error_response(404, "run not found");
+        }
+        let existing = read_node(sql, &req.node_id)?;
+        let existing_for_logic = match &existing {
+            Some(row) => Some(logic::ExistingNode {
+                spec_hash: row.spec_hash.clone(),
+                status: node_state_of(row)?,
+            }),
+            None => None,
+        };
+
+        match logic::resolve_start_node(existing_for_logic.as_ref(), &req.spec_hash) {
+            Err(logic::NondeterministicReplay) => error_response_with_code(
+                409,
+                "start_node spec hash differs from the one already recorded for this node id",
+                "nondeterministic_replay",
+            ),
+            Ok(logic::StartNodeDecision::AlreadyStarted { status }) => {
+                Response::from_json(&StartNodeOutcome {
+                    node_id: req.node_id,
+                    started: false,
+                    status: status.as_db_str().to_string(),
+                })
+            }
+            Ok(logic::StartNodeDecision::Started) => {
+                let now_ms = worker::Date::now().as_millis() as i64;
+                insert_node(
+                    sql,
+                    &req.node_id,
+                    &req.spec_hash,
+                    req.check_name.as_deref(),
+                    now_ms,
+                )?;
+                let row = require_node(sql, &req.node_id)?;
+                let run_row = require_run(sql)?;
+                self.project_node_to_d1(&run_row.id, &row).await?;
+                Response::from_json(&StartNodeOutcome {
+                    node_id: req.node_id,
+                    started: true,
+                    status: row.status,
+                })
+            }
+        }
+    }
+
+    /// `completeNode(run_id, node_id, status, result)` — module docs'
+    /// Nodes section, dynamic-pipelines.md's "Completion event
+    /// delivered twice"/"Run cancelled" rows. Does not itself
+    /// re-send the completion event to any script (no real Workflow
+    /// caller exists yet — see module docs' scope boundary): this is
+    /// purely the state-recording half.
+    async fn handle_complete_node(
+        &self,
+        sql: &SqlStorage,
+        req: CompleteNodeRequest,
+    ) -> worker::Result<Response> {
+        let Some(run_row) = read_run(sql)? else {
+            return error_response(404, "run not found");
+        };
+        let Some(existing) = read_node(sql, &req.node_id)? else {
+            return error_response(404, "node not found");
+        };
+        let Some(incoming_status) = logic::NodeState::from_db_str(&req.status) else {
+            return error_response(400, "unknown node status");
+        };
+        if !incoming_status.is_terminal() {
+            return error_response(400, "complete_node requires a terminal status");
+        }
+        let current_status = node_state_of(&existing)?;
+
+        match logic::resolve_complete_node(current_status, incoming_status) {
+            Err(logic::CompleteNodeError::ConflictingStatus) => {
+                error_response(409, "node already concluded with a different status")
+            }
+            Ok(logic::CompleteNodeDecision::DroppedCancelled) => {
+                Response::from_json(&CompleteNodeOutcome {
+                    node_id: req.node_id,
+                    status: current_status.as_db_str().to_string(),
+                    dropped: true,
+                })
+            }
+            Ok(logic::CompleteNodeDecision::Recorded) => {
+                let now_ms = worker::Date::now().as_millis() as i64;
+                update_node_status(
+                    sql,
+                    &req.node_id,
+                    incoming_status.as_db_str(),
+                    req.result.as_deref(),
+                    now_ms,
+                )?;
+                let row = require_node(sql, &req.node_id)?;
+                self.project_node_to_d1(&run_row.id, &row).await?;
+                Response::from_json(&CompleteNodeOutcome {
+                    node_id: req.node_id,
+                    status: row.status,
+                    dropped: false,
+                })
+            }
+        }
+    }
+
+    /// `ackNode(run_id, node_id)` — module docs' Nodes section: tracks
+    /// the ack bit only, per the scope boundary (no redelivery timer
+    /// this round).
+    async fn handle_ack_node(
+        &self,
+        sql: &SqlStorage,
+        req: AckNodeRequest,
+    ) -> worker::Result<Response> {
+        let Some(run_row) = read_run(sql)? else {
+            return error_response(404, "run not found");
+        };
+        let Some(existing) = read_node(sql, &req.node_id)? else {
+            return error_response(404, "node not found");
+        };
+        let needs_write = logic::resolve_ack_node(existing.acked != 0);
+        if needs_write {
+            update_node_ack(sql, &req.node_id)?;
+            let row = require_node(sql, &req.node_id)?;
+            self.project_node_to_d1(&run_row.id, &row).await?;
+        }
+        Response::from_json(&AckNodeOutcome {
+            node_id: req.node_id,
+            acked: true,
+        })
+    }
+
+    /// Minimal run-cancellation hook (module docs' "Run cancellation"):
+    /// moves the run to `RunState::Cancelled` and marks every
+    /// non-terminal node `Cancelled`. No RPC set a run to `Cancelled`
+    /// before this round existed to need it.
+    async fn handle_cancel_run(&self, sql: &SqlStorage) -> worker::Result<Response> {
+        let Some(run_row) = read_run(sql)? else {
+            return error_response(404, "run not found");
+        };
+        if run_state_of(&run_row)?.is_terminal() {
+            // Idempotent no-op: an already-terminal run (including one
+            // already `Cancelled` by an earlier, redelivered call)
+            // never gets its terminal state overwritten.
+            return Response::from_json(&CancelRunOutcome {
+                run_id: run_row.id,
+                cancelled_nodes: Vec::new(),
+            });
+        }
+
+        let nodes: Vec<(String, logic::NodeState)> = read_all_nodes(sql)?
+            .iter()
+            .map(|row| Ok((row.node_id.clone(), node_state_of(row)?)))
+            .collect::<worker::Result<Vec<_>>>()?;
+        let to_cancel = logic::nodes_to_cancel(&nodes);
+
+        let now_ms = worker::Date::now().as_millis() as i64;
+        for node_id in &to_cancel {
+            mark_node_cancelled(sql, node_id, now_ms)?;
+            let row = require_node(sql, node_id)?;
+            self.project_node_to_d1(&run_row.id, &row).await?;
+        }
+
+        update_run_status(sql, &run_row.id, RunState::Cancelled)?;
+        self.state.storage().delete_alarm().await?;
+        let run_row = require_run(sql)?;
+        self.project_run_to_d1(&run_row).await?;
+
+        Response::from_json(&CancelRunOutcome {
+            run_id: run_row.id,
+            cancelled_nodes: to_cancel,
+        })
+    }
+
     async fn project_run_to_d1(&self, row: &RunRow) -> worker::Result<()> {
         let db = self.env.d1("DB")?;
         db.prepare(
@@ -1250,6 +1589,42 @@ impl RunCoordinator {
                 .clone()
                 .map_or(JsValue::NULL, |v| JsValue::from_str(&v)),
             JsValue::from_f64(row.created_at as f64),
+        ])?
+        .run()
+        .await?;
+        Ok(())
+    }
+
+    /// Projects one `node` row into D1's `nodes` table (migration
+    /// 0010), keyed by `(run_id, node_id)` since D1 is shared across
+    /// runs, unlike the DO's own `node_id`-only primary key (module
+    /// docs' Nodes section).
+    async fn project_node_to_d1(&self, run_id: &str, row: &NodeRow) -> worker::Result<()> {
+        let db = self.env.d1("DB")?;
+        db.prepare(
+            "INSERT INTO nodes (run_id, node_id, spec_hash, status, check_name, result, started_at, completed_at, acked) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+             ON CONFLICT (run_id, node_id) DO UPDATE SET \
+               status = excluded.status, \
+               result = excluded.result, \
+               completed_at = excluded.completed_at, \
+               acked = excluded.acked",
+        )
+        .bind(&[
+            JsValue::from_str(run_id),
+            JsValue::from_str(&row.node_id),
+            JsValue::from_str(&row.spec_hash),
+            JsValue::from_str(&row.status),
+            row.check_name
+                .clone()
+                .map_or(JsValue::NULL, |v| JsValue::from_str(&v)),
+            row.result
+                .clone()
+                .map_or(JsValue::NULL, |v| JsValue::from_str(&v)),
+            JsValue::from_f64(row.started_at as f64),
+            row.completed_at
+                .map_or(JsValue::NULL, |v| JsValue::from_f64(v as f64)),
+            JsValue::from_f64(row.acked as f64),
         ])?
         .run()
         .await?;
@@ -1628,6 +2003,19 @@ fn ensure_schema(sql: &SqlStorage) -> worker::Result<()> {
             status TEXT NOT NULL, \
             conclusion TEXT, \
             created_at INTEGER NOT NULL \
+        )",
+        None,
+    )?;
+    sql.exec(
+        "CREATE TABLE IF NOT EXISTS node ( \
+            node_id TEXT PRIMARY KEY, \
+            spec_hash TEXT NOT NULL, \
+            status TEXT NOT NULL, \
+            check_name TEXT, \
+            result TEXT, \
+            started_at INTEGER NOT NULL, \
+            completed_at INTEGER, \
+            acked INTEGER NOT NULL DEFAULT 0 \
         )",
         None,
     )?;
@@ -2223,6 +2611,105 @@ fn update_check_run_state(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Nodes (`startNode`/completion/`ack`, module docs' Nodes section)
+// ---------------------------------------------------------------------------
+
+const NODE_COLUMNS: &str =
+    "node_id, spec_hash, status, check_name, result, started_at, completed_at, acked";
+
+fn read_node(sql: &SqlStorage, node_id: &str) -> worker::Result<Option<NodeRow>> {
+    let rows: Vec<NodeRow> = sql
+        .exec(
+            &format!("SELECT {NODE_COLUMNS} FROM node WHERE node_id = ?1"),
+            vec![SqlStorageValue::from(node_id)],
+        )?
+        .to_array()?;
+    Ok(rows.into_iter().next())
+}
+
+fn require_node(sql: &SqlStorage, node_id: &str) -> worker::Result<NodeRow> {
+    read_node(sql, node_id)?
+        .ok_or_else(|| worker::Error::RustError("node row missing after write".into()))
+}
+
+/// Every node this run has ever started, for [`logic::nodes_to_cancel`]'s
+/// input — `handle_cancel_run`'s only caller.
+fn read_all_nodes(sql: &SqlStorage) -> worker::Result<Vec<NodeRow>> {
+    sql.exec(&format!("SELECT {NODE_COLUMNS} FROM node"), None)?
+        .to_array()
+}
+
+fn insert_node(
+    sql: &SqlStorage,
+    node_id: &str,
+    spec_hash: &str,
+    check_name: Option<&str>,
+    started_at_ms: i64,
+) -> worker::Result<()> {
+    sql.exec(
+        "INSERT INTO node (node_id, spec_hash, status, check_name, started_at) \
+         VALUES (?1, ?2, 'running', ?3, ?4)",
+        vec![
+            SqlStorageValue::from(node_id),
+            SqlStorageValue::from(spec_hash),
+            SqlStorageValue::from(check_name.map(str::to_string)),
+            SqlStorageValue::try_from_i64(started_at_ms)?,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Records a node's terminal status and result
+/// ([`logic::CompleteNodeDecision::Recorded`]). Never called for the
+/// `DroppedCancelled` decision — that decision writes nothing at all,
+/// per "late completion events for cancelled nodes are dropped".
+fn update_node_status(
+    sql: &SqlStorage,
+    node_id: &str,
+    status: &str,
+    result: Option<&str>,
+    completed_at_ms: i64,
+) -> worker::Result<()> {
+    sql.exec(
+        "UPDATE node SET status = ?1, result = ?2, completed_at = ?3 WHERE node_id = ?4",
+        vec![
+            SqlStorageValue::from(status),
+            SqlStorageValue::from(result.map(str::to_string)),
+            SqlStorageValue::try_from_i64(completed_at_ms)?,
+            SqlStorageValue::from(node_id),
+        ],
+    )?;
+    Ok(())
+}
+
+fn update_node_ack(sql: &SqlStorage, node_id: &str) -> worker::Result<()> {
+    sql.exec(
+        "UPDATE node SET acked = 1 WHERE node_id = ?1",
+        vec![SqlStorageValue::from(node_id)],
+    )?;
+    Ok(())
+}
+
+/// Marks `node_id` `Cancelled` — `handle_cancel_run`'s per-node write,
+/// for each id [`logic::nodes_to_cancel`] returned. Unlike
+/// `update_node_status`, this never touches `result`: a cancelled node
+/// never produced one.
+fn mark_node_cancelled(
+    sql: &SqlStorage,
+    node_id: &str,
+    completed_at_ms: i64,
+) -> worker::Result<()> {
+    sql.exec(
+        "UPDATE node SET status = 'cancelled', completed_at = ?1 WHERE node_id = ?2",
+        vec![
+            SqlStorageValue::try_from_i64(completed_at_ms)?,
+            SqlStorageValue::from(node_id),
+        ],
+    )?;
+    Ok(())
+}
+
 /// `RunCoordinator`'s own per-run monotonic counter for `accepted_seq`
 /// (byo-ci.md's Idempotency section), derived from the DO's own storage
 /// rather than a dedicated counter column: one more than the highest
@@ -2370,6 +2857,19 @@ fn decode_string_list(json: &str) -> worker::Result<Vec<String>> {
 fn error_response(status: u16, message: &str) -> worker::Result<Response> {
     Ok(Response::from_json(&ErrorBody {
         error: message.to_string(),
+        code: None,
+    })?
+    .with_status(status))
+}
+
+/// Same as [`error_response`], but tags the body with `code` so
+/// [`RunCoordinatorStore::call`] can distinguish this error kind from a
+/// generic 409 conflict — currently only used for
+/// [`CoordinatorError::NondeterministicReplay`].
+fn error_response_with_code(status: u16, message: &str, code: &str) -> worker::Result<Response> {
+    Ok(Response::from_json(&ErrorBody {
+        error: message.to_string(),
+        code: Some(code.to_string()),
     })?
     .with_status(status))
 }
@@ -2382,6 +2882,14 @@ fn error_response(status: u16, message: &str) -> worker::Result<Response> {
 pub enum CoordinatorError {
     NotFound,
     Conflict(String),
+    /// `startNode` named an id with a spec hash different from the one
+    /// already recorded for it — dynamic-pipelines.md's "rejected as
+    /// nondeterministic; run fails". Kept distinct from `Conflict` so a
+    /// future Workflow-integration caller can tell "ordinary 409" from
+    /// "the run itself needs to be failed" without string-matching the
+    /// message (see module docs' Nodes section for who actually fails
+    /// the run on this).
+    NondeterministicReplay,
     Internal(String),
 }
 
@@ -2389,6 +2897,12 @@ impl std::fmt::Display for CoordinatorError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotFound => write!(f, "run not found"),
+            Self::NondeterministicReplay => {
+                write!(
+                    f,
+                    "start_node spec hash differs from a prior start for this node id"
+                )
+            }
             Self::Conflict(msg) | Self::Internal(msg) => write!(f, "{msg}"),
         }
     }
@@ -2459,6 +2973,28 @@ impl RunCoordinatorStore {
         self.call::<(), _>(Method::Post, "/close-run", None).await
     }
 
+    pub async fn start_node(
+        &self,
+        req: &StartNodeRequest,
+    ) -> Result<StartNodeOutcome, CoordinatorError> {
+        self.call(Method::Post, "/start-node", Some(req)).await
+    }
+
+    pub async fn complete_node(
+        &self,
+        req: &CompleteNodeRequest,
+    ) -> Result<CompleteNodeOutcome, CoordinatorError> {
+        self.call(Method::Post, "/complete-node", Some(req)).await
+    }
+
+    pub async fn ack_node(&self, req: &AckNodeRequest) -> Result<AckNodeOutcome, CoordinatorError> {
+        self.call(Method::Post, "/ack-node", Some(req)).await
+    }
+
+    pub async fn cancel_run(&self) -> Result<CancelRunOutcome, CoordinatorError> {
+        self.call::<(), _>(Method::Post, "/cancel-run", None).await
+    }
+
     async fn call<B, R>(
         &self,
         method: Method,
@@ -2488,12 +3024,18 @@ impl RunCoordinatorStore {
             200..=299 => response.json::<R>().await.map_err(|e| stub_error(path, e)),
             404 => Err(CoordinatorError::NotFound),
             409 => {
-                let detail = response
-                    .json::<ErrorBody>()
-                    .await
-                    .map(|b| b.error)
-                    .unwrap_or_else(|_| "shard_total or expect_jobs conflict".to_string());
-                Err(CoordinatorError::Conflict(detail))
+                let body = response.json::<ErrorBody>().await.ok();
+                match body {
+                    Some(ErrorBody {
+                        code: Some(code), ..
+                    }) if code == "nondeterministic_replay" => {
+                        Err(CoordinatorError::NondeterministicReplay)
+                    }
+                    Some(ErrorBody { error, .. }) => Err(CoordinatorError::Conflict(error)),
+                    None => Err(CoordinatorError::Conflict(
+                        "shard_total or expect_jobs conflict".to_string(),
+                    )),
+                }
             }
             status => {
                 let detail = response.text().await.unwrap_or_default();
