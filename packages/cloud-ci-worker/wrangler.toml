@@ -4,3 +4,26 @@ compatibility_date = "2026-09-01"
 
 [build]
 command = "worker-build --release"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "cloud-ci"
+# Placeholder until the production database exists; local dev (miniflare)
+# never contacts it.
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"
+
+# One SQLite-backed Durable Object per run (ADR 0004, docs/design/byo-ci.md).
+# Addressed by `(repo_id, sha, run_key, attempt)`, never by the run's own
+# ULID, so a redelivered or reordered BeginRun always lands on the same
+# instance (architecture.md's "Run identity").
+[[durable_objects.bindings]]
+name = "RUN_COORDINATOR"
+class_name = "RunCoordinator"
+
+# new_sqlite_classes, not new_classes: RunCoordinator uses
+# state.storage().sql(), which only exists on SQLite-backed objects. Never
+# rewrite this entry — migrations are append-only.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RunCoordinator"]
