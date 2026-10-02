@@ -4,6 +4,8 @@
 //! `docs/architecture.md`'s package table (Vitest, Playwright, lcov, ...) are later work and
 //! intentionally have no surface here yet.
 
+pub mod junit;
+
 /// A parsed `<testsuites>` document: zero or more [`TestSuite`]s.
 ///
 /// JUnit files in the wild sometimes omit the wrapping `<testsuites>` element and use a bare
