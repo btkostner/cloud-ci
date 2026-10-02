@@ -14,6 +14,7 @@ service IngestService {
   rpc SubmitReport(SubmitReportRequest) returns (SubmitReportResponse);
   rpc CompleteShard(CompleteShardRequest) returns (CompleteShardResponse);
   rpc GetRun(GetRunRequest) returns (GetRunResponse);
+  rpc GetTestTimings(GetTestTimingsRequest) returns (GetTestTimingsResponse);
 }
 
 enum Trigger {
@@ -150,4 +151,28 @@ message GetRunResponse {
   string run_id = 1;
   RunStatus status = 2;
   repeated JobState jobs = 3;
+}
+
+// Per-file historical duration lookup for `cloud-ci split --strategy
+// timing` (docs/design/parallelization.md's "`cloud-ci split`" section),
+// scoped to one repo. `file_paths` is the `--files` glob's matched set at
+// `file` granularity (the only granularity `cloud-ci split` implements
+// today). Read-only; never writes `test_stats`.
+message GetTestTimingsRequest {
+  uint64 repo_id = 1;
+  repeated string file_paths = 2;
+}
+
+// One file's known historical duration, aggregated from `test_stats`
+// (docs/design/analytics.md). Only present for files with at least one
+// `test_stats` row; a file with no history simply has no entry here —
+// the caller's `cloud_ci_core::split::HistoryLookup` contract already
+// treats "no entry" as "unknown duration".
+message FileTiming {
+  string file_path = 1;
+  uint64 duration_ms = 2;
+}
+
+message GetTestTimingsResponse {
+  repeated FileTiming timings = 1;
 }
