@@ -576,7 +576,14 @@ enum TaggedKind {
 
 struct Tagged {
     kind: TaggedKind,
-    whole: String,
+    /// The marker-free wrapped markdown — `parse_segments`'s matched
+    /// span with its own `<!--cc:...-->`/`<!--/cc:...-->` wrapper
+    /// already stripped. This is what every segment renders as when
+    /// `replacement` is `None` — the internal truncation-bookkeeping
+    /// markers must never leak into a posted comment, including the
+    /// overwhelmingly common under-budget case where no truncation step
+    /// ever runs.
+    stripped: String,
     replacement: Option<String>,
 }
 
@@ -588,7 +595,7 @@ enum Segment {
 fn segment_bytes(seg: &Segment) -> usize {
     match seg {
         Segment::Literal(s) => s.len(),
-        Segment::Tagged(t) => t.replacement.as_deref().unwrap_or(&t.whole).len(),
+        Segment::Tagged(t) => t.replacement.as_deref().unwrap_or(&t.stripped).len(),
     }
 }
 
@@ -601,7 +608,7 @@ fn render_segments(segments: &[Segment]) -> String {
     for seg in segments {
         match seg {
             Segment::Literal(s) => out.push_str(s),
-            Segment::Tagged(t) => out.push_str(t.replacement.as_deref().unwrap_or(&t.whole)),
+            Segment::Tagged(t) => out.push_str(t.replacement.as_deref().unwrap_or(&t.stripped)),
         }
     }
     out
@@ -697,10 +704,10 @@ fn parse_segments(markdown: &str) -> Vec<Segment> {
             break;
         };
         let close_end = open_len + close_rel + close_tag.len();
-        let whole = tail[..close_end].to_string();
+        let stripped = tail[open_len..open_len + close_rel].to_string();
         segments.push(Segment::Tagged(Tagged {
             kind,
-            whole,
+            stripped,
             replacement: None,
         }));
         pos = abs_start + close_end;
@@ -712,9 +719,18 @@ fn parse_segments(markdown: &str) -> Vec<Segment> {
 /// `rendered` (already-produced markdown, never the template — see
 /// module docs). Returns the (possibly unchanged) final body.
 fn truncate_markdown(rendered: String, ctx: &PrReport) -> RenderedReport {
-    if rendered.len() <= MAX_BODY_BYTES {
+    // Markers must always be parsed out before any body is returned,
+    // even when nothing needs truncating: `rendered` is raw `minijinja`
+    // output and still carries every `<!--cc:...-->`/`<!--/cc:...-->`
+    // bookkeeping wrapper (see module docs' "Size budget and
+    // truncation"). `parse_segments`/`render_segments` round-trip to an
+    // unchanged *visible* body when nothing is replaced — `Tagged`'s
+    // `stripped` field already has the wrapper removed — so this is the
+    // only path, including the overwhelmingly common under-budget case.
+    let mut segments = parse_segments(&rendered);
+    if total_bytes(&segments) <= MAX_BODY_BYTES {
         return RenderedReport {
-            markdown: rendered,
+            markdown: render_segments(&segments),
             truncated: false,
             overflow: false,
         };
@@ -725,8 +741,6 @@ fn truncate_markdown(rendered: String, ctx: &PrReport) -> RenderedReport {
         .full_report_url
         .clone()
         .unwrap_or_else(|| ctx.links.dashboard_url.clone());
-
-    let mut segments = parse_segments(&rendered);
 
     // Step 1: failures soft-budget degradation (first 10 full, next 40
     // one-line, rest dropped with an "and N more" note).
@@ -896,6 +910,7 @@ mod tests {
 \n\
 Base `main` @ `abc1234` · [Dashboard](https://ci.example.com/acme/web/pull/412)";
         assert_eq!(out.markdown.trim_end(), expected);
+        assert!(!out.markdown.contains("<!--cc:"));
         Ok(())
     }
 
@@ -1116,6 +1131,7 @@ Base `main` @ `abc1234` · [Dashboard](https://ci.example.com/acme/web/pull/412)
         assert!(md.contains("- [ ] Autofix <!-- cloud-ci:action autofix -->"));
 
         assert!(md.contains("<sub>Previous head `9a0c1e2`: 3 failed, 13 passed (superseded). Commands: `/cloud-ci help`.</sub>"));
+        assert!(!md.contains("<!--cc:"));
 
         Ok(())
     }
@@ -1177,6 +1193,51 @@ Base `main` @ `abc1234` · [Dashboard](https://ci.example.com/acme/web/pull/412)
         assert!(out.markdown.contains("<details open>"));
         // Beyond 50, failures collapse to an "and N more" note.
         assert!(out.markdown.contains("more failures"));
+        assert!(!out.markdown.contains("<!--cc:"));
         Ok(())
+    }
+
+    /// Multi-byte UTF-8 content (accents, CJK, emoji) placed in failure
+    /// test names/messages right where byte-budget truncation chops the
+    /// failures list — proves `truncate_markdown` never slices a
+    /// `String`/`&str` by a raw byte index that could land inside a
+    /// multi-byte character's encoding. It doesn't: every truncation
+    /// step only ever drops or replaces whole [`Segment`]s (produced by
+    /// [`parse_segments`] splitting on ASCII marker text, never on byte
+    /// counts), so `markdown.len() <= MAX_BODY_BYTES` is enforced by
+    /// which whole segments are kept, never by cutting through one.
+    #[test]
+    fn truncation_respects_utf8_character_boundaries() -> Result<(), PrCommentError> {
+        let mut ctx = mid_run_report();
+        let template_failure = ctx.scopes[0].failures[0].clone();
+        ctx.scopes[0].failures = (0..300)
+            .map(|i| Failure {
+                test: format!("café › 日本語テスト › 🎉 #{i}", i = i),
+                message: format!("expected café résumé 日本語 🎉 but got #{i}", i = i),
+                ..template_failure.clone()
+            })
+            .collect();
+        ctx.job_counts.failed = 300;
+
+        let out = render_pr_report(&ctx)?;
+        assert!(out.truncated);
+        assert!(!out.overflow);
+        assert!(out.markdown.len() <= MAX_BODY_BYTES);
+        // `markdown` is already a `String`: this only re-confirms no
+        // truncation step produced invalid UTF-8 along the way.
+        assert!(String::from_utf8(out.markdown.as_bytes().to_vec()).is_ok());
+        assert!(!out.markdown.contains("<!--cc:"));
+        Ok(())
+    }
+
+    /// `decode_oneline`'s `base64` round-trip (the one-line failure
+    /// fallback embedded by `DEFAULT_TEMPLATE` as a marker attribute)
+    /// must preserve multi-byte failure text exactly.
+    #[test]
+    fn decode_oneline_round_trips_multibyte_text() {
+        let line = "- `ci / unit` café › 日本語テスト › 🎉: expected café 🎉 but got résumé\n";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(line);
+        let open_tag = format!("<!--cc:f idx=0 line={b64}-->");
+        assert_eq!(decode_oneline(&open_tag), line);
     }
 }
