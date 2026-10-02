@@ -893,9 +893,9 @@ async fn handle_issue_token(req: &mut Request, env: &Env) -> Result<Response> {
     };
 
     let body = req.bytes().await?;
-    let request: token_issuance::IssueTokenRequest = match serde_json::from_slice(&body) {
+    let request = match token_issuance::parse_request(&body) {
         Ok(r) => r,
-        Err(e) => return json_error(400, &format!("invalid request body: {e}")),
+        Err(e) => return json_error(400, &format!("{e}")),
     };
     if let Err(e) = token_issuance::validate_request(&request, now_s) {
         return json_error(400, &format!("{e}"));

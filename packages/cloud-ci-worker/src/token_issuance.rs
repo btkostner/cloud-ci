@@ -67,23 +67,75 @@ pub const KNOWN_SCOPES: &[&str] = &["ingest:write", "query:read", "admin:tokens"
 /// }
 /// ```
 ///
-/// `repo_allowlist` and `expires_at` are **required JSON keys** holding
-/// **nullable** values, not optional/absent-defaulting ones: a plain
-/// `Option<T>` field without `#[serde(default)]` still rejects a missing
-/// key, it only accepts an explicit `null` value for a present one. This
-/// is the deliberate guard for `repo_allowlist` specifically — a `null`
-/// allowlist means "every repo this deployment knows about" (auth.md's
-/// "Data model": "null = all repos visible to `created_by`, which may
-/// span installations"), a strictly broader grant than any finite list,
-/// so an issuer has to type the literal word `null` on purpose; a request
-/// body that simply omits the field is a `400`, never a silent
-/// all-repos token.
-#[derive(Debug, Clone, Deserialize)]
+/// `repo_allowlist` is a **required JSON key** holding a **nullable**
+/// value — a `null` allowlist means "every repo this deployment knows
+/// about" (auth.md's "Data model": "null = all repos visible to
+/// `created_by`, which may span installations"), a strictly broader
+/// grant than any finite list, so an issuer has to type the literal word
+/// `null` on purpose; a request body that simply omits the key is a
+/// `400` ([`RequestError::MissingRepoAllowlist`]), never a silent
+/// all-repos token. This is enforced by [`parse_request`], not by
+/// `#[derive(Deserialize)]` alone: a plain `Option<T>` field is special-
+/// cased by serde's derive macro to be implicitly optional (defaulting
+/// to `None` when the key is absent) *regardless* of `#[serde(default)]`
+/// — there is no plain-derive way to reject a missing `Option<T>` key.
+/// [`parse_request`] works around this with the standard "double
+/// `Option`" idiom ([`RawIssueTokenRequest`]) so "key absent" and "key
+/// present with `null`" are distinguishable.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssueTokenRequest {
     pub name: String,
     pub scopes: Vec<String>,
     pub repo_allowlist: Option<Vec<u64>>,
     pub expires_at: Option<i64>,
+}
+
+/// Wire-shape mirror of [`IssueTokenRequest`] used only during parsing.
+/// `repo_allowlist`'s double-`Option` (`Option<Option<Vec<u64>>>`) is the
+/// standard trick for telling "key absent" apart from "key present,
+/// value `null`": serde's built-in `null`-handling for `Option<T>`
+/// collapses a present-but-null value straight to the *outer* `None`
+/// unless the inner `Option` is deserialized through
+/// [`deserialize_present`] instead of relying on the derived impl, hence
+/// the explicit `deserialize_with`. `#[serde(default)]` then supplies the
+/// outer `None` only when the key is missing entirely — the one case
+/// [`parse_request`] rejects.
+#[derive(Debug, Deserialize)]
+struct RawIssueTokenRequest {
+    name: String,
+    scopes: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    repo_allowlist: Option<Option<Vec<u64>>>,
+    #[serde(default)]
+    expires_at: Option<i64>,
+}
+
+/// Deserializes a present JSON value (including `null`) into `Some(T)`,
+/// for the "double `Option`" idiom on [`RawIssueTokenRequest`]'s
+/// `repo_allowlist` field — see that field's doc comment.
+fn deserialize_present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Deserialize::deserialize(deserializer).map(Some)
+}
+
+/// Parses a `POST /v1/tokens` request body, enforcing that
+/// `repo_allowlist` is a present key (explicit `null` is fine; an
+/// omitted key is not) — see [`IssueTokenRequest`]'s doc comment.
+pub fn parse_request(body: &[u8]) -> Result<IssueTokenRequest, RequestError> {
+    let raw: RawIssueTokenRequest =
+        serde_json::from_slice(body).map_err(|e| RequestError::InvalidJson(e.to_string()))?;
+    let Some(repo_allowlist) = raw.repo_allowlist else {
+        return Err(RequestError::MissingRepoAllowlist);
+    };
+    Ok(IssueTokenRequest {
+        name: raw.name,
+        scopes: raw.scopes,
+        repo_allowlist,
+        expires_at: raw.expires_at,
+    })
 }
 
 /// `POST /v1/tokens`'s success response: the plaintext token (shown once,
@@ -99,10 +151,19 @@ pub struct IssueTokenResponse {
     pub expires_at: Option<i64>,
 }
 
-/// Why an [`IssueTokenRequest`] fails validation, before any role check
-/// or D1 write happens. Pure, unit-tested with plain `cargo test`.
+/// Why an [`IssueTokenRequest`] fails to parse or validate, before any
+/// role check or D1 write happens. Pure, unit-tested with plain
+/// `cargo test`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestError {
+    /// Malformed JSON, or a JSON value that doesn't match the expected
+    /// shape (e.g. `scopes` not an array of strings). Carries
+    /// `serde_json`'s error message for the caller.
+    InvalidJson(String),
+    /// `repo_allowlist` key was absent entirely — see
+    /// [`IssueTokenRequest`]'s doc comment for why this is rejected
+    /// rather than treated as `null`.
+    MissingRepoAllowlist,
     EmptyName,
     EmptyScopes,
     UnknownScope(String),
@@ -113,6 +174,11 @@ pub enum RequestError {
 impl std::fmt::Display for RequestError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            RequestError::InvalidJson(e) => write!(f, "invalid request body: {e}"),
+            RequestError::MissingRepoAllowlist => write!(
+                f,
+                "repo_allowlist is a required key (use null for all repos, or a list of repo ids)"
+            ),
             RequestError::EmptyName => write!(f, "name must not be empty"),
             RequestError::EmptyScopes => write!(f, "scopes must not be empty"),
             RequestError::UnknownScope(s) => write!(f, "unknown scope: {s}"),
@@ -276,6 +342,47 @@ mod tests {
     #[test]
     fn valid_request_passes() {
         assert_eq!(validate_request(&valid_request(), 1_000), Ok(()));
+    }
+
+    #[test]
+    fn parse_request_rejects_missing_repo_allowlist_key() {
+        let body = br#"{"name":"x","scopes":["ingest:write"],"expires_at":null}"#;
+        assert_eq!(parse_request(body), Err(RequestError::MissingRepoAllowlist));
+    }
+
+    #[test]
+    fn parse_request_accepts_explicit_null_repo_allowlist() -> Result<(), RequestError> {
+        let body =
+            br#"{"name":"x","scopes":["ingest:write"],"repo_allowlist":null,"expires_at":null}"#;
+        let req = parse_request(body)?;
+        assert_eq!(req.repo_allowlist, None);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_request_accepts_finite_repo_allowlist() -> Result<(), RequestError> {
+        let body =
+            br#"{"name":"x","scopes":["ingest:write"],"repo_allowlist":[1,2],"expires_at":null}"#;
+        let req = parse_request(body)?;
+        assert_eq!(req.repo_allowlist, Some(vec![1, 2]));
+        Ok(())
+    }
+
+    #[test]
+    fn parse_request_defaults_missing_expires_at_to_none() -> Result<(), RequestError> {
+        let body = br#"{"name":"x","scopes":["ingest:write"],"repo_allowlist":null}"#;
+        let req = parse_request(body)?;
+        assert_eq!(req.expires_at, None);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_request_rejects_malformed_json() {
+        let body = b"not json";
+        assert!(matches!(
+            parse_request(body),
+            Err(RequestError::InvalidJson(_))
+        ));
     }
 
     #[test]
