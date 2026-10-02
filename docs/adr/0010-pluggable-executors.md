@@ -40,7 +40,7 @@ snapshots), every other backend becomes a rewrite.
 
 | Executor | Status | Boots agent via | Limits that matter |
 | --- | --- | --- | --- |
-| Cloudflare Containers | Default, built first | DO `ctx.container.start({ instance })` | 4 vCPU / 12 GiB / 20 GB disk ([0005](./0005-containers-for-execution.md)) |
+| Cloudflare Containers | Default, built first | DO `ctx.container.start({ instance })` — as of 2026-10-02 this is only directly callable from Rust for `default`-policy (Wrangler-config-fixed image/size) containers; `durable_object`-policy per-call sizing and exit-status reads need either extending the vendored `worker`/`worker-sys` crates' container bindings (bounded wasm-bindgen glue, not a redesign) or an upstream contribution to `cloudflare/workers-rs` (Containers from Rust spike, 2026-10-02) | 4 vCPU / 12 GiB / 20 GB disk ([0005](./0005-containers-for-execution.md)) |
 | AWS EC2 | Possible | `RunInstances` with user-data that starts the agent | Instance quotas and boot time `[unverified]` |
 | AWS Lambda | Possible, small jobs only | Function invocation with bootstrap token in payload | 15 min timeout, ≤10,240 MB memory, `/tmp` 512–10,240 MB; no sidecars, no Docker daemon. Source: docs.aws.amazon.com/lambda/latest/dg/gettingstarted-limits.html, checked 2026-10-01 |
 | Kubernetes Jobs | Possible | Job manifest whose pod runs the agent | Cluster-defined |

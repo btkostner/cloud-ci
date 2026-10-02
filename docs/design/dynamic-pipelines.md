@@ -303,6 +303,15 @@ sequenceDiagram
     RC->>GH: check runs, PR comment notify
 ```
 
+`RC->>C: start (policy-checked size, image, secrets)` and the `exit code` in `ci.container`'s
+result above describe the target design, not what's callable today: the Containers from Rust
+spike (2026-10-02) found the vendored `worker`/`worker-sys` crates' `Container` bindings have no
+`image`/`instance` fields on `ContainerStartupOptions` and no `exec()`/exit-code accessor, so
+per-call instance sizing (the `durable_object` scheduling policy) and exit-status reads are not
+reachable from Rust until those bindings are extended or upstreamed into `cloudflare/workers-rs`.
+`default`-policy containers (fixed image/size, no exit code) do start and run to exit from Rust
+today, proven via local Docker-backed `wrangler dev` in the same spike.
+
 Each `ci.container(id, spec)` call is two durable operations:
 
 1. `step.do("start:" + id)` asks `RunCoordinator` to start the node. This returns quickly and is
