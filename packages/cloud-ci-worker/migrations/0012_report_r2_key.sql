@@ -1,0 +1,15 @@
+-- `test_stats` finalization (analytics.md's "R2" section: "the full parsed
+-- result of each upload ... is stored in R2") needs to re-read a report's
+-- full raw bytes at run-close time, for every accepted report — not just
+-- upload-backed ones. An upload-backed report already has bytes in R2 at
+-- `uploads.r2_key` (migration 0002), but an inline-data `SubmitReport` call
+-- (`upload_id IS NULL`) never persisted its bytes anywhere: they only ever
+-- existed in the Worker request body. This column makes every `reports`
+-- row carry its own R2 location directly, uniformly, regardless of source:
+-- for an upload-backed report it is set to that upload's own `r2_key`; for
+-- an inline one, `coordinator::mod::handle_submit_report` now writes the
+-- bytes to R2 itself (content-addressed, matching uploads' own
+-- `runs/<run_id>/uploads/<upload_id>/<sha256>` convention:
+-- `runs/<run_id>/reports/<job_id>/<shard_index>/<content_sha256>`) before
+-- inserting the row. Forward-only, per AGENTS.md.
+ALTER TABLE reports ADD COLUMN r2_key TEXT NOT NULL DEFAULT '';

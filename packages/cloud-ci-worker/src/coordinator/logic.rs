@@ -789,6 +789,165 @@ pub fn nodes_to_cancel(nodes: &[(String, NodeState)]) -> Vec<String> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// `test_stats` finalization (docs/design/analytics.md's "D1 rollup
+// tables" / "Idempotency"), backing `coordinator::mod`'s
+// `finalize_test_stats` — the once-per-run write path that applies every
+// canonical, parsed report's test outcomes to the `test_stats` rolling
+// aggregate. Pure, no-I/O logic only; `finalize_test_stats` supplies the
+// parsed report bytes (via `cloud-ci-reports`) and does the actual D1
+// `batch()` call.
+// ---------------------------------------------------------------------------
+
+/// `duration_ewma_ms`'s smoothing factor (analytics.md: "exponential
+/// moving average, alpha = 0.2").
+pub const EWMA_ALPHA: f64 = 0.2;
+
+/// `recent_outcomes`'s fixed capacity (analytics.md: "last 20 outcomes").
+pub const RECENT_OUTCOMES_CAP: usize = 20;
+
+/// `test_id = hex(sha256(file_path || 0x1f || full_test_name))[0:16]`
+/// (analytics.md's `test_failures`/`test_stats` schema comment). `0x1f`
+/// (ASCII Unit Separator) joins the two fields unambiguously — unlike a
+/// printable delimiter, it cannot itself appear in a legitimate file path
+/// or test name, so two distinct `(file_path, full_test_name)` pairs never
+/// collide by one field "swallowing" the separator. Truncated to the
+/// first 16 hex characters (8 bytes) of the digest, per the doc's
+/// `[0:16]`.
+pub fn test_id(file_path: &str, full_test_name: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(file_path.as_bytes());
+    hasher.update([0x1f]);
+    hasher.update(full_test_name.as_bytes());
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(16);
+    for byte in digest.iter().take(8) {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex
+}
+
+/// The "full test name" half of [`test_id`]'s input. `cloud-ci-reports`'
+/// `TestCase` separates `classname` (xUnit-family formats' enclosing
+/// class/module, e.g. pytest's `--junitxml` output) from `name` (the bare
+/// test name, which on its own can collide across classes/modules in the
+/// same file); joining them with `::` when a classname is present mirrors
+/// Rust/pytest's own conventional "module::test" display format and keeps
+/// `test_id` stable across reports that do/don't populate `classname` for
+/// the exact same test, as long as both agree on it. A `None` or empty
+/// classname (Vitest/Playwright, which populate `file` but not
+/// `classname`) falls back to the bare name.
+pub fn full_test_name(classname: Option<&str>, name: &str) -> String {
+    match classname {
+        Some(c) if !c.is_empty() => format!("{c}::{name}"),
+        _ => name.to_string(),
+    }
+}
+
+/// `recent_outcomes`'s per-run character and `test_stats.last_status`'s
+/// word, derived once from a parsed [`cloud_ci_reports::Outcome`] (see
+/// `coordinator::mod`'s `test_outcome_of`). `Errored` is folded into
+/// `Failed` — analytics.md's `recent_outcomes` comment only names three
+/// outcomes (`'P'/'F'/'S'`), and `parse_report`'s existing
+/// `summarize_test_suites` already treats `Errored` as a failure-shaped
+/// outcome for aggregate counting, so this matches that precedent rather
+/// than inventing a fourth bucket nothing downstream expects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestOutcomeKind {
+    Passed,
+    Failed,
+    Skipped,
+}
+
+impl TestOutcomeKind {
+    pub fn as_char(self) -> char {
+        match self {
+            TestOutcomeKind::Passed => 'P',
+            TestOutcomeKind::Failed => 'F',
+            TestOutcomeKind::Skipped => 'S',
+        }
+    }
+
+    pub fn as_status_word(self) -> &'static str {
+        match self {
+            TestOutcomeKind::Passed => "pass",
+            TestOutcomeKind::Failed => "fail",
+            TestOutcomeKind::Skipped => "skip",
+        }
+    }
+}
+
+/// One test case's outcome, reduced to exactly what `finalize_test_stats`
+/// (`coordinator::mod`) needs to upsert into `test_stats` — file/name
+/// already combined into [`test_id`], duration already in whole
+/// milliseconds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TestOutcomeRow {
+    pub test_id: String,
+    pub file_path: String,
+    pub test_name: String,
+    pub duration_ms: i64,
+    pub outcome: TestOutcomeKind,
+}
+
+/// `duration_ewma_ms = alpha * new + (1 - alpha) * old` (analytics.md).
+/// `existing` is `None` for a test's first-ever occurrence for a
+/// `(repo_id, test_id)` — analytics.md's upsert pattern's `INSERT` branch
+/// (no prior row to blend with) simply sets `duration_ewma_ms` to the
+/// first duration, which this models directly rather than blending
+/// against an arbitrary starting value like `0.0`.
+pub fn ewma(existing: Option<f64>, new_duration_ms: f64) -> f64 {
+    match existing {
+        None => new_duration_ms,
+        Some(prev) => EWMA_ALPHA * new_duration_ms + (1.0 - EWMA_ALPHA) * prev,
+    }
+}
+
+/// Appends one outcome char to `recent_outcomes`, dropping the oldest
+/// char(s) once the string exceeds [`RECENT_OUTCOMES_CAP`] — analytics.md:
+/// "last 20 outcomes ... newest last", matching the doc's own
+/// `substr(... || ..., -20)` SQL expression's behavior exactly (keep the
+/// last 20 characters of the concatenation).
+pub fn append_capped_outcome(existing: &str, ch: char) -> String {
+    let mut combined: Vec<char> = existing.chars().collect();
+    combined.push(ch);
+    if combined.len() > RECENT_OUTCOMES_CAP {
+        let drop = combined.len() - RECENT_OUTCOMES_CAP;
+        combined.drain(0..drop);
+    }
+    combined.into_iter().collect()
+}
+
+/// `flipscount / (len(recent_outcomes) - 1)` (analytics.md: "flips /
+/// (len(recent_outcomes) - 1)") — a "flip" is any adjacent pair of
+/// differing outcome chars, counted over the *current* (already-capped,
+/// already-appended) `recent_outcomes` string. Fewer than two outcomes has
+/// no adjacent pair to flip between, so the score is `0.0` rather than a
+/// division by zero.
+pub fn flakiness_score(recent_outcomes: &str) -> f64 {
+    let chars: Vec<char> = recent_outcomes.chars().collect();
+    if chars.len() < 2 {
+        return 0.0;
+    }
+    let flips = chars.windows(2).filter(|pair| pair[0] != pair[1]).count();
+    flips as f64 / (chars.len() - 1) as f64
+}
+
+/// De-duplicates a run's concatenated test-outcome rows by `test_id`,
+/// keeping the first occurrence — analytics.md's "Upsert pattern for
+/// `test_stats`": "Two groups can describe the same test ... so before
+/// binding the array it is deduplicated by `test_id`, keeping one entry
+/// per distinct test ... an array with the same `test_id` twice would
+/// silently count one run as two." Order-preserving over first
+/// occurrences, same convention as [`new_check_names`] above.
+pub fn dedupe_test_outcomes(rows: Vec<TestOutcomeRow>) -> Vec<TestOutcomeRow> {
+    let mut seen = std::collections::HashSet::new();
+    rows.into_iter()
+        .filter(|row| seen.insert(row.test_id.clone()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1491,5 +1650,118 @@ mod tests {
         ] {
             assert_eq!(NodeState::from_db_str(state.as_db_str()), Some(state));
         }
+    }
+
+    #[test]
+    fn test_id_is_stable_and_16_hex_chars() {
+        let a = test_id("src/foo.rs", "mod::test_one");
+        let b = test_id("src/foo.rs", "mod::test_one");
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 16);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_id_distinguishes_field_boundary() {
+        // Without an unambiguous separator, "ab"+"c" and "a"+"bc" would
+        // collide; the 0x1f join must keep them distinct.
+        let a = test_id("ab", "c");
+        let b = test_id("a", "bc");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_id_differs_for_different_inputs() {
+        let a = test_id("src/foo.rs", "test_one");
+        let b = test_id("src/foo.rs", "test_two");
+        let c = test_id("src/bar.rs", "test_one");
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn full_test_name_joins_classname_and_name() {
+        assert_eq!(full_test_name(Some("pkg.Mod"), "test_x"), "pkg.Mod::test_x");
+    }
+
+    #[test]
+    fn full_test_name_falls_back_to_bare_name() {
+        assert_eq!(full_test_name(None, "test_x"), "test_x");
+        assert_eq!(full_test_name(Some(""), "test_x"), "test_x");
+    }
+
+    #[test]
+    fn ewma_first_occurrence_sets_raw_duration() {
+        assert_eq!(ewma(None, 123.0), 123.0);
+    }
+
+    #[test]
+    fn ewma_blends_with_alpha_0_2() {
+        // 0.2*200 + 0.8*100 = 120
+        assert_eq!(ewma(Some(100.0), 200.0), 120.0);
+    }
+
+    #[test]
+    fn append_capped_outcome_grows_under_cap() {
+        assert_eq!(append_capped_outcome("PP", 'F'), "PPF");
+    }
+
+    #[test]
+    fn append_capped_outcome_drops_oldest_at_cap() {
+        let existing = "P".repeat(20);
+        let result = append_capped_outcome(&existing, 'F');
+        assert_eq!(result.chars().count(), 20);
+        assert_eq!(result, format!("{}F", "P".repeat(19)));
+    }
+
+    #[test]
+    fn flakiness_score_zero_for_fewer_than_two_outcomes() {
+        assert_eq!(flakiness_score(""), 0.0);
+        assert_eq!(flakiness_score("P"), 0.0);
+    }
+
+    #[test]
+    fn flakiness_score_zero_when_stable() {
+        assert_eq!(flakiness_score("PPPP"), 0.0);
+    }
+
+    #[test]
+    fn flakiness_score_counts_adjacent_flips() {
+        // P F P F: 3 flips over 3 adjacent pairs = 1.0
+        assert_eq!(flakiness_score("PFPF"), 1.0);
+        // P P F F: 1 flip over 3 adjacent pairs
+        assert!((flakiness_score("PPFF") - (1.0 / 3.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn dedupe_test_outcomes_keeps_first_occurrence() {
+        let rows = vec![
+            TestOutcomeRow {
+                test_id: "a".into(),
+                file_path: "f".into(),
+                test_name: "t".into(),
+                duration_ms: 10,
+                outcome: TestOutcomeKind::Passed,
+            },
+            TestOutcomeRow {
+                test_id: "a".into(),
+                file_path: "f".into(),
+                test_name: "t".into(),
+                duration_ms: 9999,
+                outcome: TestOutcomeKind::Failed,
+            },
+            TestOutcomeRow {
+                test_id: "b".into(),
+                file_path: "f2".into(),
+                test_name: "t2".into(),
+                duration_ms: 5,
+                outcome: TestOutcomeKind::Skipped,
+            },
+        ];
+        let deduped = dedupe_test_outcomes(rows);
+        assert_eq!(deduped.len(), 2);
+        assert_eq!(deduped[0].test_id, "a");
+        assert_eq!(deduped[0].duration_ms, 10);
+        assert_eq!(deduped[1].test_id, "b");
     }
 }
