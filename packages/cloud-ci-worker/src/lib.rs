@@ -4,9 +4,10 @@ pub mod ingest_token;
 pub mod ulid;
 
 use cloud_ci_proto::ingest::v1::{
-    BeginRunRequest, BeginRunResponse, CompleteShardRequest, CompleteUploadRequest,
-    CreateUploadRequest, GetRunRequest, GetRunResponse, StartJobRequest, StartJobResponse,
-    SubmitReportRequest,
+    BeginRunRequest, BeginRunResponse, CompleteShardRequest, CompleteShardResponse,
+    CompleteUploadRequest, CompleteUploadResponse, CreateUploadRequest, CreateUploadResponse,
+    GetRunRequest, GetRunResponse, StartJobRequest, StartJobResponse, SubmitReportRequest,
+    SubmitReportResponse,
 };
 use connect::{Code, Codec, ConnectError, NegotiationError, negotiate};
 use coordinator::{CoordinatorError, RunCoordinatorStore};
@@ -14,6 +15,12 @@ use worker::{Context, Date, Env, Headers, Method, Request, Response, Result, eve
 
 #[event(fetch)]
 async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
+    // Data plane: a plain `PUT` of upload part bytes, not a Connect RPC
+    // (docs/design/byo-ci.md's "Control plane and data plane are different
+    // transports").
+    if req.method() == Method::Put {
+        return handle_upload_part(req, &env).await;
+    }
     if req.method() != Method::Post {
         return Response::error("method not allowed", 405);
     }
@@ -41,10 +48,6 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
 /// Hand-routes each `cloud_ci.ingest.v1.IngestService` procedure to its
 /// request type, per ADR 0002 (Connect over `fetch`, no Tower server).
-/// `BeginRun`, `StartJob`, and `GetRun` forward to the run's
-/// `RunCoordinator` Durable Object; the remaining four need R2 upload
-/// plumbing (a separate, later piece of work) and still just decode their
-/// request before reporting `unimplemented`.
 async fn route(
     path: &str,
     codec: Codec,
@@ -55,26 +58,18 @@ async fn route(
         "/cloud_ci.ingest.v1.IngestService/BeginRun" => handle_begin_run(codec, body, env).await,
         "/cloud_ci.ingest.v1.IngestService/StartJob" => handle_start_job(codec, body, env).await,
         "/cloud_ci.ingest.v1.IngestService/GetRun" => handle_get_run(codec, body, env).await,
-        "/cloud_ci.ingest.v1.IngestService/CreateUpload" => Err(decode_then_unimplemented::<
-            CreateUploadRequest,
-        >(
-            "CreateUpload", codec, body
-        )),
-        "/cloud_ci.ingest.v1.IngestService/CompleteUpload" => Err(decode_then_unimplemented::<
-            CompleteUploadRequest,
-        >(
-            "CompleteUpload", codec, body
-        )),
-        "/cloud_ci.ingest.v1.IngestService/SubmitReport" => Err(decode_then_unimplemented::<
-            SubmitReportRequest,
-        >(
-            "SubmitReport", codec, body
-        )),
-        "/cloud_ci.ingest.v1.IngestService/CompleteShard" => Err(decode_then_unimplemented::<
-            CompleteShardRequest,
-        >(
-            "CompleteShard", codec, body
-        )),
+        "/cloud_ci.ingest.v1.IngestService/CreateUpload" => {
+            handle_create_upload(codec, body, env).await
+        }
+        "/cloud_ci.ingest.v1.IngestService/CompleteUpload" => {
+            handle_complete_upload(codec, body, env).await
+        }
+        "/cloud_ci.ingest.v1.IngestService/SubmitReport" => {
+            handle_submit_report(codec, body, env).await
+        }
+        "/cloud_ci.ingest.v1.IngestService/CompleteShard" => {
+            handle_complete_shard(codec, body, env).await
+        }
         _ => Err(ConnectError::new(
             Code::Unimplemented,
             format!("unknown procedure {path}"),
@@ -215,22 +210,269 @@ async fn resolve_do_name_for_run(
     }
 }
 
+async fn handle_create_upload(
+    codec: Codec,
+    body: &[u8],
+    env: &Env,
+) -> std::result::Result<Vec<u8>, ConnectError> {
+    let req: CreateUploadRequest = codec.decode(body)?;
+    let do_name = resolve_do_name_for_job(env, &req.job_id).await?;
+    let store = RunCoordinatorStore::new(env, &do_name).map_err(coordinator_error)?;
+    let outcome = store.create_upload(&req).await.map_err(coordinator_error)?;
+
+    let resp = CreateUploadResponse {
+        upload_id: outcome.upload_id,
+        part_count: outcome.part_count,
+        part_size_bytes: outcome.part_size_bytes,
+        already_complete: outcome.already_complete,
+        ..Default::default()
+    };
+    codec.encode(&resp)
+}
+
+async fn handle_complete_upload(
+    codec: Codec,
+    body: &[u8],
+    env: &Env,
+) -> std::result::Result<Vec<u8>, ConnectError> {
+    let req: CompleteUploadRequest = codec.decode(body)?;
+    let do_name = resolve_do_name_for_upload(env, &req.upload_id).await?;
+    let store = RunCoordinatorStore::new(env, &do_name).map_err(coordinator_error)?;
+    store
+        .complete_upload(&req)
+        .await
+        .map_err(coordinator_error)?;
+    codec.encode(&CompleteUploadResponse::default())
+}
+
+async fn handle_submit_report(
+    codec: Codec,
+    body: &[u8],
+    env: &Env,
+) -> std::result::Result<Vec<u8>, ConnectError> {
+    let req: SubmitReportRequest = codec.decode(body)?;
+    let do_name = resolve_do_name_for_job(env, &req.job_id).await?;
+    let store = RunCoordinatorStore::new(env, &do_name).map_err(coordinator_error)?;
+    store.submit_report(&req).await.map_err(coordinator_error)?;
+    codec.encode(&SubmitReportResponse::default())
+}
+
+async fn handle_complete_shard(
+    codec: Codec,
+    body: &[u8],
+    env: &Env,
+) -> std::result::Result<Vec<u8>, ConnectError> {
+    let req: CompleteShardRequest = codec.decode(body)?;
+    let do_name = resolve_do_name_for_job(env, &req.job_id).await?;
+    let store = RunCoordinatorStore::new(env, &do_name).map_err(coordinator_error)?;
+    store
+        .complete_shard(&req)
+        .await
+        .map_err(coordinator_error)?;
+    codec.encode(&CompleteShardResponse::default())
+}
+
+/// `CreateUpload`/`SubmitReport`/`CompleteShard` only carry a `job_id`;
+/// resolves it to the owning run's Durable Object name the same way
+/// [`resolve_do_name_for_run`] does for a `run_id`.
+async fn resolve_do_name_for_job(
+    env: &Env,
+    job_id: &str,
+) -> std::result::Result<String, ConnectError> {
+    #[derive(serde::Deserialize)]
+    struct RunIdentity {
+        repo_id: i64,
+        sha: String,
+        run_key: String,
+        attempt: i64,
+    }
+
+    let db = env
+        .d1("DB")
+        .map_err(|e| ConnectError::new(Code::Internal, format!("D1 unavailable: {e}")))?;
+    let row: Option<RunIdentity> = db
+        .prepare(
+            "SELECT runs.repo_id as repo_id, runs.sha as sha, runs.run_key as run_key, runs.attempt as attempt \
+             FROM jobs JOIN runs ON jobs.run_id = runs.id WHERE jobs.id = ?1",
+        )
+        .bind(&[job_id.into()])
+        .map_err(|e| ConnectError::new(Code::Internal, format!("D1 bind failed: {e}")))?
+        .first(None)
+        .await
+        .map_err(|e| ConnectError::new(Code::Internal, format!("D1 query failed: {e}")))?;
+
+    match row {
+        Some(r) => Ok(coordinator::do_name(
+            r.repo_id as u64,
+            &r.sha,
+            &r.run_key,
+            r.attempt as u32,
+        )),
+        None => Err(ConnectError::new(
+            Code::NotFound,
+            format!("job {job_id} not found"),
+        )),
+    }
+}
+
+/// `CompleteUpload` only carries an `upload_id`; resolves it to the owning
+/// run's Durable Object name via the `uploads` -> `jobs` -> `runs`
+/// projection join.
+async fn resolve_do_name_for_upload(
+    env: &Env,
+    upload_id: &str,
+) -> std::result::Result<String, ConnectError> {
+    #[derive(serde::Deserialize)]
+    struct RunIdentity {
+        repo_id: i64,
+        sha: String,
+        run_key: String,
+        attempt: i64,
+    }
+
+    let db = env
+        .d1("DB")
+        .map_err(|e| ConnectError::new(Code::Internal, format!("D1 unavailable: {e}")))?;
+    let row: Option<RunIdentity> = db
+        .prepare(
+            "SELECT runs.repo_id as repo_id, runs.sha as sha, runs.run_key as run_key, runs.attempt as attempt \
+             FROM uploads JOIN jobs ON uploads.job_id = jobs.id JOIN runs ON jobs.run_id = runs.id \
+             WHERE uploads.id = ?1",
+        )
+        .bind(&[upload_id.into()])
+        .map_err(|e| ConnectError::new(Code::Internal, format!("D1 bind failed: {e}")))?
+        .first(None)
+        .await
+        .map_err(|e| ConnectError::new(Code::Internal, format!("D1 query failed: {e}")))?;
+
+    match row {
+        Some(r) => Ok(coordinator::do_name(
+            r.repo_id as u64,
+            &r.sha,
+            &r.run_key,
+            r.attempt as u32,
+        )),
+        None => Err(ConnectError::new(
+            Code::NotFound,
+            format!("upload {upload_id} not found"),
+        )),
+    }
+}
+
+/// Parses `/ingest/v1/uploads/{upload_id}/parts/{n}` into its two path
+/// segments. Pure, so it is unit-tested directly without a live `Request`.
+fn parse_upload_part_path(path: &str) -> Option<(&str, u32)> {
+    let rest = path.strip_prefix("/ingest/v1/uploads/")?;
+    let (upload_id, rest) = rest.split_once("/parts/")?;
+    if upload_id.is_empty() {
+        return None;
+    }
+    let part_number: u32 = rest.parse().ok()?;
+    Some((upload_id, part_number))
+}
+
+struct UploadForPart {
+    repo_id: u64,
+    r2_key: String,
+    sha256: String,
+}
+
+async fn lookup_upload_for_part(env: &Env, upload_id: &str) -> Result<Option<UploadForPart>> {
+    #[derive(serde::Deserialize)]
+    struct Row {
+        repo_id: i64,
+        r2_key: String,
+        sha256: String,
+    }
+    let db = env.d1("DB")?;
+    let row: Option<Row> = db
+        .prepare(
+            "SELECT runs.repo_id as repo_id, uploads.r2_key as r2_key, uploads.sha256 as sha256 \
+             FROM uploads JOIN jobs ON uploads.job_id = jobs.id JOIN runs ON jobs.run_id = runs.id \
+             WHERE uploads.id = ?1",
+        )
+        .bind(&[upload_id.into()])?
+        .first(None)
+        .await?;
+    Ok(row.map(|r| UploadForPart {
+        repo_id: r.repo_id as u64,
+        r2_key: r.r2_key,
+        sha256: r.sha256,
+    }))
+}
+
+/// Raw `PUT /ingest/v1/uploads/{upload_id}/parts/{n}` — the data plane
+/// (docs/design/byo-ci.md's "Control plane and data plane are different
+/// transports"). Single-part uploads only this round (`coordinator` module
+/// docs): `n` must be `1`.
+async fn handle_upload_part(mut req: Request, env: &Env) -> Result<Response> {
+    let path = req.path();
+    let Some((upload_id, part_number)) = parse_upload_part_path(&path) else {
+        return Response::error("not found", 404);
+    };
+    let upload_id = upload_id.to_string();
+    if part_number != 1 {
+        return Response::error(
+            "multipart uploads are out of scope this round; part number must be 1",
+            400,
+        );
+    }
+
+    // Security consideration: the 32 MiB part-size cap is enforced from the
+    // declared `Content-Length` before touching R2, so an oversized or
+    // hostile upload never reaches the R2 binding.
+    let content_length = req
+        .headers()
+        .get("content-length")?
+        .and_then(|v| v.parse::<u64>().ok());
+    if content_length.is_none_or(|len| len > coordinator::logic::MAX_SINGLE_PART_BYTES) {
+        return Response::error("part exceeds the 32 MiB single-part limit", 413);
+    }
+
+    let Some(token) = req
+        .headers()
+        .get("authorization")?
+        .and_then(|v| v.strip_prefix("Bearer ").map(str::to_string))
+    else {
+        return Response::error("missing bearer ingest token", 401);
+    };
+    let secret = match env.secret("INGEST_TOKEN_SECRET") {
+        Ok(secret) => secret.to_string().into_bytes(),
+        Err(_) => return Response::error("INGEST_TOKEN_SECRET is not configured", 500),
+    };
+    let now_s = Date::now().as_millis() / 1000;
+    let claims = match ingest_token::verify(&secret, &token, now_s) {
+        Ok(claims) => claims,
+        Err(_) => return Response::error("invalid or expired ingest token", 401),
+    };
+
+    // Security consideration: a part PUT without a valid token for the
+    // owning run's `repo_id` is rejected before touching R2.
+    let Some(info) = lookup_upload_for_part(env, &upload_id).await? else {
+        return Response::error("upload not found", 404);
+    };
+    if info.repo_id != claims.repo_id {
+        return Response::error("ingest token does not match the upload's repo", 403);
+    }
+
+    let bytes = req.bytes().await?;
+    if bytes.len() as u64 > coordinator::logic::MAX_SINGLE_PART_BYTES {
+        return Response::error("part exceeds the 32 MiB single-part limit", 413);
+    }
+
+    let bucket = env.bucket("ASSETS")?;
+    bucket.put(&info.r2_key, bytes).execute().await?;
+
+    let headers = Headers::new();
+    headers.set("etag", &info.sha256)?;
+    Ok(Response::empty()?.with_headers(headers))
+}
+
 fn coordinator_error(err: CoordinatorError) -> ConnectError {
     match err {
         CoordinatorError::NotFound => ConnectError::new(Code::NotFound, "run not found"),
         CoordinatorError::Conflict(msg) => ConnectError::new(Code::FailedPrecondition, msg),
         CoordinatorError::Internal(msg) => ConnectError::new(Code::Internal, msg),
-    }
-}
-
-fn decode_then_unimplemented<M: buffa::Message + serde::de::DeserializeOwned>(
-    name: &str,
-    codec: Codec,
-    body: &[u8],
-) -> ConnectError {
-    match codec.decode::<M>(body) {
-        Ok(_) => ConnectError::new(Code::Unimplemented, format!("{name} is not implemented")),
-        Err(err) => err,
     }
 }
 
@@ -245,30 +487,7 @@ fn connect_error(err: &ConnectError) -> Result<Response> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cloud_ci_proto::ingest::v1::{CreateUploadRequest, RunKey};
-
-    #[test]
-    fn still_unimplemented_procedure_decodes_both_codecs_before_reporting_unimplemented()
-    -> std::result::Result<(), ConnectError> {
-        let req = CreateUploadRequest::default();
-        for codec in [Codec::Proto, Codec::Json] {
-            let body = codec.encode(&req)?;
-            let err =
-                decode_then_unimplemented::<CreateUploadRequest>("CreateUpload", codec, &body);
-            assert_eq!(err.code, Code::Unimplemented, "{codec:?}");
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn still_unimplemented_procedure_with_malformed_body_is_invalid_argument() {
-        let err = decode_then_unimplemented::<CreateUploadRequest>(
-            "CreateUpload",
-            Codec::Proto,
-            &[0xff, 0xff],
-        );
-        assert_eq!(err.code, Code::InvalidArgument);
-    }
+    use cloud_ci_proto::ingest::v1::RunKey;
 
     #[test]
     fn coordinator_errors_map_to_expected_connect_codes() {
@@ -320,5 +539,31 @@ mod tests {
         );
         assert_eq!(name, expected);
         Ok(())
+    }
+
+    #[test]
+    fn parse_upload_part_path_extracts_upload_id_and_part_number() {
+        assert_eq!(
+            parse_upload_part_path("/ingest/v1/uploads/01ARZ3NDEKTSV4RRFFQ69G5FAV/parts/1"),
+            Some(("01ARZ3NDEKTSV4RRFFQ69G5FAV", 1))
+        );
+    }
+
+    #[test]
+    fn parse_upload_part_path_rejects_non_numeric_part() {
+        assert_eq!(
+            parse_upload_part_path("/ingest/v1/uploads/abc/parts/one"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_upload_part_path_rejects_empty_upload_id() {
+        assert_eq!(parse_upload_part_path("/ingest/v1/uploads//parts/1"), None);
+    }
+
+    #[test]
+    fn parse_upload_part_path_rejects_wrong_prefix() {
+        assert_eq!(parse_upload_part_path("/other/path"), None);
     }
 }
