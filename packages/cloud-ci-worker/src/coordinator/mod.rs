@@ -571,6 +571,10 @@ impl RunCoordinator {
                 "parts do not match the single part CreateUpload reserved",
             );
         }
+        let bucket = self.env.bucket("ASSETS")?;
+        if bucket.head(&upload.r2_key).await?.is_none() {
+            return error_response(409, "no part was uploaded for this upload_id");
+        }
         if upload.state != "complete" {
             update_upload_state(sql, &upload.id, "complete")?;
             self.project_upload_state_to_d1(&upload.id, "complete")
