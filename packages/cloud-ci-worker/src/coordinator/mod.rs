@@ -409,6 +409,10 @@ struct ReportRow {
     is_canonical: i64,
     parsed: i64,
     summary: Option<String>,
+    /// Full parsed report's R2 location (migration 0012's `reports.r2_key`
+    /// column; see `handle_submit_report`'s module docs for why every
+    /// report, not just upload-backed ones, needs this).
+    r2_key: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -865,7 +869,7 @@ impl RunCoordinator {
             return error_response(409, "shard is missing, or the run is already terminal");
         }
 
-        let (content_sha256, upload_id, bytes) = match &req.source {
+        let (content_sha256, upload_id, bytes, report_r2_key) = match &req.source {
             Some(submit_report_request::Source::UploadId(id)) => {
                 let Some(upload) = read_upload(sql, id)? else {
                     return error_response(404, "upload not found");
@@ -888,10 +892,33 @@ impl RunCoordinator {
                         "stored upload bytes do not match their declared sha256",
                     );
                 }
-                (upload.sha256.clone(), Some(upload.id.clone()), bytes)
+                // Upload-backed: the bytes already live in R2 at the
+                // upload's own key (migration 0002); reuse it rather than
+                // writing a second copy (`test_stats` finalization's R2
+                // decision — see migration 0012).
+                let r2_key = upload.r2_key.clone();
+                (
+                    upload.sha256.clone(),
+                    Some(upload.id.clone()),
+                    bytes,
+                    r2_key,
+                )
             }
             Some(submit_report_request::Source::InlineData(data)) => {
-                (hex_sha256(data), None, data.clone())
+                let content_sha256 = hex_sha256(data);
+                // Inline reports never otherwise touch R2 — without this
+                // write, the bytes only ever exist in this request's
+                // memory and `test_stats` finalization would have nothing
+                // to re-parse at run close (migration 0012's module
+                // comment). Content-addressed, mirroring uploads' own
+                // `runs/<run_id>/uploads/<upload_id>/<sha256>` key shape.
+                let r2_key = format!(
+                    "runs/{}/reports/{}/{}/{}",
+                    run_row.id, req.job_id, req.shard_index, content_sha256
+                );
+                let bucket = self.env.bucket("ASSETS")?;
+                bucket.put(&r2_key, data.clone()).execute().await?;
+                (content_sha256, None, data.clone(), r2_key)
             }
             None => {
                 return error_response(400, "SubmitReport requires inline_data or upload_id");
@@ -932,6 +959,7 @@ impl RunCoordinator {
             now_ms as i64,
             parsed,
             summary.as_deref(),
+            &report_r2_key,
         )?;
         unset_other_canonical_reports(
             sql,
@@ -1488,8 +1516,8 @@ impl RunCoordinator {
     async fn project_report_to_d1(&self, row: &ReportRow) -> worker::Result<()> {
         let db = self.env.d1("DB")?;
         db.prepare(
-            "INSERT INTO reports (id, job_id, shard_index, kind, name, scope, content_sha256, upload_id, accepted_seq, created_at, is_canonical, parsed, summary) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            "INSERT INTO reports (id, job_id, shard_index, kind, name, scope, content_sha256, upload_id, accepted_seq, created_at, is_canonical, parsed, summary, r2_key) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         )
         .bind(&[
             JsValue::from_str(&row.id),
@@ -1509,6 +1537,7 @@ impl RunCoordinator {
             row.summary
                 .clone()
                 .map_or(JsValue::NULL, |v| JsValue::from_str(&v)),
+            JsValue::from_str(&row.r2_key),
         ])?
         .run()
         .await?;
@@ -1992,7 +2021,8 @@ fn ensure_schema(sql: &SqlStorage) -> worker::Result<()> {
             created_at INTEGER NOT NULL, \
             is_canonical INTEGER NOT NULL DEFAULT 1, \
             parsed INTEGER NOT NULL DEFAULT 0, \
-            summary TEXT \
+            summary TEXT, \
+            r2_key TEXT NOT NULL DEFAULT '' \
         )",
         None,
     )?;
@@ -2441,7 +2471,7 @@ fn update_upload_state(sql: &SqlStorage, id: &str, state: &str) -> worker::Resul
 // Reports
 // ---------------------------------------------------------------------------
 
-const REPORT_COLUMNS: &str = "id, job_id, shard_index, kind, name, scope, content_sha256, upload_id, accepted_seq, created_at, is_canonical, parsed, summary";
+const REPORT_COLUMNS: &str = "id, job_id, shard_index, kind, name, scope, content_sha256, upload_id, accepted_seq, created_at, is_canonical, parsed, summary, r2_key";
 
 fn read_report(sql: &SqlStorage, id: &str) -> worker::Result<Option<ReportRow>> {
     let rows: Vec<ReportRow> = sql
@@ -2499,10 +2529,11 @@ fn insert_report(
     created_at_ms: i64,
     parsed: i64,
     summary: Option<&str>,
+    r2_key: &str,
 ) -> worker::Result<()> {
     sql.exec(
         &format!(
-            "INSERT INTO report ({REPORT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12)"
+            "INSERT INTO report ({REPORT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13)"
         ),
         vec![
             SqlStorageValue::from(id),
@@ -2517,6 +2548,7 @@ fn insert_report(
             SqlStorageValue::try_from_i64(created_at_ms)?,
             SqlStorageValue::try_from_i64(parsed)?,
             SqlStorageValue::from(summary.map(str::to_string)),
+            SqlStorageValue::from(r2_key),
         ],
     )?;
     Ok(())
