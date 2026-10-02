@@ -319,8 +319,9 @@ themselves stay in Cloudflare Secrets Store and are never read into D1.
 ## Security considerations
 
 - Both `.ts` pipeline sources and `settings.yml` are untrusted input from anyone who can open a
-  PR. Discovery evaluates only a static `on` literal, in a network-isolated sandbox, never the
-  `run` function, so reading triggers cannot itself start a container or call out.
+  PR. Discovery reads a static `on` object or calls `on(ctx)` in a network-isolated, CPU-limited
+  sandbox, never the `run` function, so reading triggers cannot itself start a container or call
+  out.
 - `settings.yml` is read only from the repo's default branch, for every event type (push, pull
   request, schedule, manual), never from a PR's own head or base ref. A PR — same-repo or fork —
   cannot widen `ai.autofix`, `concurrency.*`, `runners.*`, `retention.*`, `cache.*`,
@@ -329,6 +330,11 @@ themselves stay in Cloudflare Secrets Store and are never read into D1.
 - `secrets.<pipeline>` is the complete grant list for which secret names a pipeline file may
   request; it does not store secret values, which stay in Cloudflare Secrets Store and are only
   resolved at job start.
+- Trust boundary (accepted in PR #1 review, 2026-10-01): merging to the default branch is the
+  authority. Merged `settings.yml` can grant a pipeline any secret stored in the deployment and
+  raise concurrency, retention, and cache up to deploy-time platform limits. There is no
+  dashboard or deployer allow-list above it. Guarding those changes is the job of GitHub
+  repository rules: branch protection, required reviews, and CODEOWNERS on `.cloud-ci/`.
 
 ## Failure modes
 
