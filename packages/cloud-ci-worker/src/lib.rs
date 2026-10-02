@@ -1,5 +1,6 @@
 pub mod connect;
 pub mod coordinator;
+pub mod github_app;
 pub mod ingest_token;
 pub mod ulid;
 
