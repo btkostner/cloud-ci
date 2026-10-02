@@ -51,9 +51,7 @@ pub struct FileTimingRow {
 /// so it is unit-tested with plain `cargo test` without the Workers
 /// runtime — same layering as `installations::list_all_repo_ids`'s row
 /// mapping.
-pub fn parse_file_timing_rows(
-    rows: Vec<serde_json::Value>,
-) -> worker::Result<Vec<FileTimingRow>> {
+pub fn parse_file_timing_rows(rows: Vec<serde_json::Value>) -> worker::Result<Vec<FileTimingRow>> {
     rows.into_iter()
         .map(|row| {
             let file_path = row
@@ -104,7 +102,10 @@ pub async fn lookup_file_timings(
              WHERE test_stats.repo_id = ?1 AND test_stats.file_path = requested.value \
              GROUP BY test_stats.file_path",
         )
-        .bind(&[JsValue::from_f64(repo_id as f64), JsValue::from_str(&paths_json)])?
+        .bind(&[
+            JsValue::from_f64(repo_id as f64),
+            JsValue::from_str(&paths_json),
+        ])?
         .all()
         .await?
         .results()?;
@@ -116,12 +117,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_well_formed_rows() {
+    fn parses_well_formed_rows() -> worker::Result<()> {
         let rows = vec![
             serde_json::json!({"file_path": "a_test.go", "total_ms": 1200.0}),
             serde_json::json!({"file_path": "b_test.go", "total_ms": 450.5}),
         ];
-        let parsed = parse_file_timing_rows(rows).expect("rows should parse");
+        let parsed = parse_file_timing_rows(rows)?;
         assert_eq!(
             parsed,
             vec![
@@ -135,11 +136,13 @@ mod tests {
                 },
             ]
         );
+        Ok(())
     }
 
     #[test]
-    fn empty_rows_parse_to_empty_vec() {
-        assert_eq!(parse_file_timing_rows(Vec::new()).unwrap(), Vec::new());
+    fn empty_rows_parse_to_empty_vec() -> worker::Result<()> {
+        assert_eq!(parse_file_timing_rows(Vec::new())?, Vec::new());
+        Ok(())
     }
 
     #[test]
