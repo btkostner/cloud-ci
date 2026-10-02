@@ -314,6 +314,10 @@ pub fn convert_manifest(
     })?;
 
     if !(200..300).contains(&status) {
+        // Request body (empty, per send_empty()) has no secret material
+        // to echo back, so the raw response body is safe to surface here
+        // — kept asymmetric with create_secrets_store_secret's redacted
+        // error path below on purpose.
         return Err(GithubAppSetupError::new(format!(
             "github manifest conversion failed: http {status}: {}",
             String::from_utf8_lossy(&body)
@@ -420,9 +424,28 @@ pub fn create_secrets_store_secret(
     })?;
 
     if !(200..300).contains(&status) {
+        // Unlike convert_manifest's empty-body request, this request's
+        // body carries the secret's plaintext `value`. Cloudflare's own
+        // non-2xx validation errors can plausibly echo submitted request
+        // fields back in the response body, so the raw body must never
+        // be included in the error message — only Cloudflare's own
+        // structured `code`/`message` fields (same as the `!success`
+        // branch below), or, failing that, just the status code.
+        if let Ok(parsed) = serde_json::from_slice::<SecretCreateApiResponse>(&response_body)
+            && !parsed.errors.is_empty()
+        {
+            let messages: Vec<String> = parsed
+                .errors
+                .iter()
+                .map(|e| format!("{}: {}", e.code, e.message))
+                .collect();
+            return Err(GithubAppSetupError::new(format!(
+                "cloudflare secrets_store create failed: http {status}: {}",
+                messages.join(", ")
+            )));
+        }
         return Err(GithubAppSetupError::new(format!(
-            "cloudflare secrets_store create failed: http {status}: {}",
-            String::from_utf8_lossy(&response_body)
+            "cloudflare secrets_store create failed: http {status} (response body omitted — may contain submitted secret material)"
         )));
     }
 
@@ -1246,6 +1269,79 @@ mod tests {
             Err(err) => err.to_string(),
         };
         assert!(err.contains("Authentication error"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn create_secrets_store_secret_non_2xx_never_leaks_raw_response_body() -> Result<(), String> {
+        // Simulates Cloudflare echoing a submitted request field (the
+        // secret's own plaintext value, standing in for the canary below)
+        // back inside a non-2xx response's raw body alongside a
+        // structured error — a real, plausible REST API behavior. The
+        // error message must never contain the raw body verbatim (it may
+        // legitimately surface Cloudflare's own structured code/message,
+        // which carries no secret material here).
+        const CANARY: &str = "CANARY-SECRET-VALUE-fixture-should-never-leak";
+        let body = serde_json::to_vec(&serde_json::json!({
+            "success": false,
+            "errors": [{"code": 1004, "message": "invalid value"}],
+            "messages": [],
+            "result": null,
+            "echoed_request_value": CANARY,
+        }))
+        .map_err(|e| e.to_string())?;
+        let (base_url, _) = start_single_request_fixture(400, body).map_err(|e| e.to_string())?;
+
+        let err = match create_secrets_store_secret(
+            &base_url,
+            "account-1",
+            "store-1",
+            "bad-token",
+            "github-app-private-key",
+            CANARY,
+        ) {
+            Ok(_) => return Err("expected a non-2xx failure".to_string()),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            !err.contains(CANARY),
+            "error message leaked the raw response body: {err}"
+        );
+        assert!(err.contains("400"), "{err}");
+        assert!(err.contains("invalid value"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn create_secrets_store_secret_non_2xx_without_structured_errors_omits_body()
+    -> Result<(), String> {
+        // Cloudflare's non-2xx response doesn't even parse as the
+        // success-path's `SecretCreateApiResponse` shape here (e.g. a
+        // proxy-level error page) — the fallback message must still never
+        // include the raw bytes.
+        const CANARY: &str = "CANARY-UNSTRUCTURED-fixture-should-never-leak";
+        let (base_url, _) = start_single_request_fixture(
+            502,
+            format!("<html>upstream error: {CANARY}</html>").into_bytes(),
+        )
+        .map_err(|e| e.to_string())?;
+
+        let err = match create_secrets_store_secret(
+            &base_url,
+            "account-1",
+            "store-1",
+            "bad-token",
+            "github-app-private-key",
+            "value",
+        ) {
+            Ok(_) => return Err("expected a non-2xx failure".to_string()),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            !err.contains(CANARY),
+            "error message leaked the raw response body: {err}"
+        );
+        assert!(err.contains("502"), "{err}");
         Ok(())
     }
 
