@@ -18,10 +18,15 @@
 pub mod logic;
 
 use buffa::Enumeration;
-use cloud_ci_proto::ingest::v1::{BeginRunRequest, JobState, RunStatus, StartJobRequest, Trigger};
+use cloud_ci_proto::ingest::v1::{
+    BeginRunRequest, CompleteShardRequest, CompleteUploadRequest, Conclusion, CreateUploadRequest,
+    JobState, RunStatus, StartJobRequest, SubmitReportRequest, Trigger, UploadKind,
+    submit_report_request,
+};
 use logic::RunState;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use worker::wasm_bindgen::JsValue;
 use worker::{
     DurableObject, Env, Method, Request, RequestInit, Response, SqlStorage, SqlStorageValue, State,
@@ -96,6 +101,23 @@ pub struct GetRunOutcome {
     pub jobs: Vec<JobState>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateUploadOutcome {
+    pub upload_id: String,
+    pub part_count: u32,
+    pub part_size_bytes: u64,
+    pub already_complete: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompleteUploadOutcome {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmitReportOutcome {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompleteShardOutcome {}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct ErrorBody {
     error: String,
@@ -128,10 +150,100 @@ struct JobRow {
     shard_total: i64,
     runner_label: String,
     check_names: String,
+    state: String,
+    conclusion: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct JobShardRow {
+    job_id: String,
+    shard_index: i64,
+    state: String,
+    conclusion: Option<String>,
+    external_url: String,
+    completed_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct UploadRow {
+    id: String,
+    job_id: String,
+    shard_index: i64,
+    kind: String,
+    name: String,
+    scope: String,
+    sha256: String,
+    size_bytes: i64,
+    content_type: String,
+    state: String,
+    r2_key: String,
+    accepted_seq: i64,
+    created_at: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ReportRow {
+    id: String,
+    job_id: String,
+    shard_index: i64,
+    kind: String,
+    name: String,
+    scope: String,
+    content_sha256: String,
+    upload_id: Option<String>,
+    accepted_seq: i64,
+    created_at: i64,
+    is_canonical: i64,
+    parsed: i64,
+    summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MaxSeqRow {
+    m: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SummaryRow {
+    summary: Option<String>,
 }
 
 fn trigger_db_name(trigger: Trigger) -> &'static str {
     trigger.proto_name()
+}
+
+fn upload_kind_db_name(kind: UploadKind) -> &'static str {
+    kind.proto_name()
+}
+
+fn conclusion_db_name(c: Conclusion) -> &'static str {
+    c.proto_name()
+}
+
+fn conclusion_from_db_str(s: &str) -> Option<Conclusion> {
+    Conclusion::from_proto_name(s)
+}
+
+fn shard_state_of(row: &JobShardRow) -> worker::Result<logic::ShardState> {
+    match row.state.as_str() {
+        "pending" => Ok(logic::ShardState::Pending),
+        "uploaded" => Ok(logic::ShardState::Uploaded),
+        "missing" => Ok(logic::ShardState::Missing),
+        other => Err(worker::Error::RustError(format!(
+            "unknown job_shard state {other}"
+        ))),
+    }
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let mut out = String::with_capacity(64);
+    for b in hasher.finalize() {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -163,6 +275,22 @@ impl DurableObject for RunCoordinator {
                 self.handle_start_job(&sql, body).await
             }
             (Method::Get, "/get-run") => self.handle_get_run(&sql).await,
+            (Method::Post, "/create-upload") => {
+                let body: CreateUploadRequest = req.json().await?;
+                self.handle_create_upload(&sql, body).await
+            }
+            (Method::Post, "/complete-upload") => {
+                let body: CompleteUploadRequest = req.json().await?;
+                self.handle_complete_upload(&sql, body).await
+            }
+            (Method::Post, "/submit-report") => {
+                let body: SubmitReportRequest = req.json().await?;
+                self.handle_submit_report(&sql, body).await
+            }
+            (Method::Post, "/complete-shard") => {
+                let body: CompleteShardRequest = req.json().await?;
+                self.handle_complete_shard(&sql, body).await
+            }
             _ => error_response(404, "unknown RunCoordinator route"),
         }
     }
@@ -329,6 +457,334 @@ impl RunCoordinator {
         })
     }
 
+    async fn handle_create_upload(
+        &self,
+        sql: &SqlStorage,
+        req: CreateUploadRequest,
+    ) -> worker::Result<Response> {
+        let Some(run_row) = read_run(sql)? else {
+            return error_response(404, "run not found");
+        };
+        let run_terminal = run_state_of(&run_row)?.is_terminal();
+
+        let shard_state = match read_job_shard(sql, &req.job_id, req.shard_index)? {
+            Some(row) => shard_state_of(&row)?,
+            None => logic::ShardState::Pending,
+        };
+        if !logic::upload_allowed_for_shard(run_terminal, shard_state) {
+            return error_response(400, "shard is missing, or the run is already terminal");
+        }
+
+        let kind_name = req
+            .kind
+            .as_known()
+            .map(upload_kind_db_name)
+            .unwrap_or("UPLOAD_KIND_UNSPECIFIED");
+        let existing = read_upload_by_identity(
+            sql,
+            &req.job_id,
+            req.shard_index,
+            kind_name,
+            &req.name,
+            &req.sha256,
+        )?;
+        let existing_for_logic = existing.as_ref().map(|u| logic::ExistingUpload {
+            upload_id: u.id.clone(),
+            state: if u.state == "complete" {
+                logic::UploadState::Complete
+            } else {
+                logic::UploadState::Pending
+            },
+            scope: u.scope.clone(),
+        });
+
+        match logic::resolve_create_upload(req.size_bytes, &req.scope, existing_for_logic.as_ref())
+        {
+            Err(logic::CreateUploadError::TooLarge(_)) => error_response(
+                400,
+                "upload exceeds the 32 MiB single-part limit; multipart is out of scope",
+            ),
+            Err(logic::CreateUploadError::ScopeConflict) => error_response(
+                400,
+                "this content was already accepted under a different scope",
+            ),
+            Ok(logic::CreateUploadDecision::ReturnExisting {
+                upload_id,
+                already_complete,
+            }) => Response::from_json(&CreateUploadOutcome {
+                upload_id,
+                part_count: 0,
+                part_size_bytes: logic::MAX_SINGLE_PART_BYTES,
+                already_complete,
+            }),
+            Ok(logic::CreateUploadDecision::CreateNew) => {
+                let now_ms = worker::Date::now().as_millis();
+                let upload_id = crate::ulid::generate(now_ms).map_err(|e| {
+                    worker::Error::RustError(format!("ulid generation failed: {e}"))
+                })?;
+                let accepted_seq = next_accepted_seq(sql)?;
+                // Immutable, content-addressed location keyed by this
+                // upload's own identity (byo-ci.md's Idempotency section).
+                // The documented "publication alias" that gets rewritten as
+                // canonical content advances is a deferred nice-to-have —
+                // see module docs — since nothing reads it yet.
+                let r2_key = format!("runs/{}/uploads/{upload_id}/{}", run_row.id, req.sha256);
+                insert_upload(
+                    sql,
+                    &upload_id,
+                    &req.job_id,
+                    req.shard_index,
+                    kind_name,
+                    &req.name,
+                    &req.scope,
+                    &req.sha256,
+                    req.size_bytes as i64,
+                    &req.content_type,
+                    &r2_key,
+                    accepted_seq,
+                    now_ms as i64,
+                )?;
+                self.project_upload_to_d1(&require_upload(sql, &upload_id)?)
+                    .await?;
+                Response::from_json(&CreateUploadOutcome {
+                    upload_id,
+                    part_count: 1,
+                    part_size_bytes: logic::MAX_SINGLE_PART_BYTES,
+                    already_complete: false,
+                })
+            }
+        }
+    }
+
+    async fn handle_complete_upload(
+        &self,
+        sql: &SqlStorage,
+        req: CompleteUploadRequest,
+    ) -> worker::Result<Response> {
+        let Some(upload) = read_upload(sql, &req.upload_id)? else {
+            return error_response(404, "upload not found");
+        };
+        let part_numbers: Vec<u32> = req.parts.iter().map(|p| p.number).collect();
+        if logic::validate_complete_upload_parts(&part_numbers).is_err() {
+            return error_response(
+                400,
+                "parts do not match the single part CreateUpload reserved",
+            );
+        }
+        if upload.state != "complete" {
+            update_upload_state(sql, &upload.id, "complete")?;
+            self.project_upload_state_to_d1(&upload.id, "complete")
+                .await?;
+        }
+        Response::from_json(&CompleteUploadOutcome {})
+    }
+
+    async fn handle_submit_report(
+        &self,
+        sql: &SqlStorage,
+        req: SubmitReportRequest,
+    ) -> worker::Result<Response> {
+        let Some(run_row) = read_run(sql)? else {
+            return error_response(404, "run not found");
+        };
+        let run_terminal = run_state_of(&run_row)?.is_terminal();
+        let shard_state = match read_job_shard(sql, &req.job_id, req.shard_index)? {
+            Some(row) => shard_state_of(&row)?,
+            None => logic::ShardState::Pending,
+        };
+        if !logic::upload_allowed_for_shard(run_terminal, shard_state) {
+            return error_response(400, "shard is missing, or the run is already terminal");
+        }
+
+        let (content_sha256, upload_id, bytes) = match &req.source {
+            Some(submit_report_request::Source::UploadId(id)) => {
+                let Some(upload) = read_upload(sql, id)? else {
+                    return error_response(404, "upload not found");
+                };
+                let bucket = self.env.bucket("ASSETS")?;
+                let Some(object) = bucket.get(&upload.r2_key).execute().await? else {
+                    return Err(worker::Error::RustError(format!(
+                        "upload {id} has no object at its own r2_key"
+                    )));
+                };
+                let Some(body) = object.body() else {
+                    return Err(worker::Error::RustError(format!(
+                        "upload {id}'s R2 object has no body"
+                    )));
+                };
+                let bytes = body.bytes().await?;
+                if hex_sha256(&bytes) != upload.sha256 {
+                    return error_response(
+                        500,
+                        "stored upload bytes do not match their declared sha256",
+                    );
+                }
+                (upload.sha256.clone(), Some(upload.id.clone()), bytes)
+            }
+            Some(submit_report_request::Source::InlineData(data)) => {
+                (hex_sha256(data), None, data.clone())
+            }
+            None => {
+                return error_response(400, "SubmitReport requires inline_data or upload_id");
+            }
+        };
+
+        if read_report_by_identity(
+            sql,
+            &req.job_id,
+            req.shard_index,
+            &req.report_kind,
+            &req.name,
+            &content_sha256,
+        )?
+        .is_some()
+        {
+            // Identical content already accepted for this slot (a retried
+            // call) — a no-op, per the Idempotency section.
+            return Response::from_json(&SubmitReportOutcome {});
+        }
+
+        let (parsed, summary) = parse_report(&req.report_kind, &bytes);
+        let now_ms = worker::Date::now().as_millis();
+        let id = crate::ulid::generate(now_ms)
+            .map_err(|e| worker::Error::RustError(format!("ulid generation failed: {e}")))?;
+        let accepted_seq = next_accepted_seq(sql)?;
+        insert_report(
+            sql,
+            &id,
+            &req.job_id,
+            req.shard_index,
+            &req.report_kind,
+            &req.name,
+            &req.scope,
+            &content_sha256,
+            upload_id.as_deref(),
+            accepted_seq,
+            now_ms as i64,
+            parsed,
+            summary.as_deref(),
+        )?;
+        unset_other_canonical_reports(
+            sql,
+            &req.job_id,
+            req.shard_index,
+            &req.report_kind,
+            &req.name,
+            &id,
+        )?;
+
+        self.project_report_to_d1(&require_report(sql, &id)?)
+            .await?;
+        // The new row flipped any previously canonical row for this slot to
+        // non-canonical in the DO's own storage above; mirror that into D1
+        // too, since `project_report_to_d1` only inserts the new row.
+        self.unset_other_canonical_reports_in_d1(
+            &req.job_id,
+            req.shard_index,
+            &req.report_kind,
+            &req.name,
+            &id,
+        )
+        .await?;
+
+        Response::from_json(&SubmitReportOutcome {})
+    }
+
+    async fn handle_complete_shard(
+        &self,
+        sql: &SqlStorage,
+        req: CompleteShardRequest,
+    ) -> worker::Result<Response> {
+        let Some(run_row) = read_run(sql)? else {
+            return error_response(404, "run not found");
+        };
+        let run_terminal = run_state_of(&run_row)?.is_terminal();
+        let existing_shard = read_job_shard(sql, &req.job_id, req.shard_index)?;
+        let shard_state = match &existing_shard {
+            Some(row) => shard_state_of(row)?,
+            None => logic::ShardState::Pending,
+        };
+        let existing_conclusion = match &existing_shard {
+            Some(row) => match &row.conclusion {
+                Some(c) => Some(conclusion_from_db_str(c).ok_or_else(|| {
+                    worker::Error::RustError(format!("unknown stored conclusion {c}"))
+                })?),
+                None => None,
+            },
+            None => None,
+        };
+
+        let declared = req
+            .conclusion
+            .as_known()
+            .unwrap_or(Conclusion::CONCLUSION_UNSPECIFIED);
+        // `--conclusion` is optional on the CLI; an unspecified value is
+        // inferred from the shard's accepted reports (byo-ci.md's
+        // `cloud-ci upload` section: "failure if a report has a failed test
+        // or an error-level diagnostic, else success").
+        let incoming = if declared == Conclusion::CONCLUSION_UNSPECIFIED {
+            infer_shard_conclusion(sql, &req.job_id, req.shard_index)?
+        } else {
+            declared
+        };
+
+        let resolved = match logic::resolve_complete_shard(
+            run_terminal,
+            shard_state,
+            existing_conclusion,
+            incoming,
+        ) {
+            Ok(c) => c,
+            Err(logic::CompleteShardError::RunTerminal) => {
+                return error_response(400, "run is already terminal");
+            }
+            Err(logic::CompleteShardError::ShardMissing) => {
+                return error_response(400, "shard was already marked missing");
+            }
+            Err(logic::CompleteShardError::ConflictingConclusion) => {
+                return error_response(400, "shard already concluded with a different conclusion");
+            }
+        };
+
+        let now_ms = worker::Date::now().as_millis();
+        upsert_job_shard(
+            sql,
+            &req.job_id,
+            req.shard_index,
+            "uploaded",
+            conclusion_db_name(resolved),
+            &req.external_url,
+            now_ms as i64,
+        )?;
+        self.project_job_shard_to_d1(&require_job_shard(sql, &req.job_id, req.shard_index)?)
+            .await?;
+
+        // Conclude the job once every declared shard has uploaded.
+        // Run-level completion (webhook correlation, `--expect-jobs`
+        // counting, timeout alarms) is explicitly out of scope this round —
+        // see module docs — so a concluded job here never advances the
+        // run's own status.
+        let Some(job_row) = read_job_by_id(sql, &req.job_id)? else {
+            return error_response(404, "job not found");
+        };
+        let uploaded_shards = count_uploaded_shards(sql, &req.job_id)?;
+        if uploaded_shards >= job_row.shard_total {
+            let shard_conclusions = read_all_shard_conclusions(sql, &req.job_id)?;
+            if let Some(job_conclusion) = logic::job_conclusion_from_shards(&shard_conclusions) {
+                update_job_conclusion(
+                    sql,
+                    &req.job_id,
+                    "concluded",
+                    conclusion_db_name(job_conclusion),
+                )?;
+                self.project_job_to_d1(&run_row.id, &require_job_by_id(sql, &req.job_id)?)
+                    .await?;
+            }
+        }
+
+        Response::from_json(&CompleteShardOutcome {})
+    }
+
     async fn project_run_to_d1(&self, row: &RunRow) -> worker::Result<()> {
         let db = self.env.d1("DB")?;
         db.prepare(
@@ -362,12 +818,14 @@ impl RunCoordinator {
     async fn project_job_to_d1(&self, run_id: &str, row: &JobRow) -> worker::Result<()> {
         let db = self.env.d1("DB")?;
         db.prepare(
-            "INSERT INTO jobs (id, run_id, job_name, shard_total, runner_label, check_names) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+            "INSERT INTO jobs (id, run_id, job_name, shard_total, runner_label, check_names, state, conclusion) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
              ON CONFLICT (id) DO UPDATE SET \
                shard_total = excluded.shard_total, \
                runner_label = excluded.runner_label, \
-               check_names = excluded.check_names",
+               check_names = excluded.check_names, \
+               state = excluded.state, \
+               conclusion = excluded.conclusion",
         )
         .bind(&[
             JsValue::from_str(&row.id),
@@ -376,6 +834,128 @@ impl RunCoordinator {
             JsValue::from_f64(row.shard_total as f64),
             JsValue::from_str(&row.runner_label),
             JsValue::from_str(&row.check_names),
+            JsValue::from_str(&row.state),
+            row.conclusion
+                .clone()
+                .map_or(JsValue::NULL, |v| JsValue::from_str(&v)),
+        ])?
+        .run()
+        .await?;
+        Ok(())
+    }
+
+    async fn project_upload_to_d1(&self, row: &UploadRow) -> worker::Result<()> {
+        let db = self.env.d1("DB")?;
+        db.prepare(
+            "INSERT INTO uploads (id, job_id, shard_index, kind, name, scope, sha256, size_bytes, content_type, state, r2_key, accepted_seq, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+             ON CONFLICT (id) DO UPDATE SET state = excluded.state",
+        )
+        .bind(&[
+            JsValue::from_str(&row.id),
+            JsValue::from_str(&row.job_id),
+            JsValue::from_f64(row.shard_index as f64),
+            JsValue::from_str(&row.kind),
+            JsValue::from_str(&row.name),
+            JsValue::from_str(&row.scope),
+            JsValue::from_str(&row.sha256),
+            JsValue::from_f64(row.size_bytes as f64),
+            JsValue::from_str(&row.content_type),
+            JsValue::from_str(&row.state),
+            JsValue::from_str(&row.r2_key),
+            JsValue::from_f64(row.accepted_seq as f64),
+            JsValue::from_f64(row.created_at as f64),
+        ])?
+        .run()
+        .await?;
+        Ok(())
+    }
+
+    async fn project_upload_state_to_d1(&self, upload_id: &str, state: &str) -> worker::Result<()> {
+        let db = self.env.d1("DB")?;
+        db.prepare("UPDATE uploads SET state = ?1 WHERE id = ?2")
+            .bind(&[JsValue::from_str(state), JsValue::from_str(upload_id)])?
+            .run()
+            .await?;
+        Ok(())
+    }
+
+    async fn project_report_to_d1(&self, row: &ReportRow) -> worker::Result<()> {
+        let db = self.env.d1("DB")?;
+        db.prepare(
+            "INSERT INTO reports (id, job_id, shard_index, kind, name, scope, content_sha256, upload_id, accepted_seq, created_at, is_canonical, parsed, summary) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        )
+        .bind(&[
+            JsValue::from_str(&row.id),
+            JsValue::from_str(&row.job_id),
+            JsValue::from_f64(row.shard_index as f64),
+            JsValue::from_str(&row.kind),
+            JsValue::from_str(&row.name),
+            JsValue::from_str(&row.scope),
+            JsValue::from_str(&row.content_sha256),
+            row.upload_id
+                .clone()
+                .map_or(JsValue::NULL, |v| JsValue::from_str(&v)),
+            JsValue::from_f64(row.accepted_seq as f64),
+            JsValue::from_f64(row.created_at as f64),
+            JsValue::from_f64(row.is_canonical as f64),
+            JsValue::from_f64(row.parsed as f64),
+            row.summary
+                .clone()
+                .map_or(JsValue::NULL, |v| JsValue::from_str(&v)),
+        ])?
+        .run()
+        .await?;
+        Ok(())
+    }
+
+    async fn unset_other_canonical_reports_in_d1(
+        &self,
+        job_id: &str,
+        shard_index: u32,
+        kind: &str,
+        name: &str,
+        keep_id: &str,
+    ) -> worker::Result<()> {
+        let db = self.env.d1("DB")?;
+        db.prepare(
+            "UPDATE reports SET is_canonical = 0 \
+             WHERE job_id = ?1 AND shard_index = ?2 AND kind = ?3 AND name = ?4 AND id != ?5",
+        )
+        .bind(&[
+            JsValue::from_str(job_id),
+            JsValue::from_f64(shard_index as f64),
+            JsValue::from_str(kind),
+            JsValue::from_str(name),
+            JsValue::from_str(keep_id),
+        ])?
+        .run()
+        .await?;
+        Ok(())
+    }
+
+    async fn project_job_shard_to_d1(&self, row: &JobShardRow) -> worker::Result<()> {
+        let db = self.env.d1("DB")?;
+        db.prepare(
+            "INSERT INTO job_shards (job_id, shard_index, state, conclusion, external_url, completed_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT (job_id, shard_index) DO UPDATE SET \
+               state = excluded.state, \
+               conclusion = excluded.conclusion, \
+               external_url = excluded.external_url, \
+               completed_at = excluded.completed_at",
+        )
+        .bind(&[
+            JsValue::from_str(&row.job_id),
+            JsValue::from_f64(row.shard_index as f64),
+            JsValue::from_str(&row.state),
+            row.conclusion
+                .clone()
+                .map_or(JsValue::NULL, |v| JsValue::from_str(&v)),
+            JsValue::from_str(&row.external_url),
+            row.completed_at
+                .map_or(JsValue::NULL, |v| JsValue::from_f64(v as f64)),
         ])?
         .run()
         .await?;
@@ -414,7 +994,57 @@ fn ensure_schema(sql: &SqlStorage) -> worker::Result<()> {
             job_name TEXT NOT NULL UNIQUE, \
             shard_total INTEGER NOT NULL, \
             runner_label TEXT NOT NULL, \
-            check_names TEXT NOT NULL \
+            check_names TEXT NOT NULL, \
+            state TEXT NOT NULL DEFAULT 'running', \
+            conclusion TEXT \
+        )",
+        None,
+    )?;
+    sql.exec(
+        "CREATE TABLE IF NOT EXISTS job_shard ( \
+            job_id TEXT NOT NULL, \
+            shard_index INTEGER NOT NULL, \
+            state TEXT NOT NULL DEFAULT 'pending', \
+            conclusion TEXT, \
+            external_url TEXT NOT NULL DEFAULT '', \
+            completed_at INTEGER, \
+            PRIMARY KEY (job_id, shard_index) \
+        )",
+        None,
+    )?;
+    sql.exec(
+        "CREATE TABLE IF NOT EXISTS upload ( \
+            id TEXT PRIMARY KEY, \
+            job_id TEXT NOT NULL, \
+            shard_index INTEGER NOT NULL, \
+            kind TEXT NOT NULL, \
+            name TEXT NOT NULL, \
+            scope TEXT NOT NULL DEFAULT '', \
+            sha256 TEXT NOT NULL, \
+            size_bytes INTEGER NOT NULL, \
+            content_type TEXT NOT NULL DEFAULT '', \
+            state TEXT NOT NULL DEFAULT 'pending', \
+            r2_key TEXT NOT NULL, \
+            accepted_seq INTEGER NOT NULL, \
+            created_at INTEGER NOT NULL \
+        )",
+        None,
+    )?;
+    sql.exec(
+        "CREATE TABLE IF NOT EXISTS report ( \
+            id TEXT PRIMARY KEY, \
+            job_id TEXT NOT NULL, \
+            shard_index INTEGER NOT NULL, \
+            kind TEXT NOT NULL, \
+            name TEXT NOT NULL, \
+            scope TEXT NOT NULL DEFAULT '', \
+            content_sha256 TEXT NOT NULL, \
+            upload_id TEXT, \
+            accepted_seq INTEGER NOT NULL, \
+            created_at INTEGER NOT NULL, \
+            is_canonical INTEGER NOT NULL DEFAULT 1, \
+            parsed INTEGER NOT NULL DEFAULT 0, \
+            summary TEXT \
         )",
         None,
     )?;
@@ -438,19 +1068,51 @@ fn require_run(sql: &SqlStorage) -> worker::Result<RunRow> {
 fn read_job(sql: &SqlStorage, job_name: &str) -> worker::Result<Option<JobRow>> {
     let rows: Vec<JobRow> = sql
         .exec(
-            "SELECT id, job_name, shard_total, runner_label, check_names FROM job WHERE job_name = ?1",
+            "SELECT id, job_name, shard_total, runner_label, check_names, state, conclusion FROM job WHERE job_name = ?1",
             vec![SqlStorageValue::from(job_name)],
         )?
         .to_array()?;
     Ok(rows.into_iter().next())
 }
 
+fn read_job_by_id(sql: &SqlStorage, id: &str) -> worker::Result<Option<JobRow>> {
+    let rows: Vec<JobRow> = sql
+        .exec(
+            "SELECT id, job_name, shard_total, runner_label, check_names, state, conclusion FROM job WHERE id = ?1",
+            vec![SqlStorageValue::from(id)],
+        )?
+        .to_array()?;
+    Ok(rows.into_iter().next())
+}
+
+fn require_job_by_id(sql: &SqlStorage, id: &str) -> worker::Result<JobRow> {
+    read_job_by_id(sql, id)?
+        .ok_or_else(|| worker::Error::RustError("job row missing after write".into()))
+}
+
 fn read_all_jobs(sql: &SqlStorage) -> worker::Result<Vec<JobRow>> {
     sql.exec(
-        "SELECT id, job_name, shard_total, runner_label, check_names FROM job ORDER BY job_name",
+        "SELECT id, job_name, shard_total, runner_label, check_names, state, conclusion FROM job ORDER BY job_name",
         None,
     )?
     .to_array()
+}
+
+fn update_job_conclusion(
+    sql: &SqlStorage,
+    job_id: &str,
+    state: &str,
+    conclusion: &str,
+) -> worker::Result<()> {
+    sql.exec(
+        "UPDATE job SET state = ?1, conclusion = ?2 WHERE id = ?3",
+        vec![
+            SqlStorageValue::from(state),
+            SqlStorageValue::from(conclusion),
+            SqlStorageValue::from(job_id),
+        ],
+    )?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -573,6 +1235,435 @@ fn update_job(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Job shards
+// ---------------------------------------------------------------------------
+
+fn read_job_shard(
+    sql: &SqlStorage,
+    job_id: &str,
+    shard_index: u32,
+) -> worker::Result<Option<JobShardRow>> {
+    let rows: Vec<JobShardRow> = sql
+        .exec(
+            "SELECT job_id, shard_index, state, conclusion, external_url, completed_at \
+             FROM job_shard WHERE job_id = ?1 AND shard_index = ?2",
+            vec![
+                SqlStorageValue::from(job_id),
+                SqlStorageValue::try_from_i64(i64::from(shard_index))?,
+            ],
+        )?
+        .to_array()?;
+    Ok(rows.into_iter().next())
+}
+
+fn require_job_shard(
+    sql: &SqlStorage,
+    job_id: &str,
+    shard_index: u32,
+) -> worker::Result<JobShardRow> {
+    read_job_shard(sql, job_id, shard_index)?
+        .ok_or_else(|| worker::Error::RustError("job_shard row missing after write".into()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn upsert_job_shard(
+    sql: &SqlStorage,
+    job_id: &str,
+    shard_index: u32,
+    state: &str,
+    conclusion: &str,
+    external_url: &str,
+    completed_at_ms: i64,
+) -> worker::Result<()> {
+    sql.exec(
+        "INSERT INTO job_shard (job_id, shard_index, state, conclusion, external_url, completed_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+         ON CONFLICT (job_id, shard_index) DO UPDATE SET \
+           state = excluded.state, \
+           conclusion = excluded.conclusion, \
+           external_url = excluded.external_url, \
+           completed_at = excluded.completed_at",
+        vec![
+            SqlStorageValue::from(job_id),
+            SqlStorageValue::try_from_i64(i64::from(shard_index))?,
+            SqlStorageValue::from(state),
+            SqlStorageValue::from(conclusion),
+            SqlStorageValue::from(external_url),
+            SqlStorageValue::try_from_i64(completed_at_ms)?,
+        ],
+    )?;
+    Ok(())
+}
+
+fn count_uploaded_shards(sql: &SqlStorage, job_id: &str) -> worker::Result<i64> {
+    let rows: Vec<MaxSeqRow> = sql
+        .exec(
+            "SELECT COUNT(*) as m FROM job_shard WHERE job_id = ?1 AND state = 'uploaded'",
+            vec![SqlStorageValue::from(job_id)],
+        )?
+        .to_array()?;
+    Ok(rows.first().map(|r| r.m).unwrap_or(0))
+}
+
+fn read_all_shard_conclusions(sql: &SqlStorage, job_id: &str) -> worker::Result<Vec<Conclusion>> {
+    let rows: Vec<JobShardRow> = sql
+        .exec(
+            "SELECT job_id, shard_index, state, conclusion, external_url, completed_at \
+             FROM job_shard WHERE job_id = ?1 AND state = 'uploaded'",
+            vec![SqlStorageValue::from(job_id)],
+        )?
+        .to_array()?;
+    rows.into_iter()
+        .map(|r| {
+            let c = r.conclusion.ok_or_else(|| {
+                worker::Error::RustError("uploaded shard has no conclusion".into())
+            })?;
+            conclusion_from_db_str(&c)
+                .ok_or_else(|| worker::Error::RustError(format!("unknown stored conclusion {c}")))
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Uploads
+// ---------------------------------------------------------------------------
+
+const UPLOAD_COLUMNS: &str = "id, job_id, shard_index, kind, name, scope, sha256, size_bytes, content_type, state, r2_key, accepted_seq, created_at";
+
+fn read_upload(sql: &SqlStorage, id: &str) -> worker::Result<Option<UploadRow>> {
+    let rows: Vec<UploadRow> = sql
+        .exec(
+            &format!("SELECT {UPLOAD_COLUMNS} FROM upload WHERE id = ?1"),
+            vec![SqlStorageValue::from(id)],
+        )?
+        .to_array()?;
+    Ok(rows.into_iter().next())
+}
+
+fn require_upload(sql: &SqlStorage, id: &str) -> worker::Result<UploadRow> {
+    read_upload(sql, id)?
+        .ok_or_else(|| worker::Error::RustError("upload row missing after write".into()))
+}
+
+fn read_upload_by_identity(
+    sql: &SqlStorage,
+    job_id: &str,
+    shard_index: u32,
+    kind: &str,
+    name: &str,
+    sha256: &str,
+) -> worker::Result<Option<UploadRow>> {
+    let rows: Vec<UploadRow> = sql
+        .exec(
+            &format!(
+                "SELECT {UPLOAD_COLUMNS} FROM upload \
+                 WHERE job_id = ?1 AND shard_index = ?2 AND kind = ?3 AND name = ?4 AND sha256 = ?5"
+            ),
+            vec![
+                SqlStorageValue::from(job_id),
+                SqlStorageValue::try_from_i64(i64::from(shard_index))?,
+                SqlStorageValue::from(kind),
+                SqlStorageValue::from(name),
+                SqlStorageValue::from(sha256),
+            ],
+        )?
+        .to_array()?;
+    Ok(rows.into_iter().next())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_upload(
+    sql: &SqlStorage,
+    id: &str,
+    job_id: &str,
+    shard_index: u32,
+    kind: &str,
+    name: &str,
+    scope: &str,
+    sha256: &str,
+    size_bytes: i64,
+    content_type: &str,
+    r2_key: &str,
+    accepted_seq: i64,
+    created_at_ms: i64,
+) -> worker::Result<()> {
+    sql.exec(
+        &format!(
+            "INSERT INTO upload ({UPLOAD_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending', ?10, ?11, ?12)"
+        ),
+        vec![
+            SqlStorageValue::from(id),
+            SqlStorageValue::from(job_id),
+            SqlStorageValue::try_from_i64(i64::from(shard_index))?,
+            SqlStorageValue::from(kind),
+            SqlStorageValue::from(name),
+            SqlStorageValue::from(scope),
+            SqlStorageValue::from(sha256),
+            SqlStorageValue::try_from_i64(size_bytes)?,
+            SqlStorageValue::from(content_type),
+            SqlStorageValue::from(r2_key),
+            SqlStorageValue::try_from_i64(accepted_seq)?,
+            SqlStorageValue::try_from_i64(created_at_ms)?,
+        ],
+    )?;
+    Ok(())
+}
+
+fn update_upload_state(sql: &SqlStorage, id: &str, state: &str) -> worker::Result<()> {
+    sql.exec(
+        "UPDATE upload SET state = ?1 WHERE id = ?2",
+        vec![SqlStorageValue::from(state), SqlStorageValue::from(id)],
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Reports
+// ---------------------------------------------------------------------------
+
+const REPORT_COLUMNS: &str = "id, job_id, shard_index, kind, name, scope, content_sha256, upload_id, accepted_seq, created_at, is_canonical, parsed, summary";
+
+fn read_report(sql: &SqlStorage, id: &str) -> worker::Result<Option<ReportRow>> {
+    let rows: Vec<ReportRow> = sql
+        .exec(
+            &format!("SELECT {REPORT_COLUMNS} FROM report WHERE id = ?1"),
+            vec![SqlStorageValue::from(id)],
+        )?
+        .to_array()?;
+    Ok(rows.into_iter().next())
+}
+
+fn require_report(sql: &SqlStorage, id: &str) -> worker::Result<ReportRow> {
+    read_report(sql, id)?
+        .ok_or_else(|| worker::Error::RustError("report row missing after write".into()))
+}
+
+fn read_report_by_identity(
+    sql: &SqlStorage,
+    job_id: &str,
+    shard_index: u32,
+    kind: &str,
+    name: &str,
+    content_sha256: &str,
+) -> worker::Result<Option<ReportRow>> {
+    let rows: Vec<ReportRow> = sql
+        .exec(
+            &format!(
+                "SELECT {REPORT_COLUMNS} FROM report \
+                 WHERE job_id = ?1 AND shard_index = ?2 AND kind = ?3 AND name = ?4 AND content_sha256 = ?5"
+            ),
+            vec![
+                SqlStorageValue::from(job_id),
+                SqlStorageValue::try_from_i64(i64::from(shard_index))?,
+                SqlStorageValue::from(kind),
+                SqlStorageValue::from(name),
+                SqlStorageValue::from(content_sha256),
+            ],
+        )?
+        .to_array()?;
+    Ok(rows.into_iter().next())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_report(
+    sql: &SqlStorage,
+    id: &str,
+    job_id: &str,
+    shard_index: u32,
+    kind: &str,
+    name: &str,
+    scope: &str,
+    content_sha256: &str,
+    upload_id: Option<&str>,
+    accepted_seq: i64,
+    created_at_ms: i64,
+    parsed: i64,
+    summary: Option<&str>,
+) -> worker::Result<()> {
+    sql.exec(
+        &format!(
+            "INSERT INTO report ({REPORT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12)"
+        ),
+        vec![
+            SqlStorageValue::from(id),
+            SqlStorageValue::from(job_id),
+            SqlStorageValue::try_from_i64(i64::from(shard_index))?,
+            SqlStorageValue::from(kind),
+            SqlStorageValue::from(name),
+            SqlStorageValue::from(scope),
+            SqlStorageValue::from(content_sha256),
+            SqlStorageValue::from(upload_id.map(str::to_string)),
+            SqlStorageValue::try_from_i64(accepted_seq)?,
+            SqlStorageValue::try_from_i64(created_at_ms)?,
+            SqlStorageValue::try_from_i64(parsed)?,
+            SqlStorageValue::from(summary.map(str::to_string)),
+        ],
+    )?;
+    Ok(())
+}
+
+fn unset_other_canonical_reports(
+    sql: &SqlStorage,
+    job_id: &str,
+    shard_index: u32,
+    kind: &str,
+    name: &str,
+    keep_id: &str,
+) -> worker::Result<()> {
+    sql.exec(
+        "UPDATE report SET is_canonical = 0 \
+         WHERE job_id = ?1 AND shard_index = ?2 AND kind = ?3 AND name = ?4 AND id != ?5",
+        vec![
+            SqlStorageValue::from(job_id),
+            SqlStorageValue::try_from_i64(i64::from(shard_index))?,
+            SqlStorageValue::from(kind),
+            SqlStorageValue::from(name),
+            SqlStorageValue::from(keep_id),
+        ],
+    )?;
+    Ok(())
+}
+
+/// `RunCoordinator`'s own per-run monotonic counter for `accepted_seq`
+/// (byo-ci.md's Idempotency section), derived from the DO's own storage
+/// rather than a dedicated counter column: one more than the highest
+/// `accepted_seq` already assigned to any upload or report this run has
+/// accepted.
+fn next_accepted_seq(sql: &SqlStorage) -> worker::Result<i64> {
+    let upload_max: Vec<MaxSeqRow> = sql
+        .exec(
+            "SELECT COALESCE(MAX(accepted_seq), 0) as m FROM upload",
+            None,
+        )?
+        .to_array()?;
+    let report_max: Vec<MaxSeqRow> = sql
+        .exec(
+            "SELECT COALESCE(MAX(accepted_seq), 0) as m FROM report",
+            None,
+        )?
+        .to_array()?;
+    let u = upload_max.first().map(|r| r.m).unwrap_or(0);
+    let r = report_max.first().map(|r| r.m).unwrap_or(0);
+    Ok(u.max(r) + 1)
+}
+
+/// Infers a shard's conclusion from its accepted, parsed, canonical reports
+/// when `CompleteShard` omits `--conclusion` (byo-ci.md's `cloud-ci upload`
+/// section: "failure if a report has a failed test or an error-level
+/// diagnostic, else success"). Reports with no parser (`parsed = 0`, e.g.
+/// `lcov` coverage, which has no pass/fail concept) never contribute a
+/// failure signal here.
+fn infer_shard_conclusion(
+    sql: &SqlStorage,
+    job_id: &str,
+    shard_index: u32,
+) -> worker::Result<Conclusion> {
+    let rows: Vec<SummaryRow> = sql
+        .exec(
+            "SELECT summary FROM report \
+             WHERE job_id = ?1 AND shard_index = ?2 AND is_canonical = 1 AND parsed = 1 AND summary IS NOT NULL",
+            vec![
+                SqlStorageValue::from(job_id),
+                SqlStorageValue::try_from_i64(i64::from(shard_index))?,
+            ],
+        )?
+        .to_array()?;
+    for row in rows {
+        let Some(summary) = row.summary else {
+            continue;
+        };
+        let value: serde_json::Value = serde_json::from_str(&summary)
+            .map_err(|e| worker::Error::RustError(format!("cannot decode report summary: {e}")))?;
+        let failed = value.get("failed").and_then(|v| v.as_u64()).unwrap_or(0);
+        let errored = value.get("errored").and_then(|v| v.as_u64()).unwrap_or(0);
+        if failed > 0 || errored > 0 {
+            return Ok(Conclusion::CONCLUSION_FAILURE);
+        }
+    }
+    Ok(Conclusion::CONCLUSION_SUCCESS)
+}
+
+/// Dispatches to whichever `cloud-ci-reports` parser exists for
+/// `report_kind` (case-insensitive, matching the CLI names in
+/// byo-ci.md's "Supported report formats"). A kind with no parser yet, or
+/// bytes that fail to parse, store the raw bytes unparsed rather than
+/// erroring — byo-ci.md's Failure modes: "Raw bytes are still stored in R2
+/// ... but no `report_uploads` row is written" (here: `parsed = 0`,
+/// `summary = NULL`, but the `report` row itself still exists).
+fn parse_report(kind: &str, bytes: &[u8]) -> (i64, Option<String>) {
+    let summary = match kind.to_ascii_lowercase().as_str() {
+        "junit" => cloud_ci_reports::junit::parse(bytes)
+            .ok()
+            .map(summarize_test_suites),
+        "vitest" => cloud_ci_reports::vitest::parse(bytes)
+            .ok()
+            .map(summarize_test_suites),
+        "playwright" => cloud_ci_reports::playwright::parse(bytes)
+            .ok()
+            .map(summarize_test_suites),
+        "lcov" => cloud_ci_reports::lcov::parse(bytes)
+            .ok()
+            .map(summarize_lcov),
+        _ => None,
+    };
+    match summary {
+        Some(json) => (1, Some(json)),
+        None => (0, None),
+    }
+}
+
+fn summarize_test_suites(suites: cloud_ci_reports::TestSuites) -> String {
+    let mut passed = 0u64;
+    let mut failed = 0u64;
+    let mut skipped = 0u64;
+    let mut errored = 0u64;
+    let mut failed_tests = Vec::new();
+    for suite in &suites.suites {
+        for tc in &suite.test_cases {
+            match &tc.outcome {
+                cloud_ci_reports::Outcome::Passed => passed += 1,
+                cloud_ci_reports::Outcome::Skipped(_) => skipped += 1,
+                cloud_ci_reports::Outcome::Failed(f) => {
+                    failed += 1;
+                    failed_tests.push(serde_json::json!({"name": tc.name, "message": f.message}));
+                }
+                cloud_ci_reports::Outcome::Errored(f) => {
+                    errored += 1;
+                    failed_tests.push(serde_json::json!({"name": tc.name, "message": f.message}));
+                }
+            }
+        }
+    }
+    serde_json::json!({
+        "passed": passed,
+        "failed": failed,
+        "skipped": skipped,
+        "errored": errored,
+        "failed_tests": failed_tests,
+    })
+    .to_string()
+}
+
+fn summarize_lcov(report: cloud_ci_reports::LcovReport) -> String {
+    let mut total_lines = 0u64;
+    let mut hit_lines = 0u64;
+    for file in &report.source_files {
+        for line in &file.lines {
+            total_lines += 1;
+            if line.hit_count > 0 {
+                hit_lines += 1;
+            }
+        }
+    }
+    serde_json::json!({
+        "total_lines": total_lines,
+        "hit_lines": hit_lines,
+        "files": report.source_files.len(),
+    })
+    .to_string()
+}
+
 fn decode_string_list(json: &str) -> worker::Result<Vec<String>> {
     serde_json::from_str(json)
         .map_err(|e| worker::Error::RustError(format!("cannot decode expect_jobs: {e}")))
@@ -636,6 +1727,34 @@ impl RunCoordinatorStore {
 
     pub async fn get_run(&self) -> Result<GetRunOutcome, CoordinatorError> {
         self.call::<(), _>(Method::Get, "/get-run", None).await
+    }
+
+    pub async fn create_upload(
+        &self,
+        req: &CreateUploadRequest,
+    ) -> Result<CreateUploadOutcome, CoordinatorError> {
+        self.call(Method::Post, "/create-upload", Some(req)).await
+    }
+
+    pub async fn complete_upload(
+        &self,
+        req: &CompleteUploadRequest,
+    ) -> Result<CompleteUploadOutcome, CoordinatorError> {
+        self.call(Method::Post, "/complete-upload", Some(req)).await
+    }
+
+    pub async fn submit_report(
+        &self,
+        req: &SubmitReportRequest,
+    ) -> Result<SubmitReportOutcome, CoordinatorError> {
+        self.call(Method::Post, "/submit-report", Some(req)).await
+    }
+
+    pub async fn complete_shard(
+        &self,
+        req: &CompleteShardRequest,
+    ) -> Result<CompleteShardOutcome, CoordinatorError> {
+        self.call(Method::Post, "/complete-shard", Some(req)).await
     }
 
     async fn call<B, R>(
