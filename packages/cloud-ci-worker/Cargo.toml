@@ -15,6 +15,7 @@ cloud-ci-proto = { path = "../cloud-ci-proto-rust" }
 cloud-ci-reports = { path = "../cloud-ci-reports" }
 getrandom = { version = "0.2", features = ["js"] }
 hmac = "0.12"
+minijinja = { version = "2.24.0", default-features = false, features = ["builtins", "deserialization", "macros", "multi_template", "adjacent_loop_items", "std_collections", "serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

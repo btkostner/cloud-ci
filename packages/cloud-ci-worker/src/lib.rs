@@ -10,6 +10,7 @@ pub mod oidc;
 pub mod reconcile;
 pub mod roles;
 pub mod session;
+pub mod template_spike;
 pub mod ulid;
 pub mod webhook;
 
