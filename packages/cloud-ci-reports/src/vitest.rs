@@ -83,6 +83,7 @@ fn testcase_from_raw(file_name: &str, assertion: RawAssertionResult) -> TestCase
         outcome: outcome_from_raw(assertion.status, assertion.failure_messages),
         system_out: None,
         system_err: None,
+        attempts: None,
     }
 }
 
@@ -313,6 +314,7 @@ mod tests {
         assert_eq!(passed.line, Some(12));
         assert_eq!(passed.time, Some(0.0032));
         assert_eq!(passed.outcome, Outcome::Passed);
+        assert_eq!(passed.attempts, None);
 
         let failed = &parsed.suites[0].test_cases[1];
         assert_eq!(failed.name, "divides by zero");

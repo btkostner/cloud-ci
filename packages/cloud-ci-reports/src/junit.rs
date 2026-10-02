@@ -218,6 +218,7 @@ fn testcase_from_attrs(start: &BytesStart<'_>) -> Result<TestCase, ParseError> {
         outcome: Outcome::Passed,
         system_out: None,
         system_err: None,
+        attempts: None,
     })
 }
 

@@ -1,10 +1,11 @@
 //! Domain model for third-party CI report parsing.
 //!
-//! JUnit XML and Vitest's JSON reporter are in scope so far; other report kinds named in
-//! `docs/architecture.md`'s package table (Playwright, lcov, cobertura, ...) are later work and
-//! intentionally have no surface here yet.
+//! JUnit XML, Vitest's JSON reporter, and Playwright's JSON reporter are in scope so far; other
+//! report kinds named in `docs/architecture.md`'s package table (lcov, cobertura, ...) are later
+//! work and intentionally have no surface here yet.
 
 pub mod junit;
+pub mod playwright;
 pub mod vitest;
 
 /// A parsed `<testsuites>` document: zero or more [`TestSuite`]s.
@@ -44,8 +45,8 @@ pub struct TestCase {
     pub classname: Option<String>,
     /// `file` attribute: the source file the test is defined in. Emitted by writers that
     /// follow xUnit's legacy `testcase` attribute family (e.g. pytest's `--junitxml` output);
-    /// not part of every writer's output. [`vitest::parse`] also populates this, from the
-    /// enclosing test file's path.
+    /// not part of every writer's output. [`vitest::parse`] and [`playwright::parse`] also
+    /// populate this, from the enclosing test file's path.
     pub file: Option<String>,
     /// `line` attribute: the line in `file` the test is defined at. Same provenance as `file`.
     pub line: Option<u32>,
@@ -54,6 +55,22 @@ pub struct TestCase {
     pub outcome: Outcome,
     pub system_out: Option<String>,
     pub system_err: Option<String>,
+    /// Every attempt [`playwright::parse`] recorded for this test case, oldest first, when
+    /// Playwright retried it (its `results` array has more than one entry). `outcome` above
+    /// always mirrors the *last* attempt. `None` means the format reports only a single outcome
+    /// per test (JUnit, Vitest) or this Playwright test was not retried. A `Some` whose final
+    /// [`Attempt::outcome`] is [`Outcome::Passed`] while an earlier attempt was not is a flaky
+    /// test — Playwright's own vocabulary for this ("flaky") lives only in its aggregate test
+    /// status, not on the attempt, so callers derive it from this list instead.
+    pub attempts: Option<Vec<Attempt>>,
+}
+
+/// One Playwright test attempt (`results[]` entry). See [`TestCase::attempts`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct Attempt {
+    pub outcome: Outcome,
+    /// Attempt duration in seconds.
+    pub time: Option<f64>,
 }
 
 /// What happened when a test case ran.
