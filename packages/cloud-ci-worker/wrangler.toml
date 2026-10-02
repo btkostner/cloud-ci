@@ -54,6 +54,15 @@ class_name = "RunCoordinator"
 name = "PULL_REQUEST_STATE"
 class_name = "PullRequestState"
 
+# One SQLite-backed Durable Object per repo (architecture.md's "System
+# shape" diagram, "Core flows" § "Managed run" step 2). Addressed by
+# `repo_id` alone via `idFromName("{repo_id}")` (src/repo_state.rs module
+# docs). Owns admission/concurrency decisions only this round — see that
+# module's doc comment for the full scope boundary.
+[[durable_objects.bindings]]
+name = "REPO_STATE"
+class_name = "RepoState"
+
 # new_sqlite_classes, not new_classes: RunCoordinator uses
 # state.storage().sql(), which only exists on SQLite-backed objects. Never
 # rewrite this entry — migrations are append-only.
@@ -68,6 +77,13 @@ new_sqlite_classes = ["RunCoordinator"]
 [[migrations]]
 tag = "v2"
 new_sqlite_classes = ["PullRequestState"]
+
+# new_sqlite_classes, not new_classes: RepoState uses
+# state.storage().sql(), same reasoning as the migrations above. Never
+# rewrite the v1/v2 entries — migrations are append-only.
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["RepoState"]
 
 # Installation reconcile job (docs/design/auth.md § "Multiple orgs and
 # installations", "Discovery" paragraph): calls `GET /app/installations`

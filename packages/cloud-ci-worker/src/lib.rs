@@ -11,6 +11,7 @@ pub mod pr_comment;
 pub mod pull_request_state;
 pub mod pull_request_webhook;
 pub mod reconcile;
+pub mod repo_state;
 pub mod roles;
 pub mod session;
 pub mod template_spike;
