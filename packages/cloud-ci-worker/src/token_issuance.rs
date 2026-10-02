@@ -74,6 +74,16 @@
 //! victim straight to `/oauth/callback?state=...`); this endpoint is
 //! not, so `SameSite=Lax` alone is the mitigation — no double-submit
 //! token adds anything a cross-site attacker could otherwise forge here.
+//!
+//! This section only claims to defeat cross-*origin* forged requests —
+//! it says nothing about, and is not a defense against, session-cookie
+//! theft (XSS, log leakage: auth.md's threat-model table row 1 covers
+//! that, via this cookie's `HttpOnly`/`Secure` attributes, both set by
+//! `session::build_set_cookie_header`) or a same-site sibling-subdomain
+//! attacker (`SameSite=Lax`/`Strict` both still attach the cookie to any
+//! request from a sibling subdomain sharing this deployment's
+//! registrable domain — a distinct threat `SameSite` was never designed
+//! to address).
 
 use crate::roles::Role;
 use base64::Engine as _;

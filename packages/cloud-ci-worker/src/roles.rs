@@ -26,10 +26,12 @@
 //! even if its TTL expired, rather than fail closed immediately; if no
 //! cached row exists, resolve to viewer").
 //!
-//! Nothing in `lib.rs` calls [`resolve_role`] yet — wiring role
-//! resolution as an authorization gate on specific RPCs/dashboard routes
-//! is explicitly out of scope this round (see the round's brief, item 5).
-//! This module is the mechanism, not yet a gate.
+//! `lib.rs::handle_issue_token` (`POST /v1/tokens`, `src/token_issuance.rs`)
+//! is the first real caller: it calls [`resolve_role`] for every repo id
+//! it needs admin on before minting a token, so this module is wired as
+//! an actual authorization gate there. No other route in `lib.rs` calls
+//! it yet, though — it is not yet a general dashboard/RPC authorization
+//! gate, just no longer true that nothing calls it.
 
 use serde::{Deserialize, Serialize};
 use worker::Env;
