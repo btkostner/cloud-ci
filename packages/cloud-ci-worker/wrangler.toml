@@ -2,6 +2,17 @@ name = "cloud-ci"
 main = "build/index.js"
 compatibility_date = "2026-09-01"
 
+# Not secret: public identifiers / an allowlist, not a credential
+# (docs/design/auth.md § "Secret storage"). Placeholders until the
+# `cloud-ci setup github-app` CLI (a later round) writes the real values
+# here and runs `wrangler deploy` — until then the webhook route treats a
+# missing/empty GITHUB_ALLOWED_ORGS as "no org allowed" (fail closed) and
+# a missing/empty GITHUB_APP_ID as unconfigured (uninstall-of-disallowed-org
+# calls fail loudly rather than silently).
+[vars]
+GITHUB_APP_ID = ""
+GITHUB_ALLOWED_ORGS = ""
+
 [build]
 command = "worker-build --release"
 

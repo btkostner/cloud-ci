@@ -16,3 +16,23 @@ INGEST_TOKEN_SECRET=local-dev-ingest-token-secret
 # this becomes a Secrets Store binding once `cloud-ci setup github-app`
 # exists (docs/design/auth.md § "GitHub App setup").
 GITHUB_APP_PRIVATE_KEY=
+
+# Required secret, same fail-loudly-if-unset pattern as
+# INGEST_TOKEN_SECRET/GITHUB_APP_PRIVATE_KEY above: src/lib.rs's
+# /webhooks/github route refuses to verify any delivery (500) when this is
+# unset, rather than skipping verification. Any non-empty value works for
+# local dev; use it as the HMAC key when generating a synthetic
+# X-Hub-Signature-256 header for smoke testing. In production this becomes
+# a Secrets Store binding once `cloud-ci setup github-app` exists
+# (docs/design/auth.md § "Secret storage").
+GITHUB_WEBHOOK_SECRET=local-dev-webhook-secret
+
+# GITHUB_APP_ID and GITHUB_ALLOWED_ORGS are normally [vars] in
+# wrangler.toml (not secret — see docs/design/auth.md § "Secret storage"),
+# but `wrangler dev` reads .dev.vars as an override for [vars] too, which
+# is the easiest way to set a local allowlist for smoke testing without
+# editing wrangler.toml's deploy-time placeholders. GITHUB_APP_ID only
+# needs to be numeric for src/github_app.rs's claim construction; it does
+# not need to match a real GitHub App for local dev.
+GITHUB_APP_ID=999999
+GITHUB_ALLOWED_ORGS=acme-corp
