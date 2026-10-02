@@ -76,7 +76,7 @@ export default workflow({
       run: "mise install",
     });
     const deps = ci.snapshot("deps", {
-      from: toolchain,
+      snapshot: toolchain,
       files: ["**/package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"],
       run: "pnpm install --frozen-lockfile",
     });
@@ -221,8 +221,8 @@ shell glue and no template syntax in `run`, just a TypeScript function that retu
 
 A migration-backed suite only needs to migrate the database once. Run the migration as a plain
 `ci.container` with its own `postgres` sidecar, snapshot that sidecar's data volume once the
-migration finishes, then start each shard's own `postgres` sidecar `from:` that snapshot instead of
-sharing one live sidecar across shards:
+migration finishes, then start each shard's own `postgres` sidecar with `snapshot:` set to that
+snapshot instead of sharing one live sidecar across shards:
 
 ```ts
 const test = ci.check("ci/e2e", { required: true });
@@ -246,7 +246,7 @@ const shards = await ci.shard("e2e", {
   split: "timing",
   count: { min: 2, max: 8, target: "5m" },
   sidecars: {
-    postgres: { image: "postgres:17", from: pgSnapshot, ready: "tcp:5432" },
+    postgres: { image: "postgres:17", snapshot: pgSnapshot, ready: "tcp:5432" },
   },
   run: ({ files }) => `npx playwright test ${files.join(" ")} --reporter=blob`,
   reports: [{ type: "playwright-blob", merge: "html" }],
@@ -403,28 +403,39 @@ const toolchain = ci.snapshot("toolchain", {
   run: "mise install",
 });
 const deps = ci.snapshot("deps", {
-  from: toolchain,
+  snapshot: toolchain,
   files: ["**/package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"],
   run: "pnpm install --frozen-lockfile",
 });
 ```
 
-Each layer is keyed by a hash of `(parent key, copied files, commands)`. A node sets
-`snapshot: deps` (the property is named `snapshot`; its value is a snapshot task, not a boolean)
-to start from that layer's filesystem. Layers are long-lived across runs — reused whenever their
-key is unchanged, not rebuilt per run — so a source-only commit reuses both the `toolchain` and
-`deps` layers and only pays for copying source into the per-task containers. Layers are limited
+Each layer is keyed by a hash of `(parent key, copied files, commands)`.
+
+One rule covers every API: **`snapshot` restores, `from` captures.**
+
+- `snapshot: <snapshot>` means "start from this snapshot's filesystem". It is the same property
+  on `ci.container`, `ci.shard`, the turbo/mise helpers, a sidecar definition, and `ci.snapshot`
+  itself (a layer's parent). Its value is always a `ci.snapshot(...)` result, never a boolean.
+- `from: <container result>` appears only on `ci.snapshot`, and only when capturing the state a
+  finished container left behind (see the sidecar volume capture below). It never takes a
+  snapshot as its value.
+
+A node sets `snapshot: deps` to start from that layer's filesystem. Layers are long-lived across
+runs — reused whenever their key is unchanged, not rebuilt per run — so a source-only commit
+reuses both the `toolchain` and `deps` layers and only pays for copying source into the per-task
+containers. Layers are limited
 to 20 GB and kept 30 days (developers.cloudflare.com/containers/platform/limits, checked
 2026-09-30). Whether one container can start from a snapshot another took, and cross-container
 restore speed versus a cold install, are Phase 0 spikes; the fallback is a lockfile-keyed
 package-store cache ([assets](./assets.md)).
 
-`ci.snapshot` can also capture a sidecar's data volume instead of the job container's own
-filesystem:
+`ci.snapshot` can also capture a sidecar's data volume instead of building a layer from files and
+commands:
 `ci.snapshot(name, { from: containerResult, sidecar: "postgres", volume: "/var/lib/postgresql/data" })`
-snapshots that volume as it stood when `containerResult`'s container finished, so a later
-`ci.container`/`ci.shard` call can start its own `postgres` sidecar `from:` that snapshot instead
-of a cold `postgres:17` plus a fresh migration. Same 20 GB/30-day limits and same cross-container
+snapshots that volume as it stood when `containerResult`'s container finished. A later
+`ci.container`/`ci.shard` call restores it the normal way, with `snapshot:` on its `postgres`
+sidecar, instead of a cold `postgres:17` plus a fresh migration. `from` and `snapshot` cannot
+both be set on one `ci.snapshot` call. Same 20 GB/30-day limits and same cross-container
 restore open question as above; see [Splitting tests across shards](#splitting-tests-across-shards)
 for the worked example.
 
