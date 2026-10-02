@@ -1,0 +1,16 @@
+-- Extends RunCoordinator's D1 projection (ADR 0004) with the run's
+-- timeout, per docs/design/byo-ci.md's `BeginRun` row ("`timeout`
+-- (optional, default 30 minutes, clamped to the deployment-wide
+-- maximum)") and the Data model's `runs` table, which already lists
+-- `timeout_s` as a column. `RunCoordinator::handle_begin_run` sets a DO
+-- alarm for `now + timeout_s` the first time a run is created
+-- (`coordinator::logic::resolve_timeout_seconds`); this column is that
+-- same value, projected for dashboard/query use like every other `runs`
+-- column. Forward-only, per AGENTS.md: this adds a column, never alters
+-- or drops anything 0001/0007/0008 created.
+--
+-- Default `1800` matches `resolve_timeout_seconds`'s 30-minute default
+-- for any row written before this migration ran (none exist yet, this
+-- round, but the default keeps the column NOT NULL without a backfill
+-- step regardless).
+ALTER TABLE runs ADD COLUMN timeout_s INTEGER NOT NULL DEFAULT 1800;

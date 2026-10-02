@@ -465,6 +465,62 @@ pub fn run_state_from_conclusion(conclusion: Conclusion) -> RunState {
 }
 
 // ---------------------------------------------------------------------------
+// Timeout (`BeginRun`'s `timeout`, docs/design/byo-ci.md's `BeginRun` row:
+// "timeout (optional, default 30 minutes, clamped to the deployment-wide
+// maximum)") and its close trigger's forced `abandoned` state (Failure
+// modes row: "A shard never uploads ... The completion webhook or
+// `--expect-jobs` marks it `missing` when the run closes; otherwise the
+// timeout marks it `missing` and the run moves to `abandoned`" —
+// unconditional, unlike the webhook/`--expect-jobs` triggers' computed
+// `succeeded`/`failed`). `coordinator::mod`'s `handle_begin_run` sets a DO
+// alarm for `now + resolve_timeout_seconds(...)` the first time a run is
+// created; the alarm handler calls `handle_close_run` with `by_timeout:
+// true`, which uses `run_state_for_close` below instead of
+// `run_state_from_conclusion`.
+// ---------------------------------------------------------------------------
+
+/// byo-ci.md's `BeginRun` row default: "default 30 minutes".
+pub const DEFAULT_TIMEOUT_SECONDS: i64 = 30 * 60;
+
+/// byo-ci.md names a "deployment-wide maximum" clamp (both in the
+/// `BeginRun` row and again in the Completion semantics' timeout bullet)
+/// but never gives it a number anywhere in the doc. 6 hours is this
+/// implementation's own choice, not the doc's: generous enough for a
+/// slow full matrix/e2e suite while still bounding how long a
+/// `RunCoordinator` can sit with an open DO alarm.
+pub const MAX_TIMEOUT_SECONDS: i64 = 6 * 60 * 60;
+
+/// Resolves `BeginRun`'s requested timeout (seconds, from the proto
+/// `google.protobuf.Duration`) to what gets stored and used for the DO
+/// alarm. `requested <= 0` means "omitted" (the `Duration` defaults to
+/// zero when the field is absent), using [`DEFAULT_TIMEOUT_SECONDS`];
+/// anything above [`MAX_TIMEOUT_SECONDS`] is clamped down to it.
+pub fn resolve_timeout_seconds(requested: i64) -> i64 {
+    let base = if requested <= 0 {
+        DEFAULT_TIMEOUT_SECONDS
+    } else {
+        requested
+    };
+    base.min(MAX_TIMEOUT_SECONDS)
+}
+
+/// Chooses the run's terminal state when closing, per byo-ci.md's three
+/// completion triggers. The webhook and `--expect-jobs` triggers compute
+/// `succeeded`/`failed` from the worst job conclusion
+/// ([`run_state_from_conclusion`]); the timeout trigger is unconditional
+/// `abandoned`, per the Failure modes row for a never-uploaded shard:
+/// "otherwise the timeout marks it `missing` and the run moves to
+/// `abandoned`" — regardless of what the jobs' conclusions would
+/// otherwise compute to.
+pub fn run_state_for_close(by_timeout: bool, conclusion: Conclusion) -> RunState {
+    if by_timeout {
+        RunState::Abandoned
+    } else {
+        run_state_from_conclusion(conclusion)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Check Runs (`StartJob.check_names`, `CompleteShard`, run close),
 // docs/design/byo-ci.md "Checks and scopes" and docs/design/pr-comment.md
 // "Check Runs". Deliberately independent of `pr_comment.rs`'s template/
@@ -1074,5 +1130,55 @@ mod tests {
             ("lint".to_string(), false),
         ];
         assert!(expect_jobs_satisfied(Some(&expected), &started));
+    }
+
+    #[test]
+    fn resolve_timeout_seconds_defaults_to_30_minutes_when_omitted() {
+        assert_eq!(resolve_timeout_seconds(0), DEFAULT_TIMEOUT_SECONDS);
+        assert_eq!(resolve_timeout_seconds(-1), DEFAULT_TIMEOUT_SECONDS);
+        assert_eq!(DEFAULT_TIMEOUT_SECONDS, 1800);
+    }
+
+    #[test]
+    fn resolve_timeout_seconds_passes_through_a_requested_value_under_the_max() {
+        assert_eq!(resolve_timeout_seconds(60), 60);
+        assert_eq!(resolve_timeout_seconds(3), 3);
+    }
+
+    #[test]
+    fn resolve_timeout_seconds_clamps_to_the_deployment_wide_maximum() {
+        assert_eq!(
+            resolve_timeout_seconds(MAX_TIMEOUT_SECONDS + 1),
+            MAX_TIMEOUT_SECONDS
+        );
+        assert_eq!(resolve_timeout_seconds(i64::MAX), MAX_TIMEOUT_SECONDS);
+    }
+
+    #[test]
+    fn run_state_for_close_computes_succeeded_or_failed_when_not_by_timeout() {
+        assert_eq!(
+            run_state_for_close(false, Conclusion::CONCLUSION_SUCCESS),
+            run_state_from_conclusion(Conclusion::CONCLUSION_SUCCESS)
+        );
+        assert_eq!(
+            run_state_for_close(false, Conclusion::CONCLUSION_FAILURE),
+            run_state_from_conclusion(Conclusion::CONCLUSION_FAILURE)
+        );
+    }
+
+    #[test]
+    fn run_state_for_close_is_unconditionally_abandoned_by_timeout() {
+        // The timeout trigger forces `abandoned` regardless of what the
+        // jobs' conclusions would otherwise compute to (byo-ci.md's
+        // Failure modes row for a never-uploaded shard) — unlike the
+        // webhook/`--expect-jobs` triggers, which compute succeeded/failed.
+        assert_eq!(
+            run_state_for_close(true, Conclusion::CONCLUSION_SUCCESS),
+            RunState::Abandoned
+        );
+        assert_eq!(
+            run_state_for_close(true, Conclusion::CONCLUSION_FAILURE),
+            RunState::Abandoned
+        );
     }
 }
