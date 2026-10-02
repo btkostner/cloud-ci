@@ -1,0 +1,26 @@
+#:schema https://mise.jdx.dev/schema/mise.json
+
+[tools]
+rust = { version = "1.98.1", components = "clippy,rustfmt" }
+
+[tasks.lint]
+description = "Run clippy"
+depends = ["//packages/cloud-ci-proto:generate"]
+run = "cargo clippy --all-targets --locked -- -D warnings"
+
+[tasks.format]
+description = "Check Rust formatting"
+run = "cargo fmt --check"
+
+[tasks.test]
+description = "Run unit tests"
+depends = ["//packages/cloud-ci-proto:generate"]
+run = "cargo test --locked"
+
+[tasks.check]
+description = "Run every check"
+depends = ["lint", "format", "test"]
+
+[tasks.fix]
+description = "Format Rust code"
+run = "cargo fmt"
