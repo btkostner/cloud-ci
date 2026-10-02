@@ -23,8 +23,8 @@ jobs:
         with:
           experimental: true
 
-      - name: Install monorepo tools
-        run: mise install --monorepo
+      - name: Install tools
+        run: mise install
 
       - name: Check
         run: mise run check
