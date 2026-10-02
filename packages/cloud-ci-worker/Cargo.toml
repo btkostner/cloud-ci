@@ -23,6 +23,15 @@ wasm-bindgen = "0.2.129"
 web-sys = { version = "0.3", features = ["Crypto", "SubtleCrypto", "CryptoKey"] }
 worker = { version = "0.8.7", features = ["http", "d1"] }
 
+# Patches `worker` to add `durable_object`-scheduling-policy Container
+# startup fields (image/instance/containerSnapshot/labels) and
+# Container::exec()/ExecProcess/ExecOutput, which worker-sys/worker 0.8.7
+# lack. See docs/adr/0011-patching-third-party-crates.md for why this is a
+# git-pinned fork branch rather than a vendored copy, and what the diff
+# against the published v0.8.7 tag is.
+[patch.crates-io]
+worker = { git = "https://github.com/btkostner/workers-rs", rev = "0a6f661a61f420bcce1530cec471a207367b5e8f" }
+
 [lints.rust]
 unsafe_code = "forbid"
 
