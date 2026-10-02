@@ -309,6 +309,108 @@ pub fn job_conclusion_from_shards(shard_conclusions: &[Conclusion]) -> Option<Co
     shard_conclusions.iter().copied().reduce(worst_conclusion)
 }
 
+// ---------------------------------------------------------------------------
+// Run close (`workflow_run` webhook this round; `--expect-jobs` counting
+// and the timeout alarm are separate, later signals — see the
+// `workflow_run` module docs for why only the webhook is built this
+// round), docs/design/byo-ci.md "Completion semantics"
+// ---------------------------------------------------------------------------
+
+/// One already-known shard row, as input to [`close_job`]. An index in
+/// `1..=shard_total` with no entry here is implicitly `pending` — never
+/// reached by any upload/`CompleteShard` call — same as everywhere else
+/// in this module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShardRecord {
+    pub shard_index: u32,
+    pub state: ShardState,
+    pub conclusion: Option<Conclusion>,
+}
+
+/// What closing a run should do to one of its jobs, per "while a job
+/// still has shards that did not upload, those shards are marked
+/// `missing` at once... A job with a missing shard concludes `failure`
+/// with the summary 'N of total shards missing'."
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobCloseDecision {
+    /// Shard indices in `1..=shard_total` that have no `uploaded` or
+    /// `missing` row yet and must be written as `missing` now.
+    pub newly_missing: Vec<u32>,
+    pub conclusion: Conclusion,
+    /// `Some("N of total shards missing")` when at least one shard
+    /// (already `missing`, or newly so) exists; `None` for a job that
+    /// concluded from its own shard uploads alone.
+    pub summary: Option<String>,
+}
+
+/// Decides how to close one job when its run closes. Idempotent by
+/// construction: calling this again for a job every one of whose shards
+/// is already `uploaded` or `missing` recomputes the same decision from
+/// the same inputs, so redelivery of the same close signal is safe to
+/// replay all the way down to this function, not just at the run level.
+pub fn close_job(shard_total: u32, shards: &[ShardRecord]) -> JobCloseDecision {
+    let mut newly_missing = Vec::new();
+    let mut already_missing: u32 = 0;
+    let mut uploaded_conclusions = Vec::new();
+
+    for idx in 1..=shard_total {
+        match shards.iter().find(|s| s.shard_index == idx) {
+            Some(s) if s.state == ShardState::Uploaded => {
+                if let Some(c) = s.conclusion {
+                    uploaded_conclusions.push(c);
+                }
+            }
+            Some(s) if s.state == ShardState::Missing => already_missing += 1,
+            _ => newly_missing.push(idx),
+        }
+    }
+
+    let missing_total = already_missing + newly_missing.len() as u32;
+    let conclusion = if missing_total > 0 {
+        Conclusion::CONCLUSION_FAILURE
+    } else {
+        uploaded_conclusions
+            .into_iter()
+            .reduce(worst_conclusion)
+            .unwrap_or(Conclusion::CONCLUSION_SUCCESS)
+    };
+    let summary =
+        (missing_total > 0).then(|| format!("{missing_total} of {shard_total} shards missing"));
+
+    JobCloseDecision {
+        newly_missing,
+        conclusion,
+        summary,
+    }
+}
+
+/// Rolls every job's conclusion up to the run's own, mirroring
+/// [`job_conclusion_from_shards`]'s "worst of its children" pattern
+/// (byo-ci.md: "the run's conclusion is the worst job conclusion"). A run
+/// closed with no jobs at all has nothing to be worse than success.
+pub fn run_conclusion_from_jobs(job_conclusions: &[Conclusion]) -> Conclusion {
+    job_conclusions
+        .iter()
+        .copied()
+        .reduce(worst_conclusion)
+        .unwrap_or(Conclusion::CONCLUSION_SUCCESS)
+}
+
+/// Narrows a computed run conclusion to the two terminal states the
+/// webhook/`--expect-jobs` close path can produce (byo-ci.md's Completion
+/// semantics flowchart: "closed: succeeded / failed" — `cancelled`/
+/// `abandoned` are reached by other, unbuilt paths, not this one).
+/// Deliberately computed from cloud-ci's own job/shard data, never from
+/// GitHub's `workflow_run.conclusion` — see the `workflow_run` module
+/// docs for why.
+pub fn run_state_from_conclusion(conclusion: Conclusion) -> RunState {
+    if conclusion == Conclusion::CONCLUSION_SUCCESS {
+        RunState::Succeeded
+    } else {
+        RunState::Failed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -616,5 +718,116 @@ mod tests {
             Some(Conclusion::CONCLUSION_SKIPPED)
         );
         assert_eq!(job_conclusion_from_shards(&[]), None);
+    }
+
+    #[test]
+    fn close_job_with_every_shard_uploaded_computes_the_worst_conclusion() {
+        let shards = [
+            ShardRecord {
+                shard_index: 1,
+                state: ShardState::Uploaded,
+                conclusion: Some(Conclusion::CONCLUSION_SUCCESS),
+            },
+            ShardRecord {
+                shard_index: 2,
+                state: ShardState::Uploaded,
+                conclusion: Some(Conclusion::CONCLUSION_SKIPPED),
+            },
+        ];
+        let decision = close_job(2, &shards);
+        assert_eq!(decision.newly_missing, Vec::<u32>::new());
+        assert_eq!(decision.conclusion, Conclusion::CONCLUSION_SKIPPED);
+        assert_eq!(decision.summary, None);
+    }
+
+    #[test]
+    fn close_job_with_no_shards_uploaded_at_all_defaults_to_success() {
+        // A job with zero shards ever reaching `uploaded` is a degenerate
+        // case this function still answers deterministically: every index
+        // becomes `newly_missing`, which forces `failure` regardless of
+        // the (empty) uploaded-conclusions fold — covered by the next
+        // test. This one exercises the fold's own default in isolation
+        // via a `shard_total` of 0 (no indices to iterate at all).
+        let decision = close_job(0, &[]);
+        assert_eq!(decision.newly_missing, Vec::<u32>::new());
+        assert_eq!(decision.conclusion, Conclusion::CONCLUSION_SUCCESS);
+        assert_eq!(decision.summary, None);
+    }
+
+    #[test]
+    fn close_job_marks_never_uploaded_shards_missing_and_concludes_failure() {
+        let shards = [ShardRecord {
+            shard_index: 1,
+            state: ShardState::Uploaded,
+            conclusion: Some(Conclusion::CONCLUSION_SUCCESS),
+        }];
+        // shard_total is 3; shard 1 uploaded, 2 and 3 never did.
+        let decision = close_job(3, &shards);
+        assert_eq!(decision.newly_missing, vec![2, 3]);
+        assert_eq!(decision.conclusion, Conclusion::CONCLUSION_FAILURE);
+        assert_eq!(decision.summary, Some("2 of 3 shards missing".to_string()));
+    }
+
+    #[test]
+    fn close_job_is_idempotent_when_shards_are_already_marked_missing() {
+        // Redelivery: a previous close already wrote shard 2 as `missing`.
+        // Closing again must recompute the identical decision, including
+        // not re-adding shard 2 to `newly_missing` (it already is
+        // `missing`, nothing new to write).
+        let shards = [
+            ShardRecord {
+                shard_index: 1,
+                state: ShardState::Uploaded,
+                conclusion: Some(Conclusion::CONCLUSION_SUCCESS),
+            },
+            ShardRecord {
+                shard_index: 2,
+                state: ShardState::Missing,
+                conclusion: None,
+            },
+        ];
+        let decision = close_job(2, &shards);
+        assert_eq!(decision.newly_missing, Vec::<u32>::new());
+        assert_eq!(decision.conclusion, Conclusion::CONCLUSION_FAILURE);
+        assert_eq!(decision.summary, Some("1 of 2 shards missing".to_string()));
+    }
+
+    #[test]
+    fn run_conclusion_is_the_worst_of_its_jobs() {
+        assert_eq!(
+            run_conclusion_from_jobs(&[
+                Conclusion::CONCLUSION_SUCCESS,
+                Conclusion::CONCLUSION_FAILURE,
+            ]),
+            Conclusion::CONCLUSION_FAILURE
+        );
+        assert_eq!(
+            run_conclusion_from_jobs(&[Conclusion::CONCLUSION_SUCCESS]),
+            Conclusion::CONCLUSION_SUCCESS
+        );
+    }
+
+    #[test]
+    fn run_conclusion_with_no_jobs_at_all_defaults_to_success() {
+        assert_eq!(
+            run_conclusion_from_jobs(&[]),
+            Conclusion::CONCLUSION_SUCCESS
+        );
+    }
+
+    #[test]
+    fn run_state_from_conclusion_only_maps_success_to_succeeded() {
+        assert_eq!(
+            run_state_from_conclusion(Conclusion::CONCLUSION_SUCCESS),
+            RunState::Succeeded
+        );
+        for conclusion in [
+            Conclusion::CONCLUSION_FAILURE,
+            Conclusion::CONCLUSION_CANCELLED,
+            Conclusion::CONCLUSION_SKIPPED,
+            Conclusion::CONCLUSION_UNSPECIFIED,
+        ] {
+            assert_eq!(run_state_from_conclusion(conclusion), RunState::Failed);
+        }
     }
 }

@@ -13,6 +13,7 @@ pub mod session;
 pub mod template_spike;
 pub mod ulid;
 pub mod webhook;
+pub mod workflow_run;
 
 use cloud_ci_proto::ingest::v1::{
     BeginRunRequest, BeginRunResponse, CompleteShardRequest, CompleteShardResponse,
@@ -844,11 +845,13 @@ fn oauth_callback_url(req: &Request) -> std::result::Result<String, String> {
 /// verification"). Reads the raw body first, verifies
 /// `X-Hub-Signature-256` via [`webhook::verify_signature`], and rejects
 /// with 401 *before* parsing anything or touching D1 on any failure —
-/// the doc's explicit ordering requirement. Only `installation` and
-/// `installation_repositories` are handled this round (see
-/// `src/installations.rs`); any other `X-GitHub-Event` gets a 200
-/// "not handled" ack so GitHub does not retry-storm an event type this
-/// deployment doesn't act on yet
+/// the doc's explicit ordering requirement. `installation`,
+/// `installation_repositories` (see `src/installations.rs`), and
+/// `workflow_run` (see `src/workflow_run.rs` — only its `completed`
+/// action does anything, per docs/design/byo-ci.md's "Completion
+/// semantics") are handled this round; any other `X-GitHub-Event` gets a
+/// 200 "not handled" ack so GitHub does not retry-storm an event type
+/// this deployment doesn't act on yet
 /// (docs.github.com/en/webhooks/using-webhooks/handling-webhook-deliveries,
 /// accessed 2026-10-02: a non-2xx response causes GitHub to retry
 /// delivery).
@@ -871,6 +874,7 @@ async fn handle_github_webhook(mut req: Request, env: &Env) -> Result<Response> 
         Some("installation_repositories") => {
             handle_installation_repositories_event(&raw_body, env).await
         }
+        Some("workflow_run") => handle_workflow_run_event(&raw_body, env).await,
         _ => Response::ok("event not handled"),
     }
 }
@@ -1006,6 +1010,57 @@ async fn handle_installation_repositories_event(raw_body: &[u8], env: &Env) -> R
         }
         _ => {}
     }
+    Response::ok("ok")
+}
+
+/// `workflow_run` `completed` (docs/design/byo-ci.md § "Completion
+/// semantics"; see `src/workflow_run.rs` module docs for the full
+/// correlation strategy and why `requested`/`in_progress` are no-ops
+/// here). Looks the `(repo_id, external_url)` pair up against the
+/// `runs` D1 projection; a miss, or a match that is already terminal, is
+/// a silent 200 ack — the webhook isn't for a cloud-ci-tracked run, is
+/// for a managed run, or the run already closed by another signal/this
+/// same redelivery. Only a genuine, non-terminal match reaches
+/// `RunCoordinator::close_run`.
+async fn handle_workflow_run_event(raw_body: &[u8], env: &Env) -> Result<Response> {
+    let event: workflow_run::WorkflowRunEvent = match serde_json::from_slice(raw_body) {
+        Ok(event) => event,
+        Err(_) => return Response::error("malformed workflow_run payload", 400),
+    };
+
+    let matched = workflow_run::find_run_by_external_url(
+        env,
+        event.repository.id,
+        &event.workflow_run.html_url,
+    )
+    .await?;
+    let matched_state = match &matched {
+        Some(r) => Some(
+            coordinator::logic::RunState::from_db_str(&r.status).ok_or_else(|| {
+                worker::Error::RustError(format!("unknown run status {}", r.status))
+            })?,
+        ),
+        None => None,
+    };
+
+    let decision = workflow_run::decide_close(&event.action, matched_state);
+    let Some(matched) = matched.filter(|_| decision == workflow_run::CloseDecision::Close) else {
+        return Response::ok("ok");
+    };
+
+    let do_name = coordinator::do_name(
+        event.repository.id,
+        &matched.sha,
+        &matched.run_key,
+        matched.attempt as u32,
+    );
+    let store = RunCoordinatorStore::new(env, &do_name)
+        .map_err(|e| worker::Error::RustError(format!("run coordinator unavailable: {e}")))?;
+    store
+        .close_run()
+        .await
+        .map_err(|e| worker::Error::RustError(format!("close_run failed: {e}")))?;
+
     Response::ok("ok")
 }
 

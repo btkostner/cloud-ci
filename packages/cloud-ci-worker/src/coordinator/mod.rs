@@ -118,6 +118,12 @@ pub struct SubmitReportOutcome {}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompleteShardOutcome {}
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloseRunOutcome {
+    pub run_id: String,
+    pub status: RunStatus,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct ErrorBody {
     error: String,
@@ -152,6 +158,7 @@ struct JobRow {
     check_names: String,
     state: String,
     conclusion: Option<String>,
+    conclusion_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -291,6 +298,7 @@ impl DurableObject for RunCoordinator {
                 let body: CompleteShardRequest = req.json().await?;
                 self.handle_complete_shard(&sql, body).await
             }
+            (Method::Post, "/close-run") => self.handle_close_run(&sql).await,
             _ => error_response(404, "unknown RunCoordinator route"),
         }
     }
@@ -763,11 +771,12 @@ impl RunCoordinator {
         self.project_job_shard_to_d1(&require_job_shard(sql, &req.job_id, req.shard_index)?)
             .await?;
 
-        // Conclude the job once every declared shard has uploaded.
-        // Run-level completion (webhook correlation, `--expect-jobs`
-        // counting, timeout alarms) is explicitly out of scope this round —
-        // see module docs — so a concluded job here never advances the
-        // run's own status.
+        // Conclude the job once every declared shard has uploaded. This
+        // never advances the run's own status — run-level closing only
+        // happens via `handle_close_run` below (the `workflow_run`
+        // webhook signal this round; `--expect-jobs` counting and the
+        // timeout alarm are separate, later signals, see the
+        // `workflow_run` module docs).
         let Some(job_row) = read_job_by_id(sql, &req.job_id)? else {
             return error_response(404, "job not found");
         };
@@ -780,6 +789,7 @@ impl RunCoordinator {
                     &req.job_id,
                     "concluded",
                     conclusion_db_name(job_conclusion),
+                    None,
                 )?;
                 self.project_job_to_d1(&run_row.id, &require_job_by_id(sql, &req.job_id)?)
                     .await?;
@@ -787,6 +797,88 @@ impl RunCoordinator {
         }
 
         Response::from_json(&CompleteShardOutcome {})
+    }
+
+    /// Closes the run: for each job, marks every shard that never
+    /// uploaded `missing` and concludes the job (failing it if it has any
+    /// missing shard), then rolls the jobs' conclusions up into the run's
+    /// own and moves the run to a terminal `RunState`
+    /// (docs/design/byo-ci.md's "Completion semantics": "the run's
+    /// conclusion is the worst job conclusion"). The only caller is
+    /// `lib.rs::handle_workflow_run_event`, once it has correlated an
+    /// incoming `workflow_run` `completed` webhook to this run (see the
+    /// `workflow_run` module docs for the correlation strategy).
+    ///
+    /// Idempotent: a run already in a terminal state is a no-op ack,
+    /// covering GitHub's at-least-once webhook redelivery without
+    /// re-running (and potentially re-emitting side effects from) the
+    /// close logic a second time.
+    async fn handle_close_run(&self, sql: &SqlStorage) -> worker::Result<Response> {
+        let Some(run_row) = read_run(sql)? else {
+            return error_response(404, "run not found");
+        };
+        if run_state_of(&run_row)?.is_terminal() {
+            let status = run_status_of(&run_row)?;
+            return Response::from_json(&CloseRunOutcome {
+                run_id: run_row.id,
+                status,
+            });
+        }
+
+        let now_ms = worker::Date::now().as_millis() as i64;
+        let jobs = read_all_jobs(sql)?;
+        let mut job_conclusions = Vec::with_capacity(jobs.len());
+        for job in &jobs {
+            let shard_rows = read_all_job_shards(sql, &job.id)?;
+            let shards: Vec<logic::ShardRecord> = shard_rows
+                .iter()
+                .map(|r| {
+                    let conclusion = match &r.conclusion {
+                        Some(c) => Some(conclusion_from_db_str(c).ok_or_else(|| {
+                            worker::Error::RustError(format!("unknown stored conclusion {c}"))
+                        })?),
+                        None => None,
+                    };
+                    Ok(logic::ShardRecord {
+                        shard_index: r.shard_index as u32,
+                        state: shard_state_of(r)?,
+                        conclusion,
+                    })
+                })
+                .collect::<worker::Result<Vec<_>>>()?;
+
+            let decision = logic::close_job(job.shard_total as u32, &shards);
+
+            for idx in &decision.newly_missing {
+                mark_job_shard_missing(sql, &job.id, *idx, now_ms)?;
+                self.project_job_shard_to_d1(&require_job_shard(sql, &job.id, *idx)?)
+                    .await?;
+            }
+
+            update_job_conclusion(
+                sql,
+                &job.id,
+                "concluded",
+                conclusion_db_name(decision.conclusion),
+                decision.summary.as_deref(),
+            )?;
+            self.project_job_to_d1(&run_row.id, &require_job_by_id(sql, &job.id)?)
+                .await?;
+
+            job_conclusions.push(decision.conclusion);
+        }
+
+        let run_conclusion = logic::run_conclusion_from_jobs(&job_conclusions);
+        let next_state = logic::run_state_from_conclusion(run_conclusion);
+        update_run_status(sql, &run_row.id, next_state)?;
+        let run_row = require_run(sql)?;
+        self.project_run_to_d1(&run_row).await?;
+
+        let status = run_status_of(&run_row)?;
+        Response::from_json(&CloseRunOutcome {
+            run_id: run_row.id,
+            status,
+        })
     }
 
     async fn project_run_to_d1(&self, row: &RunRow) -> worker::Result<()> {
@@ -822,14 +914,15 @@ impl RunCoordinator {
     async fn project_job_to_d1(&self, run_id: &str, row: &JobRow) -> worker::Result<()> {
         let db = self.env.d1("DB")?;
         db.prepare(
-            "INSERT INTO jobs (id, run_id, job_name, shard_total, runner_label, check_names, state, conclusion) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+            "INSERT INTO jobs (id, run_id, job_name, shard_total, runner_label, check_names, state, conclusion, conclusion_message) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
              ON CONFLICT (id) DO UPDATE SET \
                shard_total = excluded.shard_total, \
                runner_label = excluded.runner_label, \
                check_names = excluded.check_names, \
                state = excluded.state, \
-               conclusion = excluded.conclusion",
+               conclusion = excluded.conclusion, \
+               conclusion_message = excluded.conclusion_message",
         )
         .bind(&[
             JsValue::from_str(&row.id),
@@ -840,6 +933,9 @@ impl RunCoordinator {
             JsValue::from_str(&row.check_names),
             JsValue::from_str(&row.state),
             row.conclusion
+                .clone()
+                .map_or(JsValue::NULL, |v| JsValue::from_str(&v)),
+            row.conclusion_message
                 .clone()
                 .map_or(JsValue::NULL, |v| JsValue::from_str(&v)),
         ])?
@@ -1000,7 +1096,8 @@ fn ensure_schema(sql: &SqlStorage) -> worker::Result<()> {
             runner_label TEXT NOT NULL, \
             check_names TEXT NOT NULL, \
             state TEXT NOT NULL DEFAULT 'running', \
-            conclusion TEXT \
+            conclusion TEXT, \
+            conclusion_message TEXT \
         )",
         None,
     )?;
@@ -1069,10 +1166,13 @@ fn require_run(sql: &SqlStorage) -> worker::Result<RunRow> {
     read_run(sql)?.ok_or_else(|| worker::Error::RustError("run row missing after write".into()))
 }
 
+const JOB_COLUMNS: &str =
+    "id, job_name, shard_total, runner_label, check_names, state, conclusion, conclusion_message";
+
 fn read_job(sql: &SqlStorage, job_name: &str) -> worker::Result<Option<JobRow>> {
     let rows: Vec<JobRow> = sql
         .exec(
-            "SELECT id, job_name, shard_total, runner_label, check_names, state, conclusion FROM job WHERE job_name = ?1",
+            &format!("SELECT {JOB_COLUMNS} FROM job WHERE job_name = ?1"),
             vec![SqlStorageValue::from(job_name)],
         )?
         .to_array()?;
@@ -1082,7 +1182,7 @@ fn read_job(sql: &SqlStorage, job_name: &str) -> worker::Result<Option<JobRow>> 
 fn read_job_by_id(sql: &SqlStorage, id: &str) -> worker::Result<Option<JobRow>> {
     let rows: Vec<JobRow> = sql
         .exec(
-            "SELECT id, job_name, shard_total, runner_label, check_names, state, conclusion FROM job WHERE id = ?1",
+            &format!("SELECT {JOB_COLUMNS} FROM job WHERE id = ?1"),
             vec![SqlStorageValue::from(id)],
         )?
         .to_array()?;
@@ -1096,23 +1196,29 @@ fn require_job_by_id(sql: &SqlStorage, id: &str) -> worker::Result<JobRow> {
 
 fn read_all_jobs(sql: &SqlStorage) -> worker::Result<Vec<JobRow>> {
     sql.exec(
-        "SELECT id, job_name, shard_total, runner_label, check_names, state, conclusion FROM job ORDER BY job_name",
+        &format!("SELECT {JOB_COLUMNS} FROM job ORDER BY job_name"),
         None,
     )?
     .to_array()
 }
 
+/// `message` is the run-close summary ("N of total shards missing") for
+/// a job that concluded with missing shards (docs/design/byo-ci.md's
+/// Completion semantics); `None` clears it for a job that concluded
+/// normally from its own shard uploads.
 fn update_job_conclusion(
     sql: &SqlStorage,
     job_id: &str,
     state: &str,
     conclusion: &str,
+    message: Option<&str>,
 ) -> worker::Result<()> {
     sql.exec(
-        "UPDATE job SET state = ?1, conclusion = ?2 WHERE id = ?3",
+        "UPDATE job SET state = ?1, conclusion = ?2, conclusion_message = ?3 WHERE id = ?4",
         vec![
             SqlStorageValue::from(state),
             SqlStorageValue::from(conclusion),
+            SqlStorageValue::from(message.map(str::to_string)),
             SqlStorageValue::from(job_id),
         ],
     )?;
@@ -1261,6 +1367,15 @@ fn read_job_shard(
     Ok(rows.into_iter().next())
 }
 
+fn read_all_job_shards(sql: &SqlStorage, job_id: &str) -> worker::Result<Vec<JobShardRow>> {
+    sql.exec(
+        "SELECT job_id, shard_index, state, conclusion, external_url, completed_at \
+         FROM job_shard WHERE job_id = ?1",
+        vec![SqlStorageValue::from(job_id)],
+    )?
+    .to_array()
+}
+
 fn require_job_shard(
     sql: &SqlStorage,
     job_id: &str,
@@ -1295,6 +1410,34 @@ fn upsert_job_shard(
             SqlStorageValue::from(conclusion),
             SqlStorageValue::from(external_url),
             SqlStorageValue::try_from_i64(completed_at_ms)?,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Marks one never-uploaded shard `missing` at run-close time
+/// (docs/design/byo-ci.md's Completion semantics). Unlike
+/// `upsert_job_shard`, there is no real conclusion to record — the shard
+/// never completed — so `conclusion` stays/becomes `NULL` rather than
+/// being forced to a placeholder value. Idempotent: re-closing a run
+/// whose shard is already `missing` from an earlier close attempt only
+/// refreshes `completed_at`.
+fn mark_job_shard_missing(
+    sql: &SqlStorage,
+    job_id: &str,
+    shard_index: u32,
+    now_ms: i64,
+) -> worker::Result<()> {
+    sql.exec(
+        "INSERT INTO job_shard (job_id, shard_index, state, conclusion, external_url, completed_at) \
+         VALUES (?1, ?2, 'missing', NULL, '', ?3) \
+         ON CONFLICT (job_id, shard_index) DO UPDATE SET \
+           state = 'missing', \
+           completed_at = excluded.completed_at",
+        vec![
+            SqlStorageValue::from(job_id),
+            SqlStorageValue::try_from_i64(i64::from(shard_index))?,
+            SqlStorageValue::try_from_i64(now_ms)?,
         ],
     )?;
     Ok(())
@@ -1759,6 +1902,10 @@ impl RunCoordinatorStore {
         req: &CompleteShardRequest,
     ) -> Result<CompleteShardOutcome, CoordinatorError> {
         self.call(Method::Post, "/complete-shard", Some(req)).await
+    }
+
+    pub async fn close_run(&self) -> Result<CloseRunOutcome, CoordinatorError> {
+        self.call::<(), _>(Method::Post, "/close-run", None).await
     }
 
     async fn call<B, R>(

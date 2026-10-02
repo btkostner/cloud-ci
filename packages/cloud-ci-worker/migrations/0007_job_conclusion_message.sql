@@ -1,0 +1,14 @@
+-- Extends RunCoordinator's D1 projection (ADR 0004) for the run-close path
+-- docs/design/byo-ci.md's "Completion semantics" describes: when a run
+-- closes (this round: the `workflow_run` `completed` webhook signal only —
+-- `--expect-jobs` counting and the timeout alarm are separate, later work)
+-- while a job still has shards that never uploaded, those shards are
+-- marked `missing` and the job concludes `failure` with the summary "N of
+-- total shards missing". Forward-only, per AGENTS.md: this adds a column,
+-- never alters or drops anything 0001/0002 created.
+--
+-- Named distinctly from `reports.summary` (a JSON per-report test-count
+-- digest, a different shape entirely): this is a short human-readable
+-- annotation, NULL for a job that concluded normally from its own shard
+-- uploads.
+ALTER TABLE jobs ADD COLUMN conclusion_message TEXT;
