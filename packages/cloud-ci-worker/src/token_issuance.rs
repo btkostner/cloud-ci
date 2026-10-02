@@ -38,6 +38,42 @@
 //! repo this deployment knows about, see [`authorize`]'s doc comment),
 //! calls [`crate::roles::resolve_role`] for each, and only on an
 //! all-admin result calls [`generate_token`] + [`insert_token_row`].
+//!
+//! # CSRF
+//!
+//! `POST /v1/tokens` is authenticated purely by the `__Host-cc_session`
+//! cookie ([`crate::session::check_session`]) — there is no separate CSRF
+//! token here, unlike `oauth.rs`'s double-submit-cookie `state` (see that
+//! module's "CSRF state" section). This is a deliberate choice, not a
+//! gap: `session::build_set_cookie_header` sets the cookie with
+//! `SameSite=Lax`, and per the `Set-Cookie` `SameSite` spec (MDN,
+//! developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Set-Cookie
+//! #samesitesamesite-value, accessed 2026-10-02), a `Lax` cookie is only
+//! attached to a cross-site request when *both* of two conditions hold:
+//! the request is a top-level navigation (this excludes `fetch`,
+//! `XMLHttpRequest`, `<img>`/`<script>` subresource loads, and `<iframe>`
+//! navigations) *and* it uses a "safe" HTTP method, which explicitly
+//! excludes `POST`, `PUT`, and `DELETE`. A cross-origin page therefore
+//! cannot make the browser attach this cookie to a `POST /v1/tokens`
+//! request — not via an auto-submitting `<form method=post>`, not via
+//! `fetch`, not via `XMLHttpRequest` — only a cross-site
+//! top-level-navigation *GET* would carry the cookie, and this handler
+//! (`lib.rs::handle_issue_token`) is routed on `POST` only, with no `GET`
+//! alias or redirect target that could be reached by top-level
+//! navigation. Chrome's old "Lax+POST" / "Lax-allow-unsafe" grace period
+//! (a cookie younger than ~2 minutes still riding along on a cross-site
+//! `POST`) does not change this: per
+//! chromium.org/updates/same-site/faq (accessed 2026-10-02: "It does not
+//! add any new behavior, but instead is just not applying the new
+//! `SameSite=Lax` *default* in certain scenarios"), that grace period
+//! only covers cookies that omit `SameSite` and fall back to Chrome's
+//! implicit default — `build_set_cookie_header` always sets
+//! `SameSite=Lax` explicitly, so it never qualifies. `oauth.rs` needs its
+//! own CSRF mechanism because `GET /login`/`GET /oauth/callback` *are*
+//! reachable by top-level navigation (an attacker can link or redirect a
+//! victim straight to `/oauth/callback?state=...`); this endpoint is
+//! not, so `SameSite=Lax` alone is the mitigation — no double-submit
+//! token adds anything a cross-site attacker could otherwise forge here.
 
 use crate::roles::Role;
 use base64::Engine as _;

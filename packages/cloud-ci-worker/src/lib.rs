@@ -861,6 +861,9 @@ fn oauth_callback_url(req: &Request) -> std::result::Result<String, String> {
 ///
 /// - **Authentication**: a valid `__Host-cc_session` cookie
 ///   ([`session::check_session`]) — missing/invalid/expired is `401`.
+///   No separate CSRF token is checked; see `token_issuance.rs`'s "# CSRF"
+///   module-doc section for why the cookie's `SameSite=Lax` attribute
+///   alone is sufficient for this `POST`-only, non-navigable endpoint.
 /// - **Authorization**: `admin` role ([`roles::resolve_role`]) on every
 ///   repo id the request needs it for:
 ///   - A finite `repo_allowlist`: admin on every id in that list.
