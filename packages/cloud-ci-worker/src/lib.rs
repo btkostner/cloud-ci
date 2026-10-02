@@ -2,6 +2,7 @@ pub mod connect;
 pub mod coordinator;
 pub mod github_app;
 pub mod ingest_token;
+pub mod installations;
 pub mod oidc;
 pub mod ulid;
 pub mod webhook;
@@ -23,6 +24,13 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // transports").
     if req.method() == Method::Put {
         return handle_upload_part(req, &env).await;
+    }
+    // GitHub webhook delivery, not a Connect RPC — dispatched on path,
+    // not content negotiation (docs/design/auth.md's "Webhook signature
+    // verification" ordering requirement: raw body read and signature
+    // verified before anything else touches the request).
+    if req.method() == Method::Post && req.path() == "/webhooks/github" {
+        return handle_github_webhook(req, &env).await;
     }
     if req.method() != Method::Post {
         return Response::error("method not allowed", 405);
@@ -469,6 +477,151 @@ async fn handle_upload_part(mut req: Request, env: &Env) -> Result<Response> {
     let headers = Headers::new();
     headers.set("etag", &info.sha256)?;
     Ok(Response::empty()?.with_headers(headers))
+}
+
+/// `POST /webhooks/github` (docs/design/auth.md § "Webhook signature
+/// verification"). Reads the raw body first, verifies
+/// `X-Hub-Signature-256` via [`webhook::verify_signature`], and rejects
+/// with 401 *before* parsing anything or touching D1 on any failure —
+/// the doc's explicit ordering requirement. Only `installation` and
+/// `installation_repositories` are handled this round (see
+/// `src/installations.rs`); any other `X-GitHub-Event` gets a 200
+/// "not handled" ack so GitHub does not retry-storm an event type this
+/// deployment doesn't act on yet
+/// (docs.github.com/en/webhooks/using-webhooks/handling-webhook-deliveries,
+/// accessed 2026-10-02: a non-2xx response causes GitHub to retry
+/// delivery).
+async fn handle_github_webhook(mut req: Request, env: &Env) -> Result<Response> {
+    let raw_body = req.bytes().await?;
+
+    let secret = match env.secret("GITHUB_WEBHOOK_SECRET") {
+        Ok(secret) => secret.to_string(),
+        Err(_) => return Response::error("GITHUB_WEBHOOK_SECRET is not configured", 500),
+    };
+    let Some(signature_header) = req.headers().get("x-hub-signature-256")? else {
+        return Response::error("missing X-Hub-Signature-256", 401);
+    };
+    if webhook::verify_signature(secret.as_bytes(), &signature_header, &raw_body).is_err() {
+        return Response::error("invalid webhook signature", 401);
+    }
+
+    match req.headers().get("x-github-event")?.as_deref() {
+        Some("installation") => handle_installation_event(&raw_body, env).await,
+        Some("installation_repositories") => {
+            handle_installation_repositories_event(&raw_body, env).await
+        }
+        _ => Response::ok("event not handled"),
+    }
+}
+
+/// `installation.created`/`deleted`/`suspend`/`unsuspend`
+/// (docs/design/auth.md § "Multiple orgs and installations").
+async fn handle_installation_event(raw_body: &[u8], env: &Env) -> Result<Response> {
+    let event: installations::InstallationEvent = match serde_json::from_slice(raw_body) {
+        Ok(event) => event,
+        Err(_) => return Response::error("malformed installation payload", 400),
+    };
+    let installation_id = event.installation.id;
+    let now_s = (Date::now().as_millis() / 1000) as i64;
+
+    match event.action.as_str() {
+        "created" => {
+            let allowed_orgs = env
+                .var("GITHUB_ALLOWED_ORGS")
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            if installations::is_allowed_org(&event.installation.account.login, &allowed_orgs) {
+                installations::upsert_installation(
+                    env,
+                    installation_id,
+                    &event.installation.account.login,
+                    &event.installation.account.account_type,
+                    now_s,
+                )
+                .await?;
+            } else {
+                // No row is ever created for a disallowed account
+                // (auth.md: "never creates rows for it"). The uninstall
+                // call is best-effort: against a synthetic or
+                // already-removed installation it 404s, which does not
+                // block the webhook ack — GitHub only needs the 200,
+                // not a successful uninstall, to stop retrying this
+                // delivery.
+                if let Err(e) = uninstall_disallowed_installation(env, installation_id).await {
+                    worker::console_log!(
+                        "uninstall of disallowed installation {installation_id} failed: {e}"
+                    );
+                }
+            }
+        }
+        "deleted" => {
+            installations::delete_installation_row(env, installation_id).await?;
+        }
+        "suspend" => {
+            installations::set_suspended(env, installation_id, Some(now_s)).await?;
+        }
+        "unsuspend" => {
+            installations::set_suspended(env, installation_id, None).await?;
+        }
+        // Other documented `installation` actions (e.g.
+        // `new_permissions_accepted`) carry nothing this round acts on.
+        _ => {}
+    }
+    Response::ok("ok")
+}
+
+/// Mints a fresh App-level JWT ([`github_app::mint_app_jwt`]) and calls
+/// `DELETE /app/installations/{installation_id}`
+/// ([`github_app::delete_installation`]) — per auth.md, App-authenticated,
+/// never an installation token, since the installation being removed
+/// cannot be trusted to mint its own token for the call.
+async fn uninstall_disallowed_installation(
+    env: &Env,
+    installation_id: u64,
+) -> std::result::Result<(), String> {
+    let private_key_pem = env
+        .secret("GITHUB_APP_PRIVATE_KEY")
+        .map_err(|e| format!("GITHUB_APP_PRIVATE_KEY is not configured: {e}"))?
+        .to_string();
+    let app_id: u64 = env
+        .var("GITHUB_APP_ID")
+        .map_err(|e| format!("GITHUB_APP_ID is not configured: {e}"))?
+        .to_string()
+        .parse()
+        .map_err(|e| format!("GITHUB_APP_ID is not numeric: {e}"))?;
+    let now_s = (Date::now().as_millis() / 1000) as i64;
+    let app_jwt = github_app::mint_app_jwt(&private_key_pem, app_id, now_s)
+        .await
+        .map_err(|e| e.to_string())?;
+    github_app::delete_installation(&app_jwt, installation_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// `installation_repositories.added`/`removed`
+/// (docs/design/auth.md § "Multiple orgs and installations").
+async fn handle_installation_repositories_event(raw_body: &[u8], env: &Env) -> Result<Response> {
+    let event: installations::InstallationRepositoriesEvent = match serde_json::from_slice(raw_body)
+    {
+        Ok(event) => event,
+        Err(_) => return Response::error("malformed installation_repositories payload", 400),
+    };
+    let installation_id = event.installation.id;
+
+    match event.action.as_str() {
+        "added" => {
+            for repo in &event.repositories_added {
+                installations::upsert_repo(env, repo.id, installation_id, &repo.name).await?;
+            }
+        }
+        "removed" => {
+            for repo in &event.repositories_removed {
+                installations::delete_repo(env, repo.id).await?;
+            }
+        }
+        _ => {}
+    }
+    Response::ok("ok")
 }
 
 fn coordinator_error(err: CoordinatorError) -> ConnectError {

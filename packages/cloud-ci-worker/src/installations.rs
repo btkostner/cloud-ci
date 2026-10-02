@@ -1,0 +1,319 @@
+//! `installation`/`installation_repositories` GitHub webhook handling
+//! (docs/design/auth.md § "Multiple orgs and installations", "Data
+//! model"): discovers new App installations, gates them against
+//! `GITHUB_ALLOWED_ORGS`, and keeps the `installations`/`repos` D1 tables
+//! (`migrations/0003_installations_and_repos.sql`) current.
+//!
+//! Same layering as `github_app.rs`/`coordinator/mod.rs`: payload parsing
+//! and the allowlist decision are pure, unit-tested with plain
+//! `cargo test`; the D1 read/write functions below need the Workers
+//! runtime and are only exercised by the live smoke test
+//! (`mise run //packages/cloud-ci-worker:dev`), same as
+//! `coordinator::mod`'s `project_*_to_d1` functions.
+//!
+//! `lib.rs`'s `/webhooks/github` route is the only caller: it verifies
+//! `webhook::verify_signature` first, then parses the raw body into
+//! [`InstallationEvent`]/[`InstallationRepositoriesEvent`] and dispatches
+//! here based on `action`.
+
+use serde::Deserialize;
+use worker::Env;
+use worker::wasm_bindgen::JsValue;
+
+/// `installation.account` per
+/// docs.github.com/en/webhooks/webhook-events-and-payloads#installation
+/// (accessed 2026-10-02). GitHub's payload has many more fields
+/// (`id`, `node_id`, `avatar_url`, ...); only `login`/`type` are needed
+/// here, and `serde` ignores the rest.
+#[derive(Debug, Clone, Deserialize)]
+pub struct InstallationAccount {
+    pub login: String,
+    #[serde(rename = "type")]
+    pub account_type: String,
+}
+
+/// `installation` per the same doc: only the fields this module's
+/// allowlist/upsert logic needs.
+#[derive(Debug, Clone, Deserialize)]
+pub struct InstallationPayload {
+    pub id: u64,
+    pub account: InstallationAccount,
+}
+
+/// Top-level `installation` event body. `action` is one of
+/// `created`/`deleted`/`suspend`/`unsuspend`, plus several this module
+/// does not act on (`new_permissions_accepted`, etc.) — those are simply
+/// no-ops here, not errors, since the manifest subscribes to the whole
+/// `installation` event family and GitHub may add actions over time.
+#[derive(Debug, Clone, Deserialize)]
+pub struct InstallationEvent {
+    pub action: String,
+    pub installation: InstallationPayload,
+}
+
+/// One entry of `repositories`/`repositories_added`/`repositories_removed`
+/// per docs.github.com/en/webhooks/webhook-events-and-payloads#installation_repositories
+/// (accessed 2026-10-02) — `id`/`name` only; `full_name`/`private` etc.
+/// are ignored.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RepoRef {
+    pub id: u64,
+    pub name: String,
+}
+
+/// Top-level `installation_repositories` event body. `action` is
+/// `added` or `removed`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct InstallationRepositoriesEvent {
+    pub action: String,
+    pub installation: InstallationPayload,
+    #[serde(default)]
+    pub repositories_added: Vec<RepoRef>,
+    #[serde(default)]
+    pub repositories_removed: Vec<RepoRef>,
+}
+
+/// Checks `login` against the comma-separated `GITHUB_ALLOWED_ORGS` var.
+///
+/// Case-insensitive: GitHub account logins are case-insensitive (you
+/// cannot register `Acme-Corp` and `acme-corp` as two different accounts),
+/// so comparing case-sensitively would let an operator's allowlist entry
+/// silently fail to match a differently-cased delivery for the same
+/// account — a correctness footgun with no corresponding security benefit,
+/// since case can never be the only thing distinguishing two real GitHub
+/// accounts.
+pub fn is_allowed_org(login: &str, allowed_orgs: &str) -> bool {
+    allowed_orgs
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .any(|org| org.eq_ignore_ascii_case(login))
+}
+
+// ---------------------------------------------------------------------------
+// D1 reads/writes — needs the Workers runtime, not covered by `cargo test`
+// (see module docs).
+// ---------------------------------------------------------------------------
+
+/// `installation.created` for an allowlisted account: upserts the
+/// `installations` row. Re-delivery of the same `created` event (at-least-
+/// once webhook delivery) is idempotent via `ON CONFLICT`.
+pub async fn upsert_installation(
+    env: &Env,
+    installation_id: u64,
+    account_login: &str,
+    account_type: &str,
+    installed_at_s: i64,
+) -> worker::Result<()> {
+    let db = env.d1("DB")?;
+    db.prepare(
+        "INSERT INTO installations (installation_id, account_login, account_type, suspended_at, installed_at) \
+         VALUES (?1, ?2, ?3, NULL, ?4) \
+         ON CONFLICT (installation_id) DO UPDATE SET \
+             account_login = excluded.account_login, \
+             account_type = excluded.account_type",
+    )
+    .bind(&[
+        JsValue::from_f64(installation_id as f64),
+        JsValue::from_str(account_login),
+        JsValue::from_str(account_type),
+        JsValue::from_f64(installed_at_s as f64),
+    ])?
+    .run()
+    .await?;
+    Ok(())
+}
+
+/// `installation.deleted`: removes the installation and every repo it
+/// owned. D1 (SQLite) does not enforce `FOREIGN KEY` constraints by
+/// default, so this explicitly deletes `repos` first rather than relying
+/// on cascading behavior that isn't actually enabled.
+pub async fn delete_installation_row(env: &Env, installation_id: u64) -> worker::Result<()> {
+    let db = env.d1("DB")?;
+    db.prepare("DELETE FROM repos WHERE installation_id = ?1")
+        .bind(&[JsValue::from_f64(installation_id as f64)])?
+        .run()
+        .await?;
+    db.prepare("DELETE FROM installations WHERE installation_id = ?1")
+        .bind(&[JsValue::from_f64(installation_id as f64)])?
+        .run()
+        .await?;
+    Ok(())
+}
+
+/// `installation.suspend`/`unsuspend`: sets or clears `suspended_at`.
+/// `suspended_at_s = None` clears it (unsuspend).
+pub async fn set_suspended(
+    env: &Env,
+    installation_id: u64,
+    suspended_at_s: Option<i64>,
+) -> worker::Result<()> {
+    let db = env.d1("DB")?;
+    db.prepare("UPDATE installations SET suspended_at = ?1 WHERE installation_id = ?2")
+        .bind(&[
+            suspended_at_s.map_or(JsValue::NULL, |s| JsValue::from_f64(s as f64)),
+            JsValue::from_f64(installation_id as f64),
+        ])?
+        .run()
+        .await?;
+    Ok(())
+}
+
+/// `installation_repositories.added`: upserts one `repos` row. Idempotent
+/// for redelivery.
+pub async fn upsert_repo(
+    env: &Env,
+    repo_id: u64,
+    installation_id: u64,
+    name: &str,
+) -> worker::Result<()> {
+    let db = env.d1("DB")?;
+    db.prepare(
+        "INSERT INTO repos (repo_id, installation_id, name) VALUES (?1, ?2, ?3) \
+         ON CONFLICT (repo_id) DO UPDATE SET \
+             installation_id = excluded.installation_id, \
+             name = excluded.name",
+    )
+    .bind(&[
+        JsValue::from_f64(repo_id as f64),
+        JsValue::from_f64(installation_id as f64),
+        JsValue::from_str(name),
+    ])?
+    .run()
+    .await?;
+    Ok(())
+}
+
+/// `installation_repositories.removed`: removes one `repos` row.
+pub async fn delete_repo(env: &Env, repo_id: u64) -> worker::Result<()> {
+    let db = env.d1("DB")?;
+    db.prepare("DELETE FROM repos WHERE repo_id = ?1")
+        .bind(&[JsValue::from_f64(repo_id as f64)])?
+        .run()
+        .await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allows_exact_match() {
+        assert!(is_allowed_org("acme-corp", "acme-corp,acme-labs"));
+        assert!(is_allowed_org("acme-labs", "acme-corp,acme-labs"));
+    }
+
+    #[test]
+    fn rejects_login_not_in_list() {
+        assert!(!is_allowed_org("evil-corp", "acme-corp,acme-labs"));
+    }
+
+    #[test]
+    fn rejects_everything_when_allowlist_is_empty() {
+        assert!(!is_allowed_org("acme-corp", ""));
+    }
+
+    #[test]
+    fn match_is_case_insensitive() {
+        assert!(is_allowed_org("Acme-Corp", "acme-corp"));
+        assert!(is_allowed_org("acme-corp", "ACME-CORP"));
+    }
+
+    #[test]
+    fn ignores_surrounding_whitespace_in_allowlist_entries() {
+        assert!(is_allowed_org("acme-corp", " acme-corp , acme-labs "));
+    }
+
+    #[test]
+    fn empty_entries_from_trailing_commas_never_match_an_empty_login() {
+        assert!(!is_allowed_org("", "acme-corp,"));
+    }
+
+    #[test]
+    fn installation_event_parses_documented_created_shape() -> Result<(), serde_json::Error> {
+        // Trimmed from docs.github.com/en/webhooks/webhook-events-and-payloads
+        // #installation (accessed 2026-10-02) — real payloads carry many
+        // more fields (permissions, events, repository_selection, sender,
+        // ...) which must be ignored, not rejected.
+        let body = r#"{
+            "action": "created",
+            "installation": {
+                "id": 12345,
+                "account": { "login": "acme-corp", "id": 1, "type": "Organization" },
+                "repository_selection": "all",
+                "permissions": { "contents": "read" },
+                "events": ["push"]
+            },
+            "sender": { "login": "octocat", "id": 2 }
+        }"#;
+        let event: InstallationEvent = serde_json::from_str(body)?;
+        assert_eq!(event.action, "created");
+        assert_eq!(event.installation.id, 12345);
+        assert_eq!(event.installation.account.login, "acme-corp");
+        assert_eq!(event.installation.account.account_type, "Organization");
+        Ok(())
+    }
+
+    #[test]
+    fn installation_event_parses_suspend_shape() -> Result<(), serde_json::Error> {
+        let body = r#"{
+            "action": "suspend",
+            "installation": {
+                "id": 999,
+                "account": { "login": "acme-corp", "id": 1, "type": "Organization" }
+            }
+        }"#;
+        let event: InstallationEvent = serde_json::from_str(body)?;
+        assert_eq!(event.action, "suspend");
+        Ok(())
+    }
+
+    #[test]
+    fn installation_repositories_event_parses_documented_added_shape()
+    -> Result<(), serde_json::Error> {
+        // Trimmed from docs.github.com/en/webhooks/webhook-events-and-payloads
+        // #installation_repositories (accessed 2026-10-02).
+        let body = r#"{
+            "action": "added",
+            "installation": {
+                "id": 12345,
+                "account": { "login": "acme-corp", "id": 1, "type": "Organization" }
+            },
+            "repository_selection": "selected",
+            "repositories_added": [
+                { "id": 1, "name": "widgets", "full_name": "acme-corp/widgets", "private": false }
+            ],
+            "repositories_removed": []
+        }"#;
+        let event: InstallationRepositoriesEvent = serde_json::from_str(body)?;
+        assert_eq!(event.action, "added");
+        assert_eq!(event.installation.id, 12345);
+        assert_eq!(event.repositories_added.len(), 1);
+        assert_eq!(event.repositories_added[0].id, 1);
+        assert_eq!(event.repositories_added[0].name, "widgets");
+        assert!(event.repositories_removed.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn installation_repositories_event_parses_removed_shape() -> Result<(), serde_json::Error> {
+        let body = r#"{
+            "action": "removed",
+            "installation": {
+                "id": 12345,
+                "account": { "login": "acme-corp", "id": 1, "type": "Organization" }
+            },
+            "repositories_added": [],
+            "repositories_removed": [
+                { "id": 2, "name": "gadgets", "full_name": "acme-corp/gadgets", "private": true }
+            ]
+        }"#;
+        let event: InstallationRepositoriesEvent = serde_json::from_str(body)?;
+        assert_eq!(event.action, "removed");
+        assert_eq!(event.repositories_removed.len(), 1);
+        assert_eq!(event.repositories_removed[0].id, 2);
+        assert!(event.repositories_added.is_empty());
+        Ok(())
+    }
+}
