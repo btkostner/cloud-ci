@@ -53,7 +53,7 @@
 //! the request is a top-level navigation (this excludes `fetch`,
 //! `XMLHttpRequest`, `<img>`/`<script>` subresource loads, and `<iframe>`
 //! navigations) *and* it uses a "safe" HTTP method, which explicitly
-//! excludes `POST`, `PUT`, and `DELETE`. A cross-origin page therefore
+//! excludes `POST`, `PUT`, and `DELETE`. A cross-site page therefore
 //! cannot make the browser attach this cookie to a `POST /v1/tokens`
 //! request — not via an auto-submitting `<form method=post>`, not via
 //! `fetch`, not via `XMLHttpRequest` — only a cross-site
