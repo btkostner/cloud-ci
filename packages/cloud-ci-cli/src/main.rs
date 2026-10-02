@@ -4,6 +4,7 @@ mod connect_client;
 mod identity;
 mod lint;
 mod scope;
+mod setup;
 mod split;
 mod upload;
 
@@ -11,7 +12,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
-use cli::{Cli, Command};
+use cli::{Cli, Command, SetupCommand};
 use identity::RealEnv;
 
 fn main() -> ExitCode {
@@ -43,6 +44,13 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 eprintln!("cloud-ci agent: {err}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::Setup(SetupCommand::AllowedOrgs(args)) => match setup::run_allowed_orgs(&args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("cloud-ci setup allowed-orgs: {err}");
                 ExitCode::FAILURE
             }
         },

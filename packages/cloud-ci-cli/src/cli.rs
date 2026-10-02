@@ -58,6 +58,14 @@ pub struct Cli {
     pub command: Command,
 }
 
+/// `cloud-ci setup allowed-orgs --add <login> | --remove <login> [--file
+/// <path>] [--deploy]`, per `docs/design/auth.md`'s "Org allowlist
+/// changes" paragraph. This is the only `setup` subcommand this round:
+/// `setup github-app` (architecture.md's package table lists it alongside
+/// `setup allowed-orgs`) needs a real browser + GitHub App manifest flow
+/// that does not exist yet, so it is intentionally omitted rather than
+/// stubbed — a `Setup` variant with only one working leaf is simpler than
+/// a `Setup` variant with a leaf that errors out on use.
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Upload reports/sites for one job/shard of an external (BYO) CI run.
@@ -70,6 +78,81 @@ pub enum Command {
     /// collected samples as JSON. See `AgentArgs`' own `--help` text for
     /// this round's scope limitation.
     Agent(AgentArgs),
+    /// Deployment-operator configuration changes. See `SetupCommand`'s doc
+    /// comment.
+    #[command(subcommand)]
+    Setup(SetupCommand),
+}
+
+/// `cloud-ci setup <subcommand>`. Only `allowed-orgs` exists this round —
+/// see `AllowedOrgsArgs`' doc comment for why `setup github-app` is not
+/// here yet.
+#[derive(Debug, Subcommand)]
+pub enum SetupCommand {
+    /// Add or remove a login from the deployed `GITHUB_ALLOWED_ORGS`
+    /// allowlist in `wrangler.toml`.
+    AllowedOrgs(AllowedOrgsArgs),
+}
+
+/// `cloud-ci setup allowed-orgs (--add <login> | --remove <login>)
+/// [--file <path>] [--deploy]`, per `docs/design/auth.md`'s "Org allowlist
+/// changes" paragraph: "`cloud-ci setup allowed-orgs --add <login>` (or
+/// `--remove`) is the real write path: it edits `GITHUB_ALLOWED_ORGS` in
+/// `wrangler.toml` with the operator's own Cloudflare credentials and runs
+/// `wrangler deploy`".
+///
+/// # One login per invocation
+///
+/// The doc's own CLI sketch shows a single `--add <login>` (or
+/// `--remove <login>`); nothing in auth.md suggests either flag repeats.
+/// `--add` and `--remove` are mutually exclusive (clap's `conflicts_with`)
+/// and exactly one is required per invocation — the simpler, defensible
+/// reading, and it keeps the printed before/after diff (see `run`'s doc
+/// comment) unambiguous: one login added or removed, one line of diff.
+///
+/// # `--deploy` is opt-in, diverging from the doc's literal wording
+///
+/// auth.md's prose describes this command as running `wrangler deploy`
+/// unconditionally. This CLI instead edits the file, prints the old/new
+/// `GITHUB_ALLOWED_ORGS` diff, and only invokes `wrangler deploy` itself
+/// when `--deploy` is passed — otherwise it prints the file change and
+/// tells the operator to run `wrangler deploy` themselves. A command that
+/// silently pushes a real, mutating deploy to a real Cloudflare account by
+/// default is too easy to trigger by accident (e.g. retrying after a typo
+/// in `--add`); an explicit opt-in flag matches how this codebase treats
+/// other deploy-time-only operations it cannot safely exercise outside a
+/// real Cloudflare account (see `run`'s module doc for the corresponding
+/// test boundary).
+#[derive(Debug, Parser)]
+#[command(group(clap::ArgGroup::new("allowed_orgs_op").required(true).args(["add", "remove"])))]
+pub struct AllowedOrgsArgs {
+    /// Add this login to `GITHUB_ALLOWED_ORGS`. Mutually exclusive with
+    /// `--remove`.
+    #[arg(long, conflicts_with = "remove")]
+    pub add: Option<String>,
+
+    /// Remove this login from `GITHUB_ALLOWED_ORGS`. Mutually exclusive
+    /// with `--add`.
+    #[arg(long)]
+    pub remove: Option<String>,
+
+    /// Path to the `wrangler.toml` to edit. Defaults to the deployed
+    /// worker's own config file, `packages/cloud-ci-worker/wrangler.toml`
+    /// — the file `GITHUB_ALLOWED_ORGS` actually lives in — rather than a
+    /// bare `wrangler.toml` in the current directory, since this command
+    /// is meant to be run from the repo root (or anywhere), not only from
+    /// inside `packages/cloud-ci-worker`.
+    #[arg(long, default_value = "packages/cloud-ci-worker/wrangler.toml")]
+    pub file: std::path::PathBuf,
+
+    /// Run `wrangler deploy --config <file>` (without changing the
+    /// process's own working directory — `wrangler.toml`'s `[build]`
+    /// comment documents that its `cwd` is repo-root-relative and expects
+    /// every invoker to already be running from the repo root, same as
+    /// `--file`'s own default below) after a successful file edit. Off
+    /// by default; see `AllowedOrgsArgs`' doc comment for why.
+    #[arg(long)]
+    pub deploy: bool,
 }
 
 /// `cloud-ci lint [--file <path>]`: validates `settings.yml` against
