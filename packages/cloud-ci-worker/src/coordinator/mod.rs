@@ -500,6 +500,7 @@ impl RunCoordinator {
         self.project_job_to_d1(&run_row.id, &job_row).await?;
         self.create_check_runs_for_job(sql, &run_row, &req.check_names)
             .await?;
+        self.maybe_close_for_expect_jobs(sql, &run_row).await?;
 
         Response::from_json(&StartJobOutcome { job_id })
     }
@@ -864,8 +865,49 @@ impl RunCoordinator {
         let check_names = decode_string_list(&job_row.check_names)?;
         self.update_check_runs_for_job(sql, &run_row, &check_names)
             .await?;
+        self.maybe_close_for_expect_jobs(sql, &run_row).await?;
 
         Response::from_json(&CompleteShardOutcome {})
+    }
+
+    /// After `StartJob`/`CompleteShard` change a job's started/concluded
+    /// state, checks whether the run's declared `expect_jobs` (named job
+    /// list from `BeginRun`, see `logic::expect_jobs_satisfied`) are now
+    /// all satisfied, and if so triggers the same close-run operation
+    /// the `workflow_run.completed` webhook triggers
+    /// ([`Self::handle_close_run`]) — a second, independent caller of
+    /// that one close implementation, not a parallel computation of it.
+    /// A run with no `expect_jobs` set is unaffected (never closes via
+    /// this path, per `logic::expect_jobs_satisfied`'s docs).
+    ///
+    /// Idempotent for the same reason every other caller of
+    /// `handle_close_run` is: that function's own terminal-state guard
+    /// makes a redelivered/retried `StartJob`/`CompleteShard` call that
+    /// re-observes "satisfied" a no-op, not a second close attempt.
+    async fn maybe_close_for_expect_jobs(
+        &self,
+        sql: &SqlStorage,
+        run_row: &RunRow,
+    ) -> worker::Result<()> {
+        if run_state_of(run_row)?.is_terminal() {
+            return Ok(());
+        }
+        let expect_jobs = run_row
+            .expect_jobs
+            .as_deref()
+            .map(decode_string_list)
+            .transpose()?;
+        if expect_jobs.as_deref().is_none_or(<[String]>::is_empty) {
+            return Ok(());
+        }
+        let started: Vec<(String, bool)> = read_all_jobs(sql)?
+            .into_iter()
+            .map(|j| (j.job_name, j.state == "concluded"))
+            .collect();
+        if logic::expect_jobs_satisfied(expect_jobs.as_deref(), &started) {
+            self.handle_close_run(sql).await?;
+        }
+        Ok(())
     }
 
     /// Closes the run: for each job, marks every shard that never
@@ -873,10 +915,14 @@ impl RunCoordinator {
     /// missing shard), then rolls the jobs' conclusions up into the run's
     /// own and moves the run to a terminal `RunState`
     /// (docs/design/byo-ci.md's "Completion semantics": "the run's
-    /// conclusion is the worst job conclusion"). The only caller is
-    /// `lib.rs::handle_workflow_run_event`, once it has correlated an
-    /// incoming `workflow_run` `completed` webhook to this run (see the
-    /// `workflow_run` module docs for the correlation strategy).
+    /// conclusion is the worst job conclusion"). Two callers trigger this
+    /// round: `lib.rs::handle_workflow_run_event`, once it has correlated
+    /// an incoming `workflow_run` `completed` webhook to this run (see
+    /// the `workflow_run` module docs for the correlation strategy), and
+    /// [`Self::maybe_close_for_expect_jobs`], once every job named in a
+    /// run's declared `expect_jobs` has started and concluded. The
+    /// timeout alarm (byo-ci.md's third close trigger) is not built
+    /// either way — it needs a Durable Object alarm, separate work.
     ///
     /// Idempotent: a run already in a terminal state is a no-op ack,
     /// covering GitHub's at-least-once webhook redelivery without

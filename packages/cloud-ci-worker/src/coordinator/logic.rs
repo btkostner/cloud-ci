@@ -132,6 +132,58 @@ pub fn run_state_after_start_job(current: RunState) -> RunState {
 }
 
 // ---------------------------------------------------------------------------
+// `--expect-jobs` job-count closing (docs/design/byo-ci.md's Completion
+// semantics: "`--expect-jobs N`: N jobs complete" — a second, independent
+// trigger for the same run-close operation `workflow_run.rs`'s completed
+// webhook also triggers; see `coordinator` module docs for the shared
+// `handle_close_run` both callers reuse). The timeout alarm, byo-ci.md's
+// third close trigger, still needs a Durable Object alarm and is not
+// built by either this function or its caller this round.
+// ---------------------------------------------------------------------------
+
+/// Whether a run's declared `expect_jobs` are all satisfied, so its
+/// caller should trigger the same close-run operation the
+/// `workflow_run.completed` webhook triggers.
+///
+/// `expect_jobs` in this codebase is already a *named* job list, not a
+/// bare count (see [`resolve_expect_jobs`] — `BeginRun`'s `repeated
+/// string expect_jobs` field, "the first non-empty `expect_jobs` wins").
+/// The doc's CLI-facing "`--expect-jobs N`: N jobs complete" wording is
+/// read through that existing shape: "N jobs complete" becomes "every
+/// job named in `expect_jobs` has started (`StartJob`) and reached a
+/// concluded state" — set-completeness over the declared names, not a
+/// raw count comparison.
+///
+/// A run with no `expect_jobs` stored (`None`, or an empty list — same
+/// as [`resolve_expect_jobs`]'s "no opinion" meaning) never closes via
+/// this path, only via the webhook or (later) the timeout alarm.
+///
+/// If a caller starts *more* jobs than it declared in `expect_jobs`,
+/// that is not an error this round: `expect_jobs` is treated as a floor
+/// (the complete set to wait for), not a hard cap on what may run — once
+/// every declared name is started and concluded, the run closes
+/// regardless of any extra, undeclared job still running. This matches
+/// the doc's literal wording ("once N jobs are complete, the run
+/// closes") by substituting named-job completeness for count
+/// completeness, since the field already stores names, not a number.
+pub fn expect_jobs_satisfied(
+    expect_jobs: Option<&[String]>,
+    started_jobs: &[(String, bool)],
+) -> bool {
+    let Some(expected) = expect_jobs else {
+        return false;
+    };
+    if expected.is_empty() {
+        return false;
+    }
+    expected.iter().all(|name| {
+        started_jobs
+            .iter()
+            .any(|(started_name, concluded)| started_name == name && *concluded)
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Uploads (`CreateUpload`/`CompleteUpload`), docs/design/byo-ci.md "Idempotency"
 // ---------------------------------------------------------------------------
 
@@ -310,10 +362,11 @@ pub fn job_conclusion_from_shards(shard_conclusions: &[Conclusion]) -> Option<Co
 }
 
 // ---------------------------------------------------------------------------
-// Run close (`workflow_run` webhook this round; `--expect-jobs` counting
-// and the timeout alarm are separate, later signals — see the
-// `workflow_run` module docs for why only the webhook is built this
-// round), docs/design/byo-ci.md "Completion semantics"
+// Run close (`workflow_run` webhook and `--expect-jobs` counting both
+// trigger this round, via `coordinator::mod`'s `handle_close_run` and
+// `maybe_close_for_expect_jobs` — see those module docs; the timeout
+// alarm is still separate, later work), docs/design/byo-ci.md
+// "Completion semantics"
 // ---------------------------------------------------------------------------
 
 /// One already-known shard row, as input to [`close_job`]. An index in
@@ -976,5 +1029,50 @@ mod tests {
         let summary = render_check_summary(&rows);
         assert!(summary.contains("unit"));
         assert!(summary.contains("e2e"));
+    }
+
+    #[test]
+    fn expect_jobs_satisfied_is_false_when_not_set() {
+        assert!(!expect_jobs_satisfied(None, &[("unit".to_string(), true)]));
+        assert!(!expect_jobs_satisfied(
+            Some(&[]),
+            &[("unit".to_string(), true)]
+        ));
+    }
+
+    #[test]
+    fn expect_jobs_satisfied_is_false_until_every_named_job_has_started() {
+        let expected = vec!["unit".to_string(), "e2e".to_string()];
+        let started = [("unit".to_string(), true)];
+        assert!(!expect_jobs_satisfied(Some(&expected), &started));
+    }
+
+    #[test]
+    fn expect_jobs_satisfied_is_false_while_a_named_job_is_still_running() {
+        let expected = vec!["unit".to_string(), "e2e".to_string()];
+        let started = [("unit".to_string(), true), ("e2e".to_string(), false)];
+        assert!(!expect_jobs_satisfied(Some(&expected), &started));
+    }
+
+    #[test]
+    fn expect_jobs_satisfied_is_true_once_every_named_job_concluded() {
+        let expected = vec!["unit".to_string(), "e2e".to_string()];
+        let started = [("unit".to_string(), true), ("e2e".to_string(), true)];
+        assert!(expect_jobs_satisfied(Some(&expected), &started));
+    }
+
+    #[test]
+    fn expect_jobs_satisfied_treats_expect_jobs_as_a_floor_not_a_cap() {
+        // A caller started a third, undeclared job ("lint") beyond the
+        // two it named in `expect_jobs`. It is still running, but that
+        // does not block the declared set from closing the run (module
+        // docs: "treated as a floor ... not a hard cap").
+        let expected = vec!["unit".to_string(), "e2e".to_string()];
+        let started = [
+            ("unit".to_string(), true),
+            ("e2e".to_string(), true),
+            ("lint".to_string(), false),
+        ];
+        assert!(expect_jobs_satisfied(Some(&expected), &started));
     }
 }

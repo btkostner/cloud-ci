@@ -2,10 +2,12 @@
 //! "Completion semantics": "completion comes from the shard counts the
 //! uploads declare, the external CI's completion webhook, or a
 //! timeout" — this module is the completion-webhook signal. `--expect-jobs`
-//! counting and the timeout alarm are separate, later work: counting is a
-//! simpler per-job-completion counter already partially expressible from
-//! existing `CompleteShard` state, while the timeout needs a Durable
-//! Object alarm, a different mechanism entirely — neither is built here).
+//! counting is the second signal, built in `coordinator::mod`'s
+//! `maybe_close_for_expect_jobs` (both signals reuse this module's and
+//! `coordinator::mod`'s `handle_close_run` as the one close
+//! implementation). The timeout alarm is still separate, later work: it
+//! needs a Durable Object alarm, a different mechanism entirely — that
+//! one is not built here, or anywhere else this round).
 //!
 //! Same layering as `installations.rs`: payload parsing and the
 //! found/not-found/already-terminal decision are pure, unit-tested with
