@@ -201,6 +201,31 @@ pub async fn delete_repo(env: &Env, repo_id: u64) -> worker::Result<()> {
     Ok(())
 }
 
+/// Every `installation_id` currently in the local `installations` table —
+/// `reconcile::run`'s "our current local list" half of the diff
+/// (docs/design/auth.md's "Multiple orgs and installations" "Discovery"
+/// paragraph). Row values come back as `f64` over the D1/JS boundary
+/// (same reasoning as [`lookup_repo_installation`]'s manual
+/// `serde_json::Value` extraction), so this reads each row as a bare
+/// number rather than a typed struct.
+pub async fn list_installation_ids(env: &Env) -> worker::Result<Vec<u64>> {
+    let db = env.d1("DB")?;
+    let rows: Vec<serde_json::Value> = db
+        .prepare("SELECT installation_id FROM installations")
+        .all()
+        .await?
+        .results()?;
+    rows.into_iter()
+        .map(|row| {
+            row.get("installation_id")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| {
+                    worker::Error::RustError("installations row missing installation_id".into())
+                })
+        })
+        .collect()
+}
+
 /// The `repos`/`installations` join row `BeginRun`'s OIDC path needs to
 /// decide whether a claimed `repository_id` belongs to an allowlisted,
 /// non-suspended installation (docs/design/byo-ci.md § Auth).

@@ -125,6 +125,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "buffa",
+ "chrono",
  "cloud-ci-proto",
  "cloud-ci-reports",
  "getrandom",

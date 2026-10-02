@@ -4,6 +4,7 @@ pub mod github_app;
 pub mod ingest_token;
 pub mod installations;
 pub mod oidc;
+pub mod reconcile;
 pub mod ulid;
 pub mod webhook;
 
@@ -61,6 +62,28 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
             Ok(Response::from_bytes(bytes)?.with_headers(headers))
         }
         Err(err) => connect_error(&err),
+    }
+}
+
+/// Cron Trigger entry point (`wrangler.toml`'s `[triggers]` `crons`):
+/// runs one full installation-reconcile pass ([`reconcile::run`]; see
+/// that module's docs and docs/design/auth.md's "Multiple orgs and
+/// installations" "Discovery" paragraph).
+///
+/// `worker`'s `#[event(scheduled)]` macro requires this exact
+/// three-argument `(ScheduledEvent, Env, ScheduleContext)` signature
+/// returning `()` — confirmed against worker-macros-0.8.7's `event.rs`
+/// (`validate_event_fn(&input_fn, Scheduled, 3, true)`, and the crate's
+/// own `tests/ui/scheduled-wrong-return-type.rs`/`scheduled-wrong-argument-types.rs`
+/// compile-fail fixtures for a `-> String` return or a wrong parameter
+/// list). A failed pass is logged, not propagated: a transient GitHub API
+/// or D1 error here must not crash the Worker, and the next scheduled run
+/// (same reasoning as `uninstall_disallowed_installation`'s webhook-path
+/// best-effort retry) tries again.
+#[event(scheduled)]
+async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::ScheduleContext) {
+    if let Err(e) = reconcile::run(&env).await {
+        worker::console_log!("installation reconcile pass failed: {e}");
     }
 }
 

@@ -10,6 +10,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 base64 = "0.22"
 buffa = { version = "0.9.2", features = ["json"] }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 cloud-ci-proto = { path = "../cloud-ci-proto-rust" }
 cloud-ci-reports = { path = "../cloud-ci-reports" }
 getrandom = { version = "0.2", features = ["js"] }

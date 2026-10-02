@@ -14,16 +14,21 @@
 //!    runtime's WebCrypto `SubtleCrypto.sign()`. This one genuinely needs
 //!    the `wasm32` Workers runtime to execute (see "Why WebCrypto" below)
 //!    and is only smoke-tested under `wrangler dev`, not `cargo test`.
-//! 3. [`fetch_installation_token`] — exchanges a signed App JWT for an
-//!    installation access token
+//! 3. [`fetch_installation_token`]/[`delete_installation`]/[`list_installations`]
+//!    — the `/app/*` endpoint callers. [`fetch_installation_token`] exchanges
+//!    a signed App JWT for an installation access token
 //!    (docs.github.com/en/rest/apps/apps#create-an-installation-access-token-for-an-app,
-//!    accessed 2026-10-01). Its URL/header construction
-//!    ([`installation_access_token_url`]/[`installation_access_token_headers`])
-//!    and [`InstallationToken`] response parsing are pure enough to unit
-//!    test; the actual HTTP call is **not** live-verified against
-//!    GitHub, since no real GitHub App installation exists yet (full
-//!    `cloud-ci setup github-app` is a later round's work — this module
-//!    is a capability check, not the setup flow).
+//!    accessed 2026-10-01); [`delete_installation`] uninstalls a disallowed
+//!    installation (docs.github.com/en/rest/apps/apps#delete-an-installation-for-the-authenticated-app,
+//!    accessed 2026-10-02); [`list_installations`] is the reconcile job's
+//!    (`reconcile.rs`) GitHub-side source of truth
+//!    (docs.github.com/en/rest/apps/apps#list-installations-for-the-authenticated-app,
+//!    accessed 2026-10-02). Each endpoint's URL/header construction and
+//!    response-shape parsing are pure enough to unit test; the actual HTTP
+//!    calls are **not** live-verified against GitHub, since no real GitHub
+//!    App installation exists yet (full `cloud-ci setup github-app` is a
+//!    later round's work — this module is a capability check, not the setup
+//!    flow).
 //!
 //! Nothing in `lib.rs` calls [`fetch_installation_token`] yet — webhook
 //! handling and Check-Run posting, its real callers, don't exist yet. It
@@ -480,6 +485,133 @@ pub async fn delete_installation(
     Ok(())
 }
 
+/// GitHub's documented max per page for `GET /app/installations`
+/// (docs.github.com/en/rest/apps/apps#list-installations-for-the-authenticated-app,
+/// accessed 2026-10-02): "The number of results per page (max 100)."
+/// Requesting the max keeps a reconcile pass's page count as small as
+/// possible for deployments with many installations.
+const INSTALLATIONS_PER_PAGE: u32 = 100;
+
+/// `GET /app/installations`'s URL for one page, with `page`/`per_page`
+/// interpolated — pure string construction, unit-testable without the
+/// Workers runtime.
+///
+/// Pagination mechanism: this endpoint's own documented parameters
+/// (docs.github.com/en/rest/apps/apps#list-installations-for-the-authenticated-app,
+/// accessed 2026-10-02) are `page`/`per_page` query parameters (default
+/// page size 30, max 100), not a `Link` response header — GitHub's REST
+/// API documents `Link`-header pagination as a *general* convention
+/// (docs.github.com/en/rest/using-the-rest-api/using-pagination-in-the-rest-api),
+/// but this specific endpoint's own parameter table spells out `page`/
+/// `per_page` directly as its mechanism, so [`list_installations`] walks
+/// pages by incrementing `page` until a short (or empty) page comes back,
+/// with no `Link` header parsing needed.
+fn list_installations_url(page: u32) -> String {
+    format!(
+        "https://api.github.com/app/installations?per_page={INSTALLATIONS_PER_PAGE}&page={page}"
+    )
+}
+
+/// Same three headers as [`uninstall_installation_headers`] — this
+/// endpoint also authenticates with an App-level JWT, not an installation
+/// token ("You must use a JWT to access this endpoint" — same doc).
+fn list_installations_headers(app_jwt: &str) -> [(&'static str, String); 3] {
+    [
+        ("authorization", format!("Bearer {app_jwt}")),
+        ("accept", "application/vnd.github+json".to_string()),
+        ("x-github-api-version", GITHUB_API_VERSION.to_string()),
+    ]
+}
+
+/// `installation.account` per
+/// docs.github.com/en/rest/apps/apps#list-installations-for-the-authenticated-app
+/// (accessed 2026-10-02): only `id`/`login`/`type` are needed here — the
+/// same three fields `installations::InstallationAccount` takes from the
+/// webhook payload's `account` object, but kept as its own type since one
+/// comes from a webhook body and the other from this endpoint's response,
+/// and nothing requires the two wire shapes to stay identical.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ListedInstallationAccount {
+    pub id: u64,
+    pub login: String,
+    #[serde(rename = "type")]
+    pub account_type: String,
+}
+
+/// One entry of `GET /app/installations`'s response array
+/// (docs.github.com/en/rest/apps/apps#list-installations-for-the-authenticated-app,
+/// accessed 2026-10-02), trimmed to the fields `reconcile::run` needs —
+/// the real response carries many more (`permissions`, `events`,
+/// `suspended_by`, ...).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ListedInstallation {
+    pub id: u64,
+    pub account: ListedInstallationAccount,
+    /// RFC 3339 (e.g. `"2026-10-01T12:00:00Z"`) — `reconcile::parse_installed_at`
+    /// converts this to unix seconds for `installations.installed_at`.
+    pub created_at: String,
+}
+
+/// `GET /app/installations`, paginated to completion
+/// (docs.github.com/en/rest/apps/apps#list-installations-for-the-authenticated-app,
+/// accessed 2026-10-02): the reconcile job's (`reconcile::run`)
+/// GitHub-side source of truth (docs/design/auth.md's "Multiple orgs and
+/// installations" "Discovery" paragraph: "a periodic reconcile job calls
+/// `GET /app/installations` (paginated, App JWT auth) and diffs against
+/// the `installations` table"). Uses an App-level JWT ([`mint_app_jwt`]),
+/// same as [`delete_installation`] — this endpoint is explicitly
+/// documented as App-authenticated, and spans every installation, not
+/// one, so there is no single installation token to scope it to.
+///
+/// Not live-verified against GitHub: no real GitHub App installation
+/// exists in this environment to call it against (same limitation as
+/// [`fetch_installation_token`]/[`delete_installation`]).
+pub async fn list_installations(app_jwt: &str) -> Result<Vec<ListedInstallation>, GithubAppError> {
+    let mut all = Vec::new();
+    let mut page = 1u32;
+    loop {
+        let url = list_installations_url(page);
+        let headers = worker::Headers::new();
+        for (name, value) in list_installations_headers(app_jwt) {
+            headers
+                .set(name, &value)
+                .map_err(|e| GithubAppError(format!("cannot set {name} header: {e}")))?;
+        }
+
+        let mut init = worker::RequestInit::new();
+        init.with_method(worker::Method::Get);
+        init.with_headers(headers);
+
+        let request = worker::Request::new_with_init(&url, &init)
+            .map_err(|e| GithubAppError(format!("cannot build list installations request: {e}")))?;
+
+        let mut response = worker::Fetch::Request(request)
+            .send()
+            .await
+            .map_err(|e| GithubAppError(format!("list installations request failed: {e}")))?;
+
+        if response.status_code() != 200 {
+            let body = response.text().await.unwrap_or_default();
+            return Err(GithubAppError(format!(
+                "list installations failed: {} {body}",
+                response.status_code()
+            )));
+        }
+
+        let page_results: Vec<ListedInstallation> = response.json().await.map_err(|e| {
+            GithubAppError(format!("cannot decode list installations response: {e}"))
+        })?;
+        let page_len = page_results.len();
+        all.extend(page_results);
+
+        if page_len < INSTALLATIONS_PER_PAGE as usize {
+            break;
+        }
+        page += 1;
+    }
+    Ok(all)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -662,5 +794,59 @@ mod tests {
             headers[2],
             ("x-github-api-version", GITHUB_API_VERSION.to_string())
         );
+    }
+
+    #[test]
+    fn list_installations_url_carries_page_and_max_per_page() {
+        assert_eq!(
+            list_installations_url(1),
+            "https://api.github.com/app/installations?per_page=100&page=1"
+        );
+        assert_eq!(
+            list_installations_url(3),
+            "https://api.github.com/app/installations?per_page=100&page=3"
+        );
+    }
+
+    #[test]
+    fn list_installations_headers_carry_bearer_jwt_and_api_version() {
+        let headers = list_installations_headers("my.jwt.value");
+        assert_eq!(
+            headers[0],
+            ("authorization", "Bearer my.jwt.value".to_string())
+        );
+        assert_eq!(
+            headers[1],
+            ("accept", "application/vnd.github+json".to_string())
+        );
+        assert_eq!(
+            headers[2],
+            ("x-github-api-version", GITHUB_API_VERSION.to_string())
+        );
+    }
+
+    #[test]
+    fn listed_installation_parses_documented_shape() -> Result<(), serde_json::Error> {
+        // Trimmed from docs.github.com/en/rest/apps/apps
+        // #list-installations-for-the-authenticated-app (extra fields like
+        // `permissions`/`events`/`suspended_by` are present on the real
+        // response and must be ignored, not rejected).
+        let body = r#"{
+            "id": 12345,
+            "account": { "login": "acme-corp", "id": 1, "type": "Organization" },
+            "repository_selection": "all",
+            "permissions": { "contents": "read" },
+            "events": ["push"],
+            "created_at": "2026-10-01T12:00:00Z",
+            "updated_at": "2026-10-01T12:00:00Z",
+            "suspended_at": null,
+            "suspended_by": null
+        }"#;
+        let parsed: ListedInstallation = serde_json::from_str(body)?;
+        assert_eq!(parsed.id, 12345);
+        assert_eq!(parsed.account.login, "acme-corp");
+        assert_eq!(parsed.account.account_type, "Organization");
+        assert_eq!(parsed.created_at, "2026-10-01T12:00:00Z");
+        Ok(())
     }
 }

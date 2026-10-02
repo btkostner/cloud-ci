@@ -51,3 +51,19 @@ class_name = "RunCoordinator"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["RunCoordinator"]
+
+# Installation reconcile job (docs/design/auth.md § "Multiple orgs and
+# installations", "Discovery" paragraph): calls `GET /app/installations`
+# and diffs it against the local `installations` table, catching a missed
+# `installation.created`/`installation.deleted` webhook or an org removed
+# from `GITHUB_ALLOWED_ORGS` after it was installed (see src/reconcile.rs
+# and auth.md's "Failure modes" table). Every 20 minutes: this is a
+# backstop for rare missed webhook deliveries, not the primary discovery
+# path (the `installation`/`installation_repositories` webhooks are), so
+# it does not need to run every few minutes; 20 minutes bounds the window
+# a missed webhook can go unnoticed to a half hour at most while keeping
+# the `GET /app/installations` call volume (and the D1 reads/writes per
+# pass) low for a job whose entire purpose is catching the rare case, not
+# driving normal operation.
+[triggers]
+crons = ["*/20 * * * *"]
