@@ -1,6 +1,6 @@
 //! Argument parsing for the `cloud-ci` binary.
 //!
-//! Two subcommands: `upload`, per `docs/design/byo-ci.md`'s GitHub Actions
+//! Five subcommands: `upload`, per `docs/design/byo-ci.md`'s GitHub Actions
 //! example:
 //!
 //! ```text
@@ -38,6 +38,18 @@
 //!
 //! ```text
 //! cloud-ci agent --cgroup-path /sys/fs/cgroup --duration-secs 60
+//! ```
+//!
+//! and `setup`, deployment-operator configuration changes with two
+//! leaves: `allowed-orgs`, per `docs/design/auth.md`'s "Org allowlist
+//! changes" paragraph, and `github-app`, per that doc's "### GitHub App
+//! setup" sequence diagram — see `SetupCommand`'s doc comment for both:
+//!
+//! ```text
+//! cloud-ci setup allowed-orgs --add acme-labs
+//! cloud-ci setup github-app --name "cloud-ci (acme)" \
+//!   --allowed-orgs acme-corp,acme-labs --deployment-url https://ci.acme.example \
+//!   --cloudflare-account-id <id> --secrets-store-id <id>
 //! ```
 
 use std::fmt;
