@@ -1,0 +1,29 @@
+-- docs/design/ai.md § "### Prompting and output contract": the round
+-- that actually calls `env.AI.run()` (src/ai_model_call.rs,
+-- `ai_model_call_pass` in src/lib.rs) and drives `ai_insight` rows from
+-- `status = 'pending_model_call'` to a real terminal state.
+--
+-- Forward-only (AGENTS.md: "D1 migrations are forward-only and safe on a
+-- live deployment"): `ALTER TABLE ... ADD COLUMN`, never touching
+-- 0001-0016's existing columns. `context_json` (migration 0016) stays
+-- exactly what it was — the assembled, truncated prompt *input* this
+-- round sends to the model, immutable once written. `model_response_json`
+-- is new: the model's *output*, written only once a terminal status is
+-- reached.
+--
+-- - `status = 'ok'`: `model_response_json` holds the validated
+--   `ai_insight.rs::FailureSummary` JSON (after
+--   `validate_schema_lengths`/`validate_output`), the shape the future
+--   PR-comment-rendering round (explicitly out of scope this round) will
+--   read.
+-- - `status = 'invalid_output'`: `model_response_json` holds the last
+--   raw (unparsed-or-unvalidated) response text from the second
+--   (retried) attempt, for operator debugging — ai.md: "the PR comment
+--   shows nothing for that failure", so this column is diagnostic only
+--   for this status, never rendered.
+-- - `status = 'pending_model_call'`: `model_response_json` stays NULL —
+--   no model response exists yet (a fresh row from the prior round, or
+--   a row whose only `env.AI.run()` attempts so far failed at the
+--   network/binding level, not the validation level — see
+--   `ai_model_call_pass`'s own doc comment for that distinction).
+ALTER TABLE ai_insight ADD COLUMN model_response_json TEXT;

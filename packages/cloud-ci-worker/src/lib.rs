@@ -1,4 +1,5 @@
 pub mod ai_insight;
+pub mod ai_model_call;
 pub mod ai_queue;
 pub mod api_tokens;
 pub mod connect;
@@ -117,14 +118,18 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
 }
 
 /// Cron Trigger entry point (`wrangler.toml`'s `[triggers]` `crons`):
-/// `wrangler.toml` declares two schedules bound to this single handler
+/// `wrangler.toml` declares three schedules bound to this single handler
 /// (`*/20 * * * *` for the installation reconcile pass, `*/15 * * * *`
 /// for the analytics rollup cron, docs/design/analytics.md § "Data
-/// flow"'s `Cron: */15 rollup` node) — `event.cron()` is the exact cron
+/// flow"'s `Cron: */15 rollup` node, and `*/5 * * * *` for this round's
+/// AI model-call pass, [`ai_model_call_pass`] — see that function's own
+/// doc comment for why a cron pass, not the `cloud-ci-analysis` Queue
+/// consumer below, drives `ai_insight` rows from `pending_model_call` to
+/// a terminal state) — `event.cron()` is the exact cron
 /// string that fired this invocation (confirmed against worker-0.8.7's
 /// `schedule.rs`: `ScheduledEvent::cron` returns the triggering
 /// schedule's own string, not a Worker-wide constant), so matching on it
-/// is how one `#[event(scheduled)]` handler tells the two triggers apart.
+/// is how one `#[event(scheduled)]` handler tells the three triggers apart.
 ///
 /// `worker`'s `#[event(scheduled)]` macro requires this exact
 /// three-argument `(ScheduledEvent, Env, ScheduleContext)` signature
@@ -148,6 +153,11 @@ async fn scheduled(event: worker::ScheduledEvent, env: Env, _ctx: worker::Schedu
         "*/20 * * * *" => {
             if let Err(e) = reconcile::run(&env).await {
                 worker::console_log!("installation reconcile pass failed: {e}");
+            }
+        }
+        "*/5 * * * *" => {
+            if let Err(e) = ai_model_call_pass(&env).await {
+                worker::console_log!("ai model-call pass failed: {e}");
             }
         }
         other => {
@@ -289,10 +299,12 @@ async fn handle_analysis_requested(env: &Env, message: &ai_queue::AnalysisReques
             JsValue::from_f64(message.repo_id as f64),
             JsValue::from_str(&message.run_id),
             JsValue::from_str(&entry.fingerprint),
-            // No `PROMPT_SUMMARY_V1` template exists yet (this module's
-            // scope boundary) — "unversioned" is an honest placeholder,
-            // not a real prompt version, until that template exists.
-            JsValue::from_str("unversioned"),
+            // `ai_model_call::PROMPT_VERSION` — this round's model call
+            // (`ai_model_call_pass`) reads this row with
+            // `ai_model_call::PROMPT_SUMMARY_V1` already matching this
+            // exact version string, so a future template bump
+            // (`PROMPT_SUMMARY_V2`) never serves a stale cached insight.
+            JsValue::from_str(ai_model_call::PROMPT_VERSION),
             JsValue::from_str(&context_json),
             JsValue::from_f64(now_ms as f64),
         ])?
@@ -309,6 +321,312 @@ async fn handle_analysis_requested(env: &Env, message: &ai_queue::AnalysisReques
     }
 
     Ok(())
+}
+
+/// Rows processed per `*/5 * * * *` pass (module doc comment on
+/// [`ai_model_call_pass`]). Bounds one cron invocation's wall time and
+/// `env.AI.run()` call volume — a backlog larger than this drains over
+/// several 5-minute passes rather than one long-running invocation,
+/// which is safe: the `status = 'pending_model_call'` gate makes every
+/// pass idempotent over rows an earlier pass already finished (see
+/// [`ai_model_call_pass`]'s own "Idempotency" doc section).
+const PENDING_MODEL_CALL_BATCH_LIMIT: f64 = 10.0;
+
+/// `*/5 * * * *` cron pass (doc comment on [`scheduled`]): picks up
+/// every `ai_insight` row left at `status = 'pending_model_call'` by
+/// [`handle_analysis_requested`] and drives it to a real terminal state
+/// — `status = 'ok'` (a validated `ai_insight::FailureSummary` stored in
+/// `model_response_json`, migration 0017) or `status = 'invalid_output'`
+/// (ai.md: "A second failure stores `status = invalid_output`").
+///
+/// # Why a cron pass, not the `cloud-ci-analysis` Queue consumer
+///
+/// [`handle_analysis_requested`] already consumed and acked the one
+/// `AnalysisRequested` Queue message that produced each `pending_model_call`
+/// row — there is no second message to re-trigger model-call work on,
+/// and acking a message only once the (multi-second) model call finishes
+/// would reintroduce exactly the per-message serialization
+/// `max_batch_size = 1` already accepts for the context-assembly step,
+/// now doubled for no benefit. A cron pass that scans `ai_insight`
+/// directly drives a *stored row*, not a *Queue message*, through its
+/// remaining transitions — the same shape `rollup::run`/`reconcile::run`
+/// already use for "scan a D1 table, make outbound calls, write results
+/// back" passes.
+///
+/// # Idempotency
+///
+/// Only rows with `status = 'pending_model_call'` are ever selected or
+/// updated (every `UPDATE` below keeps `AND status = 'pending_model_call'`
+/// in its `WHERE` clause) — a row an earlier pass already moved to
+/// `'ok'` or `'invalid_output'` is never re-selected and never
+/// re-written, so re-running this pass over the same backlog never
+/// re-calls the model for an already-finished row. The one window this
+/// round does not close is two passes overlapping on the *same* row
+/// between its `SELECT` and its `UPDATE` (no claim/lock column — the
+/// same documented gap `rollup::run`/`reconcile::run` already carry for
+/// their own scanned rows); the realistic failure mode under that rare
+/// overlap is a duplicate model call for one row, not an incorrect final
+/// status, since whichever `UPDATE` commits first wins and the other's
+/// `status`-gated `UPDATE` then matches zero rows.
+///
+/// # Model-call failure vs. invalid-output — not the same thing
+///
+/// A genuine `env.AI.run()` `Err` (network/binding failure) is logged
+/// and the row is left untouched at `pending_model_call` for a later
+/// pass to retry — nothing was learned about a response that was never
+/// received, so this is not a terminal state. A real response that
+/// parses but fails schema validation on both the first attempt and the
+/// one retry is different: the model was reached and it answered: ai.md's
+/// `status = invalid_output` is for that case specifically, and only
+/// that case.
+///
+/// # Budget/usage accounting
+///
+/// Every real `env.AI.run()` call this function makes — including a
+/// first attempt that goes on to fail validation and gets retried — has
+/// its `usage.prompt_tokens`/`usage.completion_tokens` converted to
+/// neurons ([`ai_model_call::neurons_for_usage`]) and folded into that
+/// row's repo's `ai_usage_daily` entry for today via an idempotent
+/// `INSERT ... ON CONFLICT ... DO UPDATE` upsert ([`record_usage`]) —
+/// real post-call accounting, not a placeholder. ai.md's "Cost controls"
+/// also describes a pre-call "reserves the estimated neurons before the
+/// call" half; this round implements only the "reconciles them after"
+/// half (the pre-call cap check already lives one round earlier, in
+/// [`handle_analysis_requested`], and this round does not re-check it
+/// before calling the model for a row that round already admitted) —
+/// an honest, still-open gap, not a silent omission. A response whose
+/// `usage` field is absent, or whose model id has no known
+/// neurons-per-token rate ([`ai_model_call::neurons_for_usage`]
+/// returning `None` for anything but [`ai_model_call::DEFAULT_SUMMARY_MODEL`]),
+/// contributes no accounting for that call — logged, never silently
+/// treated as zero-cost.
+async fn ai_model_call_pass(env: &Env) -> Result<()> {
+    let db = env.d1("DB")?;
+    let ai = env.ai("AI")?;
+    let model = env
+        .var("AI_MODEL_SUMMARY")
+        .ok()
+        .map(|v| v.to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| ai_model_call::DEFAULT_SUMMARY_MODEL.to_string());
+
+    #[derive(serde::Deserialize)]
+    struct PendingRow {
+        id: String,
+        repo_id: i64,
+        context_json: String,
+    }
+    let rows: Vec<PendingRow> = db
+        .prepare(
+            "SELECT id, repo_id, context_json FROM ai_insight \
+             WHERE status = 'pending_model_call' ORDER BY created_at ASC LIMIT ?1",
+        )
+        .bind(&[JsValue::from_f64(PENDING_MODEL_CALL_BATCH_LIMIT)])?
+        .all()
+        .await?
+        .results()?;
+
+    for row in rows {
+        let context: ai_model_call::StoredInsightContext =
+            match serde_json::from_str(&row.context_json) {
+                Ok(c) => c,
+                Err(e) => {
+                    worker::console_log!(
+                        "ai: ai_insight {} has unparsable context_json, skipping: {e}",
+                        row.id,
+                    );
+                    continue;
+                }
+            };
+        let owned_segments = ai_model_call::input_segments(&context);
+        let segments: Vec<&str> = owned_segments.iter().map(String::as_str).collect();
+        let base_messages = ai_model_call::build_summary_messages(&context);
+        let request = ai_model_call::build_chat_request(base_messages.clone(), &context);
+
+        let first: std::result::Result<ai_model_call::ChatResponse, worker::Error> =
+            ai.run(model.as_str(), &request).await;
+        let first_response = match first {
+            Ok(r) => r,
+            Err(e) => {
+                worker::console_log!(
+                    "ai: model call failed for ai_insight {} (network/binding error, not a \
+                     validation failure — leaving status=pending_model_call for a later pass): {e}",
+                    row.id,
+                );
+                continue;
+            }
+        };
+        if let Some(usage) = first_response.usage {
+            record_usage(&db, row.repo_id, &model, usage).await;
+        }
+
+        match ai_model_call::parse_and_validate(&first_response.response, &segments) {
+            Ok(summary) => {
+                store_insight_ok(&db, &row.id, &summary).await?;
+            }
+            Err(first_error) => {
+                retry_once(
+                    &db,
+                    &ai,
+                    &model,
+                    &row.id,
+                    row.repo_id,
+                    &base_messages,
+                    &first_response.response,
+                    &first_error,
+                    &context,
+                    &segments,
+                )
+                .await?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// The retried `env.AI.run()` call (ai.md: "retried once with the
+/// validation error appended"), and the write of whichever terminal
+/// status the retry's own outcome implies — called only after
+/// [`ai_model_call_pass`]'s first attempt already failed validation.
+#[allow(clippy::too_many_arguments)]
+async fn retry_once(
+    db: &worker::D1Database,
+    ai: &worker::Ai,
+    model: &str,
+    insight_id: &str,
+    repo_id: i64,
+    base_messages: &[ai_model_call::ChatMessage],
+    first_raw_response: &str,
+    first_error: &ai_model_call::ModelResponseError,
+    context: &ai_model_call::StoredInsightContext,
+    segments: &[&str],
+) -> Result<()> {
+    let description = ai_model_call::describe_model_response_error(first_error);
+    let retry_messages =
+        ai_model_call::build_retry_messages(base_messages, first_raw_response, &description);
+    let retry_request = ai_model_call::build_chat_request(retry_messages, context);
+
+    let second: std::result::Result<ai_model_call::ChatResponse, worker::Error> =
+        ai.run(model, &retry_request).await;
+    let second_response = match second {
+        Ok(r) => r,
+        Err(e) => {
+            worker::console_log!(
+                "ai: retried model call failed for ai_insight {insight_id} (network/binding \
+                 error, not a validation failure — leaving status=pending_model_call for a \
+                 later pass): {e}",
+            );
+            return Ok(());
+        }
+    };
+    if let Some(usage) = second_response.usage {
+        record_usage(db, repo_id, model, usage).await;
+    }
+
+    match ai_model_call::parse_and_validate(&second_response.response, segments) {
+        Ok(summary) => store_insight_ok(db, insight_id, &summary).await,
+        Err(_) => store_insight_invalid(db, insight_id, &second_response.response).await,
+    }
+}
+
+/// Writes a validated [`ai_insight::FailureSummary`] as this insight's
+/// final state (`status = 'ok'`). `WHERE status = 'pending_model_call'`
+/// is the idempotency guard [`ai_model_call_pass`]'s doc comment
+/// describes — a row a concurrent pass already finished is left alone.
+async fn store_insight_ok(
+    db: &worker::D1Database,
+    insight_id: &str,
+    summary: &ai_insight::FailureSummary,
+) -> Result<()> {
+    let summary_json = serde_json::to_string(summary)
+        .map_err(|e| worker::Error::RustError(format!("encoding validated FailureSummary: {e}")))?;
+    db.prepare(
+        "UPDATE ai_insight SET status = 'ok', model_response_json = ?1, updated_at = ?2 \
+         WHERE id = ?3 AND status = 'pending_model_call'",
+    )
+    .bind(&[
+        JsValue::from_str(&summary_json),
+        JsValue::from_f64(Date::now().as_millis() as f64),
+        JsValue::from_str(insight_id),
+    ])?
+    .run()
+    .await?;
+    worker::console_log!("ai: ai_insight {insight_id} status=ok");
+    Ok(())
+}
+
+/// Writes the second attempt's raw (never-validated) response as this
+/// insight's final state (`status = 'invalid_output'`) — ai.md: "A
+/// second failure stores `status = invalid_output`, and the PR comment
+/// shows nothing for that failure." `model_response_json` here is
+/// diagnostic only, not the rendered shape [`store_insight_ok`] writes.
+async fn store_insight_invalid(
+    db: &worker::D1Database,
+    insight_id: &str,
+    raw_response: &str,
+) -> Result<()> {
+    db.prepare(
+        "UPDATE ai_insight SET status = 'invalid_output', model_response_json = ?1, \
+         updated_at = ?2 WHERE id = ?3 AND status = 'pending_model_call'",
+    )
+    .bind(&[
+        JsValue::from_str(raw_response),
+        JsValue::from_f64(Date::now().as_millis() as f64),
+        JsValue::from_str(insight_id),
+    ])?
+    .run()
+    .await?;
+    worker::console_log!("ai: ai_insight {insight_id} status=invalid_output (retry exhausted)");
+    Ok(())
+}
+
+/// Folds one `env.AI.run()` call's real usage into
+/// `ai_usage_daily.neuron_count` for `repo_id`/today — an idempotent
+/// upsert (`INSERT ... ON CONFLICT (repo_id, date) DO UPDATE SET
+/// neuron_count = neuron_count + excluded.neuron_count`), so calling it
+/// once per real model call (this function is never called twice for
+/// the same `env.AI.run()` response — see call sites) accumulates
+/// correctly across a day's many calls. Best-effort: a D1 write failure
+/// here is logged and swallowed, not propagated — this crate's
+/// established posture for a non-critical side path (mirrors
+/// `verify_scoped_api_token_begin_run_credential`'s own best-effort
+/// `last_used_at` update). [`ai_model_call::neurons_for_usage`] returning
+/// `None` (a non-default model with no known rate) skips the write
+/// entirely rather than writing a zero that would understate real cost.
+async fn record_usage(
+    db: &worker::D1Database,
+    repo_id: i64,
+    model: &str,
+    usage: ai_model_call::ChatUsage,
+) {
+    let Some(neurons) = ai_model_call::neurons_for_usage(model, usage) else {
+        worker::console_log!(
+            "ai: model {model} has no known neurons-per-token rate; usage \
+             ({}/{} prompt/completion tokens) for repo {repo_id} is unaccounted",
+            usage.prompt_tokens,
+            usage.completion_tokens,
+        );
+        return;
+    };
+    let today = ai_queue::utc_date_string(Date::now().as_millis() as i64);
+    let result = db
+        .prepare(
+            "INSERT INTO ai_usage_daily (repo_id, date, neuron_count) VALUES (?1, ?2, ?3) \
+             ON CONFLICT (repo_id, date) DO UPDATE SET neuron_count = neuron_count + excluded.neuron_count",
+        )
+        .bind(&[
+            JsValue::from_f64(repo_id as f64),
+            JsValue::from_str(&today),
+            JsValue::from_f64(neurons as f64),
+        ]);
+    let result = match result {
+        Ok(stmt) => stmt.run().await,
+        Err(e) => Err(e),
+    };
+    if let Err(e) = result {
+        worker::console_log!("ai: failed to record usage for repo {repo_id}: {e}");
+    }
 }
 
 /// Hand-routes each `cloud_ci.ingest.v1.IngestService` procedure to its

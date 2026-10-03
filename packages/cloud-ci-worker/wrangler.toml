@@ -19,6 +19,12 @@ GITHUB_ALLOWED_ORGS = ""
 # Placeholder until `cloud-ci setup` (a later round) writes this
 # deployment's real exchange URL here.
 CLOUD_CI_INGEST_AUDIENCE = ""
+# Deploy-time default model override (src/ai_model_call.rs's
+# `DEFAULT_SUMMARY_MODEL`, ai.md's "### Model selection": "Deploy-time
+# defaults are set in wrangler `vars`"). Empty string means "use the
+# compiled-in default" (`@cf/openai/gpt-oss-120b`) — not secret, same
+# placeholder category as GITHUB_APP_ID above.
+AI_MODEL_SUMMARY = ""
 # Cloudflare account id the Analytics Engine SQL API's URL path needs
 # (src/rollup.rs's `query_analytics_engine`, docs/design/analytics.md §
 # "Querying for rollups uses the SQL API") — not secret, same
@@ -68,6 +74,15 @@ bucket_name = "cloud-ci-assets"
 [[analytics_engine_datasets]]
 binding = "METRICS"
 dataset = "cloud_ci_metrics"
+
+# Workers AI binding (docs/design/ai.md § "Summary": "through the `AI`
+# binding in `cloud-ci-worker`"). `[ai]`/`binding = "AI"` is the current
+# Wrangler TOML syntax for a Workers AI binding
+# (developers.cloudflare.com/workers-ai/get-started/workers-wrangler/,
+# checked 2026-10-02). Binding name matches `env.ai("AI")` in
+# `src/lib.rs`'s `ai_model_call_pass`.
+[ai]
+binding = "AI"
 
 
 # `cloud-ci-analysis` Queue (docs/design/ai.md § "### Pipeline": "When a
@@ -227,7 +242,17 @@ new_sqlite_classes = ["NodeContainer"]
 # yet and upserts one. 15 minutes matches analytics.md's own stated
 # cadence for this cron (distinct from the 20-minute installation
 # reconcile cron above) — `src/lib.rs`'s single `#[event(scheduled)]`
-# handler tells the two schedules apart by comparing `event.cron()`
+# handler tells the three schedules apart by comparing `event.cron()`
 # against each literal string below.
+# AI model-call pass (docs/design/ai.md § "### Pipeline",
+# src/lib.rs's `ai_model_call_pass`): every 5 minutes, drives every
+# `ai_insight` row left at `status = 'pending_model_call'` by the
+# `cloud-ci-analysis` Queue consumer to a real terminal state via
+# `env.AI.run()`. 5 minutes, not 15/20: each pass makes real model
+# calls with real latency and a small per-pass row limit
+# (`PENDING_MODEL_CALL_BATCH_LIMIT`), so a shorter interval drains a
+# backlog faster without risking overlapping passes doing much work
+# (see that function's own "Idempotency" doc section for the
+# overlap-safety argument).
 [triggers]
-crons = ["*/15 * * * *", "*/20 * * * *"]
+crons = ["*/15 * * * *", "*/20 * * * *", "*/5 * * * *"]
