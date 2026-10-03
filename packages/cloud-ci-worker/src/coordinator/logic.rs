@@ -988,6 +988,34 @@ pub fn split_for_invocation_budget<T>(events: &[T], budget: usize) -> (&[T], &[T
     events.split_at(split)
 }
 
+/// Partitions a drained `test_event_overflow` batch's own `seq`s by
+/// whether their paired write attempt succeeded, so the deferred-flush
+/// caller (`coordinator::mod`'s `flush_test_event_overflow`) deletes
+/// exactly the rows it actually wrote and leaves the rest queued for
+/// the next alarm-triggered retry. `seqs` and `succeeded` must be the
+/// same length and share index-for-index correspondence with the
+/// batch `flush_test_event_overflow` read and attempted to write — a
+/// precondition the caller upholds by building both from the same
+/// `Vec` in the same order, not something this pure function can
+/// check. A mixed-outcome batch need not leave a contiguous surviving
+/// prefix (an older row can fail while a newer one in the same batch
+/// succeeds), which is exactly why the caller must delete by exact
+/// `seq` set rather than the simpler `seq <= max` range-delete a
+/// strictly-successful batch would allow.
+pub fn partition_seqs_by_write_result(seqs: &[i64], succeeded: &[bool]) -> (Vec<i64>, Vec<i64>) {
+    seqs.iter().zip(succeeded.iter()).fold(
+        (Vec::new(), Vec::new()),
+        |(mut ok, mut failed), (seq, ok_flag)| {
+            if *ok_flag {
+                ok.push(*seq);
+            } else {
+                failed.push(*seq);
+            }
+            (ok, failed)
+        },
+    )
+}
+
 /// `duration_ewma_ms = alpha * new + (1 - alpha) * old` (analytics.md).
 /// `existing` is `None` for a test's first-ever occurrence for a
 /// `(repo_id, test_id)` — analytics.md's upsert pattern's `INSERT` branch
@@ -1422,6 +1450,44 @@ mod tests {
         let (immediate, overflow) = split_for_invocation_budget(&events, 250);
         assert_eq!(immediate, events.as_slice());
         assert!(overflow.is_empty());
+    }
+
+    #[test]
+    fn partition_seqs_by_write_result_splits_mixed_outcomes_non_contiguously() {
+        // The exact scenario `delete_test_event_overflow_through`'s old
+        // `seq <= max_seq` range-delete got wrong: a failure in the
+        // middle of a batch must not be swept away just because a later
+        // `seq` in the same batch succeeded.
+        let seqs = vec![10, 11, 12, 13];
+        let succeeded = vec![true, false, true, false];
+        let (ok, failed) = partition_seqs_by_write_result(&seqs, &succeeded);
+        assert_eq!(ok, vec![10, 12]);
+        assert_eq!(failed, vec![11, 13]);
+    }
+
+    #[test]
+    fn partition_seqs_by_write_result_all_succeeded_keeps_order() {
+        let seqs = vec![1, 2, 3];
+        let succeeded = vec![true, true, true];
+        let (ok, failed) = partition_seqs_by_write_result(&seqs, &succeeded);
+        assert_eq!(ok, vec![1, 2, 3]);
+        assert!(failed.is_empty());
+    }
+
+    #[test]
+    fn partition_seqs_by_write_result_all_failed_deletes_nothing() {
+        let seqs = vec![1, 2, 3];
+        let succeeded = vec![false, false, false];
+        let (ok, failed) = partition_seqs_by_write_result(&seqs, &succeeded);
+        assert!(ok.is_empty());
+        assert_eq!(failed, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn partition_seqs_by_write_result_on_empty_batch_is_empty() {
+        let (ok, failed) = partition_seqs_by_write_result(&[], &[]);
+        assert!(ok.is_empty());
+        assert!(failed.is_empty());
     }
 
     #[test]

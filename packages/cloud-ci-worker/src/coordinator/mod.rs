@@ -1121,10 +1121,18 @@ impl RunCoordinator {
     /// is scheduled to drain it in one or more later invocations
     /// ([`Self::flush_test_event_overflow`]), each with its own fresh
     /// 250-write budget. A missing `METRICS` binding or an individual
-    /// `write_data_point` failure is still only logged, same best-effort
-    /// posture as before — `SubmitReport`'s own success must never depend
-    /// on analytics telemetry succeeding — but every event now gets a
-    /// real write attempt, immediately or on a later flush, never zero.
+    /// `write_data_point` failure during this *immediate* write is still
+    /// only logged, same best-effort posture as before —
+    /// `SubmitReport`'s own success must never depend on analytics
+    /// telemetry succeeding, and nothing from the immediate slice is
+    /// persisted to retry. The *deferred* (overflow) slice gets a
+    /// stronger guarantee once it reaches [`Self::flush_test_event_overflow`]:
+    /// a row whose write fails there stays queued in
+    /// `test_event_overflow` and is retried on the next alarm fire
+    /// instead of being deleted alongside its successful batch-mates
+    /// (see that method's doc comment) — so every event gets a real
+    /// write attempt, and every overflowed event keeps getting new
+    /// attempts until one succeeds, never silently dropped.
     async fn write_test_events(
         &self,
         sql: &SqlStorage,
@@ -1155,60 +1163,110 @@ impl RunCoordinator {
     /// The actual `write_data_point` loop, shared by
     /// [`Self::write_test_events`]'s immediate-write path and
     /// [`Self::flush_test_event_overflow`]'s deferred-write path. Never
-    /// errors: a missing binding or an individual write failure is logged
-    /// and otherwise ignored (see `write_test_events`'s doc comment).
-    fn write_test_event_batch(&self, events: &[logic::TestEventPoint]) {
+    /// errors itself: a missing binding or an individual write failure is
+    /// logged, not propagated as a `worker::Result` error (see
+    /// `write_test_events`'s doc comment) — but unlike an earlier version
+    /// of this method, the per-row outcome is no longer thrown away.
+    /// Returns one `bool` per input `events`, same order, `true` iff that
+    /// row's `write_data_point` call actually succeeded (a missing
+    /// `METRICS` binding counts every row `false`, logged once instead of
+    /// per-row). [`Self::flush_test_event_overflow`] uses this to delete
+    /// only the rows it actually wrote and leave the rest queued for a
+    /// later retry — the immediate-write path (`write_test_events`,
+    /// called directly from `SubmitReport`, nothing persisted to retry)
+    /// ignores the return value, matching its existing best-effort
+    /// posture.
+    fn write_test_event_batch(&self, events: &[logic::TestEventPoint]) -> Vec<bool> {
         if events.is_empty() {
-            return;
+            return Vec::new();
         }
         let dataset = match self.env.analytics_engine("METRICS") {
             Ok(dataset) => dataset,
             Err(e) => {
                 worker::console_log!("analytics: METRICS binding unavailable: {e}");
-                return;
+                return vec![false; events.len()];
             }
         };
-        for event in events {
-            let repo_id_str = event.repo_id.to_string();
-            let result = AnalyticsEngineDataPointBuilder::new()
-                .indexes([repo_id_str.as_str()])
-                .blobs([
-                    "test",
-                    event.run_id.as_str(),
-                    event.job_id.as_str(),
-                    event.test_id.as_str(),
-                ])
-                .doubles([event.duration_ms as f64, event.outcome.as_test_double()])
-                .write_to(&dataset);
-            if let Err(e) = result {
-                worker::console_log!(
-                    "analytics: write_data_point failed for test {}: {e}",
-                    event.test_id
-                );
-            }
-        }
+        events
+            .iter()
+            .map(|event| {
+                let repo_id_str = event.repo_id.to_string();
+                let result = AnalyticsEngineDataPointBuilder::new()
+                    .indexes([repo_id_str.as_str()])
+                    .blobs([
+                        "test",
+                        event.run_id.as_str(),
+                        event.job_id.as_str(),
+                        event.test_id.as_str(),
+                    ])
+                    .doubles([event.duration_ms as f64, event.outcome.as_test_double()])
+                    .write_to(&dataset);
+                match result {
+                    Ok(()) => true,
+                    Err(e) => {
+                        worker::console_log!(
+                            "analytics: write_data_point failed for test {}: {e}",
+                            event.test_id
+                        );
+                        false
+                    }
+                }
+            })
+            .collect()
     }
 
     /// Drains up to one invocation's `writeDataPoint` budget from
     /// `test_event_overflow` — a real write attempt for every drained
-    /// row, then deletes exactly the rows attempted. Returns how many
-    /// rows are still queued afterward, so [`alarm`][DurableObject::alarm]
-    /// knows whether to keep re-scheduling itself before it considers the
-    /// run's own timeout deadline.
+    /// row, then deletes only the rows that attempt actually succeeded
+    /// for. A row whose `write_data_point` call failed (transient
+    /// Analytics Engine outage, rate limit, network error — see
+    /// `write_test_event_batch`'s doc comment) stays in
+    /// `test_event_overflow` and is re-attempted by the next
+    /// alarm-triggered flush, rather than being swept away unconditionally
+    /// the way an earlier version of this method deleted the whole
+    /// drained range regardless of per-row outcome. Bounded-retry /
+    /// dead-letter handling for a row that fails *every* attempt is
+    /// deliberately not implemented here: `write_data_point` failures are
+    /// expected to be transient infrastructure issues (Analytics Engine
+    /// outage, rate limit, network blip), not permanent per-row defects —
+    /// `insert_test_event_overflow` only ever persists rows this same
+    /// code already built successfully from a parsed report, so there is
+    /// no "malformed forever" row shape to guard against today. If that
+    /// assumption stops holding (a write failure correlated with specific
+    /// row content rather than transient infra), add a retry-count column
+    /// and a dead-letter table then; doing it speculatively now would be
+    /// unexercised complexity.
+    ///
+    /// Returns how many rows are still queued afterward, so
+    /// [`alarm`][DurableObject::alarm] knows whether to keep
+    /// re-scheduling itself before it considers the run's own timeout
+    /// deadline.
     async fn flush_test_event_overflow(&self, sql: &SqlStorage) -> worker::Result<i64> {
         const MAX_DATA_POINTS_PER_INVOCATION: i64 = 250;
         let batch = read_test_event_overflow_batch(sql, MAX_DATA_POINTS_PER_INVOCATION)?;
         if batch.is_empty() {
             return Ok(0);
         }
-        let max_seq = batch.iter().map(|(seq, _)| *seq).max().unwrap_or(0);
+        let seqs: Vec<i64> = batch.iter().map(|(seq, _)| *seq).collect();
         let events: Vec<logic::TestEventPoint> = batch.into_iter().map(|(_, e)| e).collect();
         worker::console_log!(
             "analytics: flushing {} overflowed test outcome(s) from test_event_overflow",
             events.len()
         );
-        self.write_test_event_batch(&events);
-        delete_test_event_overflow_through(sql, max_seq)?;
+        let succeeded = self.write_test_event_batch(&events);
+        let (succeeded_seqs, failed_seqs) =
+            logic::partition_seqs_by_write_result(&seqs, &succeeded);
+        if !failed_seqs.is_empty() {
+            worker::console_log!(
+                "analytics: {} of {} overflowed test outcome(s) failed to write this flush; \
+                 leaving them in test_event_overflow for the next alarm-triggered retry",
+                failed_seqs.len(),
+                events.len()
+            );
+        }
+        if !succeeded_seqs.is_empty() {
+            delete_test_event_overflow_rows(sql, &succeeded_seqs)?;
+        }
         count_test_event_overflow(sql)
     }
 
@@ -4006,16 +4064,33 @@ fn read_test_event_overflow_batch(
         .collect()
 }
 
-/// Deletes every overflow row up to and including `max_seq` — called
-/// only after [`RunCoordinator::write_test_event_batch`] has already
-/// attempted a real write for each one, matching this module's existing
-/// best-effort analytics posture (an individual `write_data_point`
-/// failure is logged, not retried — see `write_test_events`'s doc
-/// comment) applied to the deferred path too.
-fn delete_test_event_overflow_through(sql: &SqlStorage, max_seq: i64) -> worker::Result<()> {
+/// Deletes exactly the overflow rows named by `seqs` — called only
+/// after [`RunCoordinator::write_test_event_batch`] has already
+/// attempted a real write for each row in the drained batch `seqs` was
+/// derived from, and filtered (by
+/// [`logic::partition_seqs_by_write_result`]) down to the ones that
+/// attempt actually succeeded for. Deliberately not a `seq <= max_seq`
+/// range-delete: a mixed-outcome batch (one row's write fails while a
+/// later-`seq` row in the same batch succeeds) would otherwise delete
+/// a failed row just because a newer row happened to succeed, which is
+/// exactly the unconditional-delete bug this function replaces.
+/// No-op (and no query issued) when `seqs` is empty — callers should
+/// still prefer checking that themselves to avoid the allocation below.
+fn delete_test_event_overflow_rows(sql: &SqlStorage, seqs: &[i64]) -> worker::Result<()> {
+    if seqs.is_empty() {
+        return Ok(());
+    }
+    let placeholders = (1..=seqs.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let params = seqs
+        .iter()
+        .map(|seq| SqlStorageValue::try_from_i64(*seq))
+        .collect::<worker::Result<Vec<_>>>()?;
     sql.exec(
-        "DELETE FROM test_event_overflow WHERE seq <= ?1",
-        vec![SqlStorageValue::try_from_i64(max_seq)?],
+        &format!("DELETE FROM test_event_overflow WHERE seq IN ({placeholders})"),
+        params,
     )?;
     Ok(())
 }
