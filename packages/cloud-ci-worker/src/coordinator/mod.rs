@@ -2631,10 +2631,15 @@ impl RunCoordinator {
 
     /// One shard's terminal ingest call — module docs' "Shard groups /
     /// merge barrier" section, parallelization.md bullets 2-4. Produces
-    /// [`ShardBarrierDecision`] only: see this module's doc comment and
-    /// [`logic::evaluate_barrier`]'s doc comment for the exact
-    /// decision-only scope boundary this round stops at (no real
-    /// cancellation, no real merge dispatch).
+    /// [`ShardBarrierDecision`], and — on `Satisfied { merge: true, .. }`
+    /// only — dispatches it for real via
+    /// [`RunCoordinator::enqueue_shard_merge`] (see this module's doc
+    /// comment's "Merge execution is real for `junit`/`lcov`, nothing
+    /// else" bullet). `FailFastTriggered`'s cancellation half is still
+    /// decision-only this round: see [`logic::evaluate_barrier`]'s doc
+    /// comment for why there is no real `stop_node_container`/
+    /// `handle_cancel_run` call yet (shards are not modeled as `node`
+    /// rows this round).
     async fn handle_shard_terminal(
         &self,
         sql: &SqlStorage,
