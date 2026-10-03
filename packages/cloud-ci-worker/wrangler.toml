@@ -49,6 +49,20 @@ migrations_dir = "migrations"
 binding = "ASSETS"
 bucket_name = "cloud-ci-assets"
 
+# Analytics Engine dataset holding the `step`/`sample`/`test`/`cache`
+# event kinds docs/design/analytics.md's "Analytics Engine schema"
+# section specifies (one dataset, event kind in `blob1`, `repo_id` as
+# `index1`). `[[analytics_engine_datasets]]`/`binding`/`dataset` is the
+# exact current Wrangler configuration syntax (verified 2026-10-02,
+# developers.cloudflare.com/analytics/analytics-engine/get-started/ §
+# "Name your dataset and add it to your Worker"; no dataset needs to be
+# created up front — Analytics Engine creates it on first write). Binding
+# name matches `env.analytics_engine("METRICS")` in
+# src/coordinator/mod.rs's `write_test_events`.
+[[analytics_engine_datasets]]
+binding = "METRICS"
+dataset = "cloud_ci_metrics"
+
 # One SQLite-backed Durable Object per run (ADR 0004, docs/design/byo-ci.md).
 # Addressed by `(repo_id, sha, run_key, attempt)`, never by the run's own
 # ULID, so a redelivered or reordered BeginRun always lands on the same
