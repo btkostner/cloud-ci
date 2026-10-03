@@ -19,6 +19,7 @@ pub mod pr_comment;
 pub mod pull_request_state;
 pub mod pull_request_webhook;
 pub mod reconcile;
+pub mod repo_settings;
 pub mod repo_state;
 pub mod roles;
 pub mod rollup;
@@ -241,10 +242,59 @@ async fn queue(
     Ok(())
 }
 
-/// One `AnalysisRequested` message's processing — budget check, context
-/// assembly from the run's own canonical parsed reports, and a
-/// `pending_model_call` `ai_insight` row per selected fingerprint. See
-/// [`queue`]'s doc comment for the retry/ack posture.
+/// A `runs.settings_sha` with no stored frozen sha for a given `run_id` —
+/// a legacy row created before admission froze one (coordinator/mod.rs's
+/// "Settings SHA" module doc section), or a DO defect that should never
+/// happen. There is no retroactive way to freeze a sha for an
+/// already-created run, so [`handle_analysis_requested`] fails closed on
+/// this: propagated as a genuine processing error so the Queue retries,
+/// never silently falling back to re-resolving a repo's live
+/// default-branch HEAD itself.
+#[derive(Debug, PartialEq, Eq)]
+struct NoSettingsSnapshot {
+    run_id: String,
+}
+
+impl std::fmt::Display for NoSettingsSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "run {} has no stored settings_sha snapshot", self.run_id)
+    }
+}
+
+impl std::error::Error for NoSettingsSnapshot {}
+
+/// Pure "does this stored `settings_sha` admit this consumer call" decision — separated
+/// from the D1 fetch above it so it is unit-testable with plain `cargo test`, same layering
+/// as [`api_tokens::check_token`]. `None` (no row, or a row with a `NULL` `settings_sha` —
+/// a legacy run created before admission froze one) fails closed with
+/// [`NoSettingsSnapshot`]; `Some(sha)` passes the stored value through unchanged, never
+/// substituted, truncated, or re-resolved.
+fn require_settings_sha(
+    settings_sha: Option<String>,
+    run_id: &str,
+) -> Result<String, NoSettingsSnapshot> {
+    settings_sha.ok_or_else(|| NoSettingsSnapshot {
+        run_id: run_id.to_string(),
+    })
+}
+
+/// One `AnalysisRequested` message's processing — settings gate, budget
+/// check, context assembly from the run's own canonical parsed reports,
+/// and a `pending_model_call` `ai_insight` row per selected fingerprint.
+/// See [`queue`]'s doc comment for the retry/ack posture.
+///
+/// Settings come from the `settings_sha` `coordinator/mod.rs`'s
+/// `BeginRun` admission path froze and stored on `runs` for this
+/// `run_id`, passed to `repo_settings::settings_for_sha` — never live
+/// default-branch HEAD at *consumption* time. This is settings.md's
+/// strict "at event time" contract: the repo's default branch moving
+/// between admission and this call never changes what settings this run
+/// is judged against. A `NULL` stored sha ([`NoSettingsSnapshot`]), or a
+/// settings resolution failure of any kind — including `Invalid` (a
+/// `settings.yml` that exists but fails to parse) — fails this call
+/// closed: propagated as a genuine processing error so the Queue
+/// retries, never silently substituted with a default cap, treated as
+/// "AI enabled" by assumption, or re-resolved against live HEAD.
 async fn handle_analysis_requested(env: &Env, message: &ai_queue::AnalysisRequested) -> Result<()> {
     let db = env.d1("DB")?;
     let today = ai_queue::utc_date_string(Date::now().as_millis() as i64);
@@ -263,13 +313,38 @@ async fn handle_analysis_requested(env: &Env, message: &ai_queue::AnalysisReques
         .await?;
     let usage_so_far = usage_row.map(|r| r.neuron_count).unwrap_or(0);
 
-    if ai_queue::is_over_daily_cap(usage_so_far, ai_queue::PLACEHOLDER_DAILY_NEURON_CAP) {
+    #[derive(serde::Deserialize)]
+    struct RunSettingsShaRow {
+        settings_sha: Option<String>,
+    }
+    let run_row: Option<RunSettingsShaRow> = db
+        .prepare("SELECT settings_sha FROM runs WHERE id = ?1")
+        .bind(&[JsValue::from_str(&message.run_id)])?
+        .first(None)
+        .await?;
+    let settings_sha = require_settings_sha(run_row.and_then(|r| r.settings_sha), &message.run_id)
+        .map_err(|e| worker::Error::RustError(e.to_string()))?;
+
+    let settings = repo_settings::settings_for_sha(env, message.repo_id, &settings_sha)
+        .await
+        .map_err(|e| worker::Error::RustError(format!("ai: settings resolution failed: {e}")))?;
+
+    if !settings.ai.enabled || settings.ai.summaries == cloud_ci_core::settings::Summaries::Off {
         worker::console_log!(
-            "ai: repo {} over daily budget ({usage_so_far}/{} neurons — placeholder cap, \
-             pending real settings integration, see ai_queue.rs module docs); \
+            "ai: repo {} has ai.enabled={} ai.summaries=off; skipping analysis for run {}",
+            message.repo_id,
+            settings.ai.enabled,
+            message.run_id,
+        );
+        return Ok(());
+    }
+
+    let daily_neuron_cap = settings.ai.daily_neuron_cap;
+    if ai_queue::is_over_daily_cap(usage_so_far, daily_neuron_cap) {
+        worker::console_log!(
+            "ai: repo {} over daily budget ({usage_so_far}/{daily_neuron_cap} neurons); \
              skipping analysis for run {}",
             message.repo_id,
-            ai_queue::PLACEHOLDER_DAILY_NEURON_CAP,
             message.run_id,
         );
         return Ok(());
@@ -2299,6 +2374,24 @@ fn connect_error(err: &ConnectError) -> Result<Response> {
 mod tests {
     use super::*;
     use cloud_ci_proto::ingest::v1::RunKey;
+
+    #[test]
+    fn require_settings_sha_rejects_a_null_stored_sha() {
+        assert_eq!(
+            require_settings_sha(None, "run-no-snapshot"),
+            Err(NoSettingsSnapshot {
+                run_id: "run-no-snapshot".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn require_settings_sha_passes_a_present_sha_through_unchanged() {
+        assert_eq!(
+            require_settings_sha(Some("abc123deadbeef".to_string()), "run-with-snapshot"),
+            Ok("abc123deadbeef".to_string())
+        );
+    }
 
     #[test]
     fn coordinator_errors_map_to_expected_connect_codes() {

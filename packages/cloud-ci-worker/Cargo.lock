@@ -147,6 +147,7 @@ dependencies = [
  "getrandom",
  "hmac",
  "minijinja",
+ "percent-encoding",
  "serde",
  "serde_json",
  "sha2",

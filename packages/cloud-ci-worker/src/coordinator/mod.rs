@@ -204,6 +204,44 @@
 //!   reasoning migration 0011 used to exclude `report_summaries`/
 //!   `test_failures`).
 
+//! ## Settings SHA (frozen at admission)
+//!
+//! `handle_begin_run`'s first-creation path resolves the repo's live
+//! default-branch HEAD *once*, via
+//! [`crate::repo_settings::resolve_default_branch_sha`] (the same
+//! `roles::lookup_repo_owner` + `roles::installation_token_for_repo`
+//! chain [`RunCoordinator::check_run_auth`] already uses), and stores it
+//! on the new `run` row's `settings_sha` column (see [`ensure_schema`])
+//! *before* the row is ever durably created. A delayed consumer of this
+//! run (the AI queue today; rightsizing later) reads this stored sha and
+//! calls [`crate::repo_settings::settings_for_sha`] with it — never
+//! re-resolving live HEAD itself — so settings.md's "at event time"
+//! contract holds even when the repo's default branch moves between
+//! admission and consumption.
+//!
+//! - **Fails closed, not best-effort.** Unlike [`RunCoordinator::check_run_auth`]'s
+//!   degrade-and-log posture (a Check Run is a side channel), a
+//!   `settings_sha` resolution failure aborts `BeginRun` itself — no
+//!   `run` row is ever created with a missing or guessed sha. There is
+//!   no second chance to freeze a sha retroactively.
+//! - **Resolved exactly once.** The resolve happens before the row
+//!   exists, which is itself an `await` boundary a duplicate or
+//!   reordered `BeginRun`/webhook delivery can race. `handle_begin_run`
+//!   re-reads the row immediately after resolving; if a concurrent
+//!   delivery already won and created it, this delivery's own
+//!   resolution is discarded and the race winner's already-stored
+//!   `settings_sha` is reused untouched — never a second insert, never
+//!   an overwrite. The D1 projection ([`RunCoordinator::project_run_to_d1`])
+//!   mirrors this: `settings_sha` is bound on insert but deliberately
+//!   absent from its `ON CONFLICT ... DO UPDATE SET` list, so a later
+//!   resumed/redelivered `BeginRun` projecting the same row again can
+//!   never overwrite the first value D1 ever stored for it either.
+//! - **Legacy rows.** `settings_sha` is `NULL` only for a `run` row
+//!   written before this column existed ([`ensure_schema`]'s own
+//!   `ALTER TABLE` doc comment) — there is no retroactive way to freeze
+//!   a sha for one. A consumer reading `NULL` must fail closed with a
+//!   typed "no snapshot" error, never substitute live HEAD.
+
 pub mod logic;
 
 use crate::github_checks;
@@ -530,6 +568,15 @@ struct RunRow {
     external_url: String,
     created_at: i64,
     timeout_s: i64,
+    /// `None` for a run row created before this column existed
+    /// ([`ensure_schema`]'s own `ALTER TABLE` doc comment) — never
+    /// silently substituted with a live default-branch HEAD lookup; a
+    /// delayed consumer reading `None` here must fail closed
+    /// (`NoSettingsSnapshot`), not re-resolve. Every row this version's
+    /// `handle_begin_run` creates always has `Some` — the resolve
+    /// happens before the row is ever written (see the "Settings SHA"
+    /// module doc section, and `handle_begin_run`'s own body).
+    settings_sha: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1016,10 +1063,24 @@ impl RunCoordinator {
         req: BeginRunRequest,
     ) -> worker::Result<Response> {
         let trigger_name = trigger_db_name(req.trigger.as_known().unwrap_or_default());
-        let existing = read_run(sql)?;
 
-        let run_row = match existing {
-            None => {
+        // Resolve and persist `settings_sha` exactly once, before this run's row ever
+        // exists — the "Settings SHA" module doc section's admission contract. Only
+        // the first-creation path resolves anything; a resumed/redelivered `BeginRun`
+        // for an already-existing row never re-resolves or overwrites it.
+        if read_run(sql)?.is_none() {
+            let settings_sha = self
+                .resolve_settings_sha_for_admission(req.key.repo_id)
+                .await?;
+
+            // Race check: the resolve above is an `await` boundary, so a duplicate,
+            // reordered, or redelivered `BeginRun` for this same run can land on this
+            // DO instance concurrently and also observe `read_run` as `None`. Re-read
+            // immediately after resolving; if a row now exists, some other delivery
+            // already won and inserted it first. Discard this delivery's own
+            // resolution and fall through to the shared update-existing path below —
+            // never a second insert, never an overwrite of the winner's stored sha.
+            if read_run(sql)?.is_none() {
                 let now_ms = worker::Date::now().as_millis();
                 let run_id = crate::ulid::generate(now_ms).map_err(|e| {
                     worker::Error::RustError(format!("ulid generation failed: {e}"))
@@ -1043,41 +1104,59 @@ impl RunCoordinator {
                     &req.external_url,
                     now_ms as i64,
                     timeout_s,
+                    // Routed through `logic::resolve_admission_settings_sha` (not the raw
+                    // `settings_sha` local) so the actual write is governed by the same
+                    // tested "first sha wins" decision as any other caller, not just this
+                    // block's surrounding control flow: a fresh `read_run` here can only
+                    // observe `settings_sha: None` (this `if` only reaches here when no row
+                    // exists), so this always resolves to `&settings_sha` today — belt and
+                    // suspenders against a future refactor of the surrounding checks.
+                    logic::resolve_admission_settings_sha(
+                        read_run(sql)?
+                            .as_ref()
+                            .and_then(|r| r.settings_sha.as_deref()),
+                        &settings_sha,
+                    ),
                 )?;
                 // DO alarm for `now + timeout_s`, byo-ci.md's third close
                 // trigger (§ Completion semantics' "Timeout" bullet). Only
-                // set the first time a run is created — this `None` arm
-                // runs once per `(repo_id, sha, run_key, attempt)`, since a
+                // set the first time a run is created — this block runs once
+                // per `(repo_id, sha, run_key, attempt)`, since a
                 // redelivered/retried `BeginRun` for the same run always
-                // lands in the `Some(row)` arm below (`do_name` is
-                // deterministic), so a retry never pushes the timeout out
+                // lands in the shared update-existing path below (`do_name`
+                // is deterministic), so a retry never pushes the timeout out
                 // or sets a second alarm.
                 self.state
                     .storage()
                     .set_alarm(timeout_s.saturating_mul(1000))
                     .await?;
-                require_run(sql)?
             }
-            Some(row) => {
-                let current_expect_jobs = row
-                    .expect_jobs
-                    .as_deref()
-                    .map(decode_string_list)
-                    .transpose()?;
-                match logic::resolve_expect_jobs(current_expect_jobs.as_deref(), &req.expect_jobs) {
-                    Ok(Some(new_list)) => update_expect_jobs(sql, &row.id, &new_list)?,
-                    Ok(None) => {}
-                    Err(_) => {
-                        return error_response(
-                            409,
-                            "expect_jobs conflicts with the value already set for this run",
-                        );
-                    }
-                }
-                update_trigger_and_url(sql, &row.id, trigger_name, &req.external_url)?;
-                require_run(sql)?
+        }
+
+        // Shared update-existing path: runs for every `BeginRun` call against a row
+        // that already exists by this point — whether it pre-existed, was just
+        // inserted above, or was created by the race winner above. A freshly inserted
+        // row's `expect_jobs`/`trigger`/`external_url` already match `req` exactly
+        // (just written by `insert_run`), so `resolve_expect_jobs` resolves to `Ok(None)`
+        // and `update_trigger_and_url` is a harmless no-op write for that case.
+        let row = require_run(sql)?;
+        let current_expect_jobs = row
+            .expect_jobs
+            .as_deref()
+            .map(decode_string_list)
+            .transpose()?;
+        match logic::resolve_expect_jobs(current_expect_jobs.as_deref(), &req.expect_jobs) {
+            Ok(Some(new_list)) => update_expect_jobs(sql, &row.id, &new_list)?,
+            Ok(None) => {}
+            Err(_) => {
+                return error_response(
+                    409,
+                    "expect_jobs conflicts with the value already set for this run",
+                );
             }
-        };
+        }
+        update_trigger_and_url(sql, &row.id, trigger_name, &req.external_url)?;
+        let run_row = require_run(sql)?;
 
         self.project_run_to_d1(&run_row).await?;
 
@@ -1086,6 +1165,23 @@ impl RunCoordinator {
             run_id: run_row.id,
             status,
         })
+    }
+
+    /// Resolves the repo's live default-branch HEAD sha for
+    /// [`Self::handle_begin_run`]'s admission-time freeze — see the
+    /// "Settings SHA" module doc section. Unlike [`Self::check_run_auth`]'s
+    /// degrade-and-log posture (a Check Run is a best-effort side
+    /// channel), this fails closed: any error anywhere in the
+    /// `roles::lookup_repo_owner` + `roles::installation_token_for_repo` +
+    /// `repo_settings::resolve_default_branch_sha` chain (repo not
+    /// registered, secrets missing, GitHub API error) is propagated as a
+    /// genuine error, aborting `BeginRun` with no `run` row ever created —
+    /// there is no best-effort fallback for the sha every delayed
+    /// consumer of this run will trust.
+    async fn resolve_settings_sha_for_admission(&self, repo_id: u64) -> worker::Result<String> {
+        crate::repo_settings::resolve_default_branch_sha(&self.env, repo_id as i64)
+            .await
+            .map_err(|e| worker::Error::RustError(format!("settings_sha resolution failed: {e}")))
     }
 
     async fn handle_start_job(
@@ -3167,11 +3263,16 @@ impl RunCoordinator {
         Ok(())
     }
 
+    // `settings_sha` is bound on insert but deliberately absent from the
+    // `ON CONFLICT ... DO UPDATE SET` list below — frozen at admission
+    // (the "Settings SHA" module doc section), a later resumed or
+    // redelivered `BeginRun` projecting this same row again must never
+    // overwrite the first value D1 ever stored for it.
     async fn project_run_to_d1(&self, row: &RunRow) -> worker::Result<()> {
         let db = self.env.d1("DB")?;
         db.prepare(
-            "INSERT INTO runs (id, repo_id, sha, run_key, attempt, status, expect_jobs, trigger, external_url, created_at, timeout_s) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+            "INSERT INTO runs (id, repo_id, sha, run_key, attempt, status, expect_jobs, trigger, external_url, created_at, timeout_s, settings_sha) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
              ON CONFLICT (id) DO UPDATE SET \
                status = excluded.status, \
                expect_jobs = excluded.expect_jobs, \
@@ -3192,6 +3293,9 @@ impl RunCoordinator {
             JsValue::from_str(&row.external_url),
             JsValue::from_f64(row.created_at as f64),
             JsValue::from_f64(row.timeout_s as f64),
+            row.settings_sha
+                .clone()
+                .map_or(JsValue::NULL, |v| JsValue::from_str(&v)),
         ])?
         .run()
         .await?;
@@ -4220,10 +4324,37 @@ fn ensure_schema(sql: &SqlStorage) -> worker::Result<()> {
             trigger TEXT NOT NULL, \
             external_url TEXT NOT NULL, \
             created_at INTEGER NOT NULL, \
-            timeout_s INTEGER NOT NULL DEFAULT 1800 \
+            timeout_s INTEGER NOT NULL DEFAULT 1800, \
+            settings_sha TEXT \
         )",
         None,
     )?;
+    // Retrofits `settings_sha` onto a `run` table created by a version of this DO
+    // before the column existed (`CREATE TABLE IF NOT EXISTS` above never alters an
+    // already-existing table). A run row from before this version has no frozen sha
+    // to retrofit — it stays `NULL`, not a guessed live-HEAD substitute; callers must
+    // treat `NULL` as "no settings snapshot for this run" (`RunRow::settings_sha`'s
+    // doc comment) and fail closed, never silently re-resolve live HEAD. Checked via
+    // `pragma_table_info` rather than discarding every `ALTER` error as "probably just
+    // the duplicate-column case" — same guard as `node`'s `physical_address` retrofit
+    // below, for the same reason: that would also silently swallow a genuine ALTER
+    // failure (disk full, corrupted schema), which would otherwise surface later as a
+    // confusing "no such column" on an unrelated `SELECT`.
+    #[derive(Deserialize)]
+    struct ColumnPresent {
+        #[allow(dead_code)]
+        present: i64,
+    }
+    let has_settings_sha = !sql
+        .exec(
+            "SELECT 1 AS present FROM pragma_table_info('run') WHERE name = 'settings_sha'",
+            None,
+        )?
+        .to_array::<ColumnPresent>()?
+        .is_empty();
+    if !has_settings_sha {
+        sql.exec("ALTER TABLE run ADD COLUMN settings_sha TEXT", None)?;
+    }
     sql.exec(
         "CREATE TABLE IF NOT EXISTS job ( \
             id TEXT PRIMARY KEY, \
@@ -4320,12 +4451,8 @@ fn ensure_schema(sql: &SqlStorage) -> worker::Result<()> {
     // via `pragma_table_info` rather than discarding every `ALTER` error as "probably just the
     // duplicate-column case": that would also silently swallow a genuine ALTER failure (disk
     // full, corrupted schema), which would otherwise surface later as a confusing "no such
-    // column" on an unrelated `SELECT`.
-    #[derive(Deserialize)]
-    struct ColumnPresent {
-        #[allow(dead_code)]
-        present: i64,
-    }
+    // column" on an unrelated `SELECT`. Reuses `ColumnPresent` (defined above for the
+    // `run.settings_sha` check) rather than a second identical struct.
     let has_physical_address = !sql
         .exec(
             "SELECT 1 AS present FROM pragma_table_info('node') WHERE name = 'physical_address'",
@@ -4450,7 +4577,7 @@ fn ensure_schema(sql: &SqlStorage) -> worker::Result<()> {
 fn read_run(sql: &SqlStorage) -> worker::Result<Option<RunRow>> {
     let rows: Vec<RunRow> = sql
         .exec(
-            "SELECT id, repo_id, sha, run_key, attempt, status, expect_jobs, trigger, external_url, created_at, timeout_s FROM run LIMIT 1",
+            "SELECT id, repo_id, sha, run_key, attempt, status, expect_jobs, trigger, external_url, created_at, timeout_s, settings_sha FROM run LIMIT 1",
             None,
         )?
         .to_array()?;
@@ -4534,6 +4661,7 @@ fn insert_run(
     external_url: &str,
     created_at_ms: i64,
     timeout_s: i64,
+    settings_sha: &str,
 ) -> worker::Result<()> {
     let expect_jobs_json = expect_jobs
         .map(serde_json::to_string)
@@ -4541,8 +4669,8 @@ fn insert_run(
         .map_err(|e| worker::Error::RustError(format!("cannot encode expect_jobs: {e}")))?;
     let repo_id_value = SqlStorageValue::try_from_i64(repo_id as i64)?;
     sql.exec(
-        "INSERT INTO run (id, repo_id, sha, run_key, attempt, status, expect_jobs, trigger, external_url, created_at, timeout_s) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        "INSERT INTO run (id, repo_id, sha, run_key, attempt, status, expect_jobs, trigger, external_url, created_at, timeout_s, settings_sha) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         vec![
             SqlStorageValue::from(id),
             repo_id_value,
@@ -4555,6 +4683,7 @@ fn insert_run(
             SqlStorageValue::from(external_url),
             SqlStorageValue::try_from_i64(created_at_ms)?,
             SqlStorageValue::try_from_i64(timeout_s)?,
+            SqlStorageValue::from(settings_sha),
         ],
     )?;
     Ok(())

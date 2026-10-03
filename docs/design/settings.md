@@ -308,7 +308,7 @@ which moves independently of `settings.yml`'s content.
 3. Every `secrets.<pipeline>` key must name a file that exists in `.cloud-ci/pipelines/` at the
    resolved default-branch sha (an allow-list for a pipeline that does not exist is a typo, not a
    no-op) — the same sha `settings.yml` itself is fetched from (see
-   [Fetching settings.yml](#fetching-settingsyml)), never the triggering event's own sha. This
+   [Fetching settings.yml](#fetching-settings-yml)), never the triggering event's own sha. This
    check re-runs against the current `pipeline_manifest` on every event, even when
    `settings.yml`'s `blob_sha` is unchanged and its cached content-errors are reused, because a
    pipeline file can be renamed or removed on the default branch without touching `settings.yml`.

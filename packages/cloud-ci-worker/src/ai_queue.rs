@@ -21,30 +21,29 @@
 //! token-budget truncation. It deliberately stops **before**
 //! `CACHE`/`AI[env.AI.run via AI Gateway]`: no cache lookup, no
 //! `env.AI.run()` call, no `AI_GATEWAY_ID` wiring, no
-//! `PROMPT_SUMMARY_V1` template. A future round picks up from the
-//! `ai_insight` row this round's consumer writes with
-//! `status = 'pending_model_call'` (migration 0016's doc comment) — that
-//! row's `context_json` is built exclusively from the redacted copies
-//! (see [`assemble_failure_context`]'s own doc comment), so a future
-//! round's model call never needs to redact again; it only needs to
-//! avoid introducing a second, unredacted input class.
+//! `PROMPT_SUMMARY_V1` template — that half (`src/ai_model_call.rs`'s
+//! pure functions, driven by `src/lib.rs`'s `ai_model_call_pass` on the
+//! `*/5` cron) picks up from the `ai_insight` row this round's consumer
+//! writes with `status = 'pending_model_call'` (migration 0016's doc
+//! comment) — that row's `context_json` is built exclusively from the
+//! redacted copies (see [`assemble_failure_context`]'s own doc
+//! comment), so the model-call pass never needs to redact again; it
+//! only needs to avoid introducing a second, unredacted input class.
 //!
 //! # Honest gaps this round does not close
 //!
-//! - **Settings integration.** `cloud-ci-core::settings` already parses
-//!   every `ai.*` key, including `ai.daily_neuron_cap`
-//!   (`cloud-ci-core/src/settings.rs`'s `validate_ai`) — that parser is
-//!   not the gap. The real gap is one level up: `cloud-ci-worker` does
-//!   not depend on `cloud-ci-core` at all (not in `Cargo.toml`), and
-//!   nothing in the running Worker fetches a repo's `settings.yml` from
-//!   GitHub's default branch or persists a resolved `Ai` struct anywhere
-//!   this consumer could read it from. So this round's budget check uses
-//!   [`PLACEHOLDER_DAILY_NEURON_CAP`], a hardcoded, deliberately
-//!   conservative stand-in for the per-repo `ai.daily_neuron_cap` the
-//!   settings parser already knows how to produce — not because parsing
-//!   is missing, but because the Worker has no live settings-fetch path
-//!   to hand that parser real bytes from. Wiring that fetch (and
-//!   `cloud-ci-core` as a dependency) is a separate, later round's job.
+//! - **Settings integration — now real.** `lib.rs`'s `handle_analysis_requested` reads the
+//!   `settings_sha` [`coordinator/mod.rs`](../coordinator/mod.rs)'s `BeginRun` admission path
+//!   already froze and stored on this run's `runs` row, then calls
+//!   `crate::repo_settings::settings_for_sha` with that stored sha for the real per-repo
+//!   `ai.daily_neuron_cap` — never `resolve_settings_for_repo`'s live default-branch HEAD
+//!   (that function has been deleted; every caller needed the frozen-sha contract, not a
+//!   live-HEAD stand-in). This replaces the placeholder this module used to export here.
+//!   `repo_settings` does not clamp `clamp_to_deployment_bounds`-sensitive fields (needs new
+//!   `wrangler.toml` `[vars]`, out of scope pending coordinator-recovery handoff — see that
+//!   module's own scope-boundary doc) — irrelevant to `ai.daily_neuron_cap`, which is not one
+//!   of the clamped fields.
+//!
 //! - **Log tail.** ai.md's "Failure summaries: inputs" table's second row
 //!   (R2 log of the failing step, last 400 lines) is not read here: no
 //!   code in this crate writes a failing step's log to R2 at all yet
@@ -64,10 +63,11 @@
 //!   input class is always empty/zero, same treatment as the log tail.
 //! - **`ai.exclude_paths`.** The path-based exclusion glob list
 //!   (ai.md's `.cloud-ci/settings.yml` example: `"infra/secrets/**"`,
-//!   `"**/*.pem"`) is not applied here — it needs the same not-yet-built
-//!   settings-fetch path the "Settings integration" bullet above names,
-//!   and this round has no diff/log-tail input for it to apply to yet
-//!   regardless. This is a distinct mechanism from
+//!   `"**/*.pem"`) is not applied here — `repo_settings` can now fetch
+//!   the real list, but this consumer has no diff/log-tail content for
+//!   it to filter in the first place (both input classes are
+//!   always-empty per the two bullets above), so wiring the fetch would
+//!   have nothing to act on yet. This is a distinct mechanism from
 //!   [`crate::ai_redact`]'s *content*-based redaction (see that module's
 //!   own doc comment's "Relationship to `ai.exclude_paths`" section) —
 //!   closing this gap does not close that one and vice versa. Redaction
@@ -113,18 +113,6 @@ pub struct AnalysisRequested {
     pub run_id: String,
     pub repo_id: i64,
 }
-
-/// Hardcoded, deliberately conservative stand-in for the per-repo
-/// `ai.daily_neuron_cap` setting (default `20000` per
-/// `docs/design/settings.md`'s field reference) until the Worker has a
-/// real settings-fetch path — see this module's doc comment's "Settings
-/// integration" gap. `2,000` is one-tenth of that documented default: low
-/// enough that a deployment accidentally left on this placeholder stays
-/// well inside ai.md's own "Cost controls" deployment-wide cap
-/// (`AI_DAILY_NEURON_CAP` default `100,000`) even across several repos,
-/// without being so low that a single legitimate summary (~848 neurons
-/// per ai.md's "Cost controls" estimate) can never fit.
-pub const PLACEHOLDER_DAILY_NEURON_CAP: i64 = 2_000;
 
 /// ai.md's budget-cap check: `usage_so_far` (today's `ai_usage_daily
 /// .neuron_count` for this repo) has already met or exceeded `cap`. `>=`,

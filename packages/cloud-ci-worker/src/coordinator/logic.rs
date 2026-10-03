@@ -97,6 +97,25 @@ pub fn resolve_expect_jobs(
     }
 }
 
+/// "First sha wins": `BeginRun`'s admission-time `settings_sha` resolve
+/// (coordinator/mod.rs's "Settings SHA (frozen at admission)" module doc
+/// section) is an `await` boundary a duplicate, reordered, or
+/// redelivered `BeginRun` can race across. `existing_sha` is whatever
+/// this run's row already has stored by the time the race is checked —
+/// `Some` only once some delivery (this one or a race winner) has ever
+/// successfully inserted a row; `resolved_sha` is what *this* delivery
+/// just resolved. A stored sha, once set, is never replaced: `Some`
+/// always wins regardless of what `resolved_sha` is (even if the
+/// repo's default branch moved between two deliveries' own resolves) —
+/// only a brand-new row (`existing_sha: None`) ever gets this
+/// delivery's freshly resolved value.
+pub fn resolve_admission_settings_sha<'a>(
+    existing_sha: Option<&'a str>,
+    resolved_sha: &'a str,
+) -> &'a str {
+    existing_sha.unwrap_or(resolved_sha)
+}
+
 /// `StartJob`'s `shard_total` is rejected when a later call for the same
 /// `(run_id, job_name)` supplies a different total than what is already
 /// stored (docs/design/byo-ci.md: "A `shard_total` different from the stored
@@ -2198,6 +2217,45 @@ mod tests {
         assert_eq!(
             resolve_expect_jobs(Some(&existing), &incoming),
             Err(ExpectJobsConflict)
+        );
+    }
+
+    #[test]
+    fn resolve_admission_settings_sha_uses_the_resolved_sha_for_a_brand_new_row() {
+        // `existing_sha: None` is the only case a delivery's own freshly resolved sha is
+        // ever used — a row that has never been admitted yet.
+        assert_eq!(
+            resolve_admission_settings_sha(None, "resolveddeadbeef0000000000000000000000"),
+            "resolveddeadbeef0000000000000000000000"
+        );
+    }
+
+    #[test]
+    fn resolve_admission_settings_sha_keeps_the_race_winners_stored_sha() {
+        // Two `BeginRun` deliveries raced: this delivery's own resolve finished second,
+        // but a race winner already stored its own sha first. The winner's value is kept,
+        // this delivery's own `resolved_sha` is discarded entirely.
+        assert_eq!(
+            resolve_admission_settings_sha(
+                Some("winnersha00000000000000000000000000000"),
+                "thisdeliveryslosingsha00000000000000000",
+            ),
+            "winnersha00000000000000000000000000000"
+        );
+    }
+
+    #[test]
+    fn resolve_admission_settings_sha_never_overwrites_on_a_plain_resume() {
+        // A later, ordinary resumed/redelivered `BeginRun` for an already-admitted run
+        // resolves a *different* sha than what was first ever stored (the repo's default
+        // branch moved on). The already-stored value still wins — "first sha wins" holds
+        // even when the two values genuinely differ, not just when they happen to match.
+        assert_eq!(
+            resolve_admission_settings_sha(
+                Some("firststoredsha0000000000000000000000000"),
+                "newerliveheadsha000000000000000000000000",
+            ),
+            "firststoredsha0000000000000000000000000"
         );
     }
 
