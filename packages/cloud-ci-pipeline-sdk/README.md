@@ -38,6 +38,20 @@ package, the same way any other script dependency would be.
   resolved shard to `check` via each per-shard `ci.container` call's own
   attach logic. See "`ci.shard`: shard-plan resolution and per-shard
   dispatch" below for the full split-algorithm-reuse rationale.
+- **`ci.group(ids, { runner, run, check })`** — the design doc gives
+  `ci.group` exactly one line (a "Graph helpers" table row: "Run several
+  nodes in one container to save startup cost", no worked example or
+  prose section anywhere else in that document). This package implements
+  that line literally: one real `step.do("group:" + ids.join(","), ...)`
+  wraps a single `ContainerExecutor.start()` call covering every id in
+  `ids`, and that one `ContainerResult` is returned for each id (see
+  "`ci.group`: one container, several node ids" below for the full
+  rationale and the explicit shape choice this ambiguous spec required).
+  Rejects an empty `ids` array, a duplicate id within one call's own
+  `ids`, and a duplicate id already used by another `ci.group`/
+  `ci.container`/`ci.shard` call in the same execution; attaches every id
+  to `check` (throwing if that check is already sealed) before the step
+  runs.
 
 ## The step-durability contract, and what is and isn't proven this round
 
@@ -185,6 +199,51 @@ no-opping — same "fail loudly, not silently" rule
   `ci.snapshot`'s own absence from this round (see "Explicitly out of
   scope this round" below).
 
+## `ci.group`: one container, several node ids
+
+`docs/design/dynamic-pipelines.md`'s entire specification of `ci.group` is
+one "Graph helpers" table row: `` `ci.group(ids, spec)` `` — "Run several
+nodes in one container to save startup cost" (`:381`). Unlike
+`ci.container`, `ci.shard`, and `ci.check`, there is no "User experience"
+code sample, no "Design" section, and no other mention of `ci.group`
+anywhere else in that document.
+
+**The ambiguity, and the choice this package makes:** the row gives a
+signature (`ids`, a param this package's `GroupOptions` type exposed as
+`opts`) and a one-sentence purpose, but no field list for `spec`, no
+return shape, and no statement of how a grouped node's id interacts with
+`ci.container`/`ci.shard`'s own id-uniqueness and check-attachment rules.
+This package resolves that by treating `ci.group` as the narrowest
+coherent reading of "several nodes in one container": `spec` reuses
+`ContainerOptions`'s exact field set (`runner`, `run`, `check`) rather
+than inventing a second container-spec shape, with `run` being the single,
+already-combined shell command the caller composes to cover every id in
+`ids` (the same division of labor `ci.shard`'s `run({shard, shards,
+files}) => command` callback already uses: the SDK never guesses how to
+combine several nodes' work into one command). `GroupResult.results` maps
+every id in `ids` to that one container's `ContainerResult`, since all of
+them genuinely ran inside it. Every id in `ids` goes through the exact
+same `seenIds` duplicate check and `check.attach()` call a plain
+`ci.container`/`ci.shard` id would (`src/group.ts`), so a grouped id can
+never silently collide with — or escape — the id-uniqueness and
+check-sealing rules the rest of the SDK already enforces.
+
+**What this reading explicitly is not:** a callback-based logical/UI
+grouping of nested `ci.check`/`ci.container` calls (e.g. `ci.group(name,
+fn)`). The design doc's actual signature takes an id array and a spec
+object, never a function — this package does not implement a shape the
+text does not state, however natural that alternate reading might seem
+from the "logically group a set of steps" phrasing a feature named
+`group` might suggest in other CI systems.
+
+`runGroup` (`src/group.ts`) deliberately does not call `runContainer`
+per id — doing so would dispatch one container per id, defeating the
+"save startup cost" point of the primitive entirely (unlike `ci.shard`,
+which genuinely wants, and gets, one container per shard). It instead
+makes its own single `step.do("group:" + ids.join(","), ...)` call,
+after running the same duplicate-id and check-attach checks
+`runContainer` makes, against every id in `ids`.
+
 ## `workflow()`'s adapter shape, and the host-side load path (confirmed 2026-10-02)
 
 `workflow({ on, run })` returns a single object meant to be a script's
@@ -284,8 +343,6 @@ Each of these is a real, named gap — not a silent omission:
   `turbo.checkPerTask`/`mise.plan` and the generic `graph.fromJson`/
   `graph.fromGraph` helpers. Not implemented; this package has no `turbo`
   or `mise` export at all.
-- **`ci.group`** — running several nodes in one container. Not
-  implemented.
 - **Sidecars** — `ContainerOptions` has no `sidecars` field; a container
   spec in this round is a single process, no sidecar lifecycle.
 - **Multi-step containers** — `ContainerOptions` has no `steps` field; a
@@ -308,7 +365,7 @@ Each of these is a real, named gap — not a silent omission:
 - **`ci.limit`, `ci.skip`, `ci.cached`, `ci.turboCache`, `ci.readFile`** —
   none of the design doc's other `ci` surface members exist on `CiContext`
   yet; only `ci.event`, `ci.changedFiles`, `ci.branch`, `ci.labels`,
-  `ci.check`, `ci.container`, `ci.shard`.
+  `ci.check`, `ci.container`, `ci.shard`, `ci.group`.
 
 ## Testing
 
@@ -331,6 +388,15 @@ Each of these is a real, named gap — not a silent omission:
   resolved shard, the shared container-id namespace with plain
   `ci.container` calls, duplicate shard-id rejection, and the
   no-planner-configured error.
+- `test/group.test.ts` — `ci.group`'s single-container batch dispatch
+  against a fake `WorkflowStepLike`/`ContainerExecutor` (same conventions
+  as `container.test.ts`): one executor call covers every id in `ids`,
+  the same `ContainerResult` is returned for each id, replay reuses the
+  recorded step without a second executor call, check attachment across
+  every grouped id, the shared id namespace with plain `ci.container`/
+  `ci.shard` calls (collisions rejected both ways), within-call duplicate
+  ids rejected, an empty `ids` array rejected, and the
+  no-executor-configured error.
 - `test/workflow.test.ts` — `workflow()`'s adapter shape: `on` passthrough,
   `fetch()`'s `env.WORKFLOWS.create()` call and id response, `run()`
   building a `CiContext` and auto-sealing checks, and an end-to-end replay

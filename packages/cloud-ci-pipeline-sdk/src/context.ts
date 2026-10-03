@@ -1,5 +1,6 @@
 import { CheckRegistry } from "./check.js";
 import { runContainer } from "./container.js";
+import { runGroup } from "./group.js";
 import { runShard } from "./shard.js";
 import type {
   Check,
@@ -8,6 +9,8 @@ import type {
   ContainerExecutor,
   ContainerOptions,
   ContainerResult,
+  GroupOptions,
+  GroupResult,
   ShardOptions,
   ShardPlanner,
   ShardResult,
@@ -27,8 +30,8 @@ export interface CiContextOptions {
 /**
  * The `ci` object a script's `run(ci)` receives. Implements the subset of
  * `docs/design/dynamic-pipelines.md`'s full `ci` API this round builds:
- * `ci.event`, `ci.changedFiles`, `ci.check`, `ci.container`, `ci.shard`.
- * Every other documented member (`ci.snapshot`, `ci.group`, `ci.limit`,
+ * `ci.event`, `ci.changedFiles`, `ci.check`, `ci.container`, `ci.shard`,
+ * `ci.group`. Every other documented member (`ci.snapshot`, `ci.limit`,
  * `ci.skip`, `ci.cached`, `ci.turboCache`, `ci.readFile`) is intentionally
  * absent this round — see README's scope boundary list.
  */
@@ -77,6 +80,14 @@ export class CiContext {
         seenShardIds: this.shardIds,
       },
       id,
+      opts,
+    );
+  }
+
+  group(ids: readonly string[], opts: GroupOptions): Promise<GroupResult> {
+    return runGroup(
+      { step: this.step, executor: this.executor, seenIds: this.containerIds },
+      ids,
       opts,
     );
   }
