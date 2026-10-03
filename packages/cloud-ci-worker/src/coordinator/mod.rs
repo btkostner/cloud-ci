@@ -2222,6 +2222,9 @@ impl RunCoordinator {
     /// image, Docker/runtime error) — a real failure
     /// [`Self::handle_start_node`] maps straight to the node's own
     /// `failed` status, never an unhandled 500.
+    /// Delegates to [`crate::node_container::start_container`] — the same real DO-to-DO call
+    /// [`crate::executor::ContainersExecutor::start`] makes, extracted here rather than
+    /// duplicated so neither caller reimplements the HTTP request.
     async fn start_node_container(
         &self,
         run_row: &RunRow,
@@ -2235,67 +2238,17 @@ impl RunCoordinator {
             &run_row.run_key,
             run_row.attempt as u32,
         );
-        let namespace = self
-            .env
-            .durable_object(crate::node_container::NODE_CONTAINER_BINDING)
-            .map_err(|e| format!("node container namespace unavailable: {e}"))?;
-        let id = namespace
-            .id_from_name(node_id)
-            .map_err(|e| format!("node container id error: {e}"))?;
-        let stub = id
-            .get_stub()
-            .map_err(|e| format!("node container stub error: {e}"))?;
-
-        let encoded = serde_json::to_string(&serde_json::json!({
-            "run_do_name": run_do_name,
-            "node_id": node_id,
-            "image": image,
-            "command": command,
-        }))
-        .map_err(|e| format!("cannot encode node-container start request: {e}"))?;
-        let mut init = RequestInit::new();
-        init.with_method(Method::Post)
-            .with_body(Some(JsValue::from_str(&encoded)));
-        let request =
-            Request::new_with_init("https://node-container.cloud-ci.internal/start", &init)
-                .map_err(|e| format!("cannot build node-container start request: {e}"))?;
-        let mut response = stub
-            .fetch_with_request(request)
+        crate::node_container::start_container(&self.env, &run_do_name, node_id, image, command)
             .await
-            .map_err(|e| format!("node container fetch failed: {e}"))?;
-        match response.status_code() {
-            200..=299 => Ok(()),
-            status => {
-                let detail = response.text().await.unwrap_or_default();
-                Err(format!("node container rejected start: {status} {detail}"))
-            }
-        }
     }
 
-    /// Stops `node_id`'s real container via a DO-to-DO call into
-    /// `NodeContainer`'s `/stop` — [`Self::handle_cancel_run`]'s only
-    /// caller. Best-effort, degrade-and-log on any failure (unreachable
-    /// DO, container already gone): blocking the whole run's
-    /// cancellation on one node's container failing to stop would leave
-    /// the run stuck cancelling forever, the same degrade-and-log
-    /// posture `check_run_auth`'s callers already use for GitHub API
-    /// failures.
+    /// Delegates to [`crate::node_container::stop_container`] — [`Self::handle_cancel_run`]'s
+    /// only caller. Best-effort, degrade-and-log on any failure (unreachable DO, container
+    /// already gone): blocking the whole run's cancellation on one node's container failing to
+    /// stop would leave the run stuck cancelling forever, the same degrade-and-log posture
+    /// `check_run_auth`'s callers already use for GitHub API failures.
     async fn stop_node_container(&self, node_id: &str) {
-        let result: worker::Result<()> = async {
-            let namespace = self
-                .env
-                .durable_object(crate::node_container::NODE_CONTAINER_BINDING)?;
-            let id = namespace.id_from_name(node_id)?;
-            let stub = id.get_stub()?;
-            let mut init = RequestInit::new();
-            init.with_method(Method::Post);
-            let request =
-                Request::new_with_init("https://node-container.cloud-ci.internal/stop", &init)?;
-            stub.fetch_with_request(request).await?;
-            Ok(())
-        }
-        .await;
-        if let Err(e) = result {
+        if let Err(e) = crate::node_container::stop_container(&self.env, node_id).await {
             worker::console_log!("cancel_run: stop container for node {node_id} failed: {e}");
         }
     }

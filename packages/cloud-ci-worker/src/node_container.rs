@@ -96,6 +96,7 @@ impl DurableObject for NodeContainer {
                 self.handle_start(body)
             }
             (Method::Post, "/stop") => self.handle_stop().await,
+            (Method::Get, "/status") => self.handle_status(),
             _ => Response::error("not found", 404),
         }
     }
@@ -120,6 +121,11 @@ struct StartResponse {
 #[derive(Serialize)]
 struct StopResponse {
     stopped: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StatusResponse {
+    running: bool,
 }
 
 impl NodeContainer {
@@ -178,6 +184,121 @@ impl NodeContainer {
         }
         container.destroy(None).await?;
         Response::from_json(&StopResponse { stopped: true })
+    }
+
+    /// Reads this node's container running/not state — the `Executor` trait's `status`
+    /// conformer (`crate::executor::ContainersExecutor::status`), with no other caller yet
+    /// (module docs: liveness is agent heartbeats, not executor polling, so nothing in
+    /// `RunCoordinator` calls this on a timer).
+    fn handle_status(&self) -> worker::Result<Response> {
+        let Some(container) = self.state.container() else {
+            return Response::from_json(&StatusResponse { running: false });
+        };
+        Response::from_json(&StatusResponse {
+            running: container.running(),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Free functions — the real DO-to-DO calls, shared by `RunCoordinator::start_node_container`/
+// `stop_node_container` and `crate::executor::ContainersExecutor` so neither duplicates this
+// logic. Extracted from what were previously private `RunCoordinator` methods; the HTTP calls
+// themselves are unchanged.
+// ---------------------------------------------------------------------------
+
+/// Starts `node_id`'s real container via a DO-to-DO call into this module's own `NodeContainer`
+/// DO's `/start`. `Err` means the container itself failed to *start* (bad image, Docker/runtime
+/// error) — callers map that straight to the node's own `failed` status, never an unhandled 500
+/// (`coordinator`'s own doc comment on this call covers why).
+pub async fn start_container(
+    env: &Env,
+    run_do_name: &str,
+    node_id: &str,
+    image: &str,
+    command: &[String],
+) -> Result<(), String> {
+    let namespace = env
+        .durable_object(NODE_CONTAINER_BINDING)
+        .map_err(|e| format!("node container namespace unavailable: {e}"))?;
+    let id = namespace
+        .id_from_name(node_id)
+        .map_err(|e| format!("node container id error: {e}"))?;
+    let stub = id
+        .get_stub()
+        .map_err(|e| format!("node container stub error: {e}"))?;
+
+    let encoded = serde_json::to_string(&serde_json::json!({
+        "run_do_name": run_do_name,
+        "node_id": node_id,
+        "image": image,
+        "command": command,
+    }))
+    .map_err(|e| format!("cannot encode node-container start request: {e}"))?;
+    let mut init = RequestInit::new();
+    init.with_method(Method::Post)
+        .with_body(Some(JsValue::from_str(&encoded)));
+    let request = Request::new_with_init("https://node-container.cloud-ci.internal/start", &init)
+        .map_err(|e| format!("cannot build node-container start request: {e}"))?;
+    let mut response = stub
+        .fetch_with_request(request)
+        .await
+        .map_err(|e| format!("node container fetch failed: {e}"))?;
+    match response.status_code() {
+        200..=299 => Ok(()),
+        status => {
+            let detail = response.text().await.unwrap_or_default();
+            Err(format!("node container rejected start: {status} {detail}"))
+        }
+    }
+}
+
+/// Stops `node_id`'s real container via a DO-to-DO call into `/stop`. Best-effort is the
+/// caller's posture, not this function's: it returns the real `worker::Result`, and
+/// `RunCoordinator::stop_node_container` is the one that logs-and-swallows a failure.
+pub async fn stop_container(env: &Env, node_id: &str) -> worker::Result<()> {
+    let namespace = env.durable_object(NODE_CONTAINER_BINDING)?;
+    let id = namespace.id_from_name(node_id)?;
+    let stub = id.get_stub()?;
+    let mut init = RequestInit::new();
+    init.with_method(Method::Post);
+    let request = Request::new_with_init("https://node-container.cloud-ci.internal/stop", &init)?;
+    stub.fetch_with_request(request).await?;
+    Ok(())
+}
+
+/// Reads `node_id`'s container running/not state via `/status` —
+/// `crate::executor::ContainersExecutor::status`'s only caller.
+pub async fn container_status(env: &Env, node_id: &str) -> Result<bool, String> {
+    let namespace = env
+        .durable_object(NODE_CONTAINER_BINDING)
+        .map_err(|e| format!("node container namespace unavailable: {e}"))?;
+    let id = namespace
+        .id_from_name(node_id)
+        .map_err(|e| format!("node container id error: {e}"))?;
+    let stub = id
+        .get_stub()
+        .map_err(|e| format!("node container stub error: {e}"))?;
+    let mut init = RequestInit::new();
+    init.with_method(Method::Get);
+    let request = Request::new_with_init("https://node-container.cloud-ci.internal/status", &init)
+        .map_err(|e| format!("cannot build node-container status request: {e}"))?;
+    let mut response = stub
+        .fetch_with_request(request)
+        .await
+        .map_err(|e| format!("node container fetch failed: {e}"))?;
+    match response.status_code() {
+        200..=299 => {
+            let body: StatusResponse = response
+                .json()
+                .await
+                .map_err(|e| format!("cannot decode node-container status response: {e}"))?;
+            Ok(body.running)
+        }
+        status => {
+            let detail = response.text().await.unwrap_or_default();
+            Err(format!("node container rejected status: {status} {detail}"))
+        }
     }
 }
 
