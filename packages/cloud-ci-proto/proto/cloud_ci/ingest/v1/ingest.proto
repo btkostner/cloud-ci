@@ -17,6 +17,7 @@ service IngestService {
   rpc GetRun(GetRunRequest) returns (GetRunResponse);
   rpc GetTestTimings(GetTestTimingsRequest) returns (GetTestTimingsResponse);
   rpc ResolveShardPlan(ResolveShardPlanRequest) returns (ResolveShardPlanResponse);
+  rpc RegisterShardGroup(RegisterShardGroupRequest) returns (RegisterShardGroupResponse);
 }
 
 enum Trigger {
@@ -168,6 +169,15 @@ message SubmitResourceSamplesRequest {
   // `parse_memory_peak` module doc) — distinct from a genuine `0`.
   optional uint64 memory_peak_bytes = 6;
   bool oom_detected = 7;
+  // The exact node (container) that produced this batch, e.g.
+  // `shard:{job_name}:{idx}:{attempt}`, so an OOM report names its
+  // container rather than inferring it from `(job_id, shard_index,
+  // attempt)`. Optional and additive: an old agent omits it, and an unset
+  // (or empty) value is treated identically. It is part of the batch's
+  // *content* hash, not its `(job_id, shard_index, attempt)` identity: the
+  // same identity resubmitted with a different `node_id` is a conflict,
+  // never an overwrite. At most 256 bytes, no control characters.
+  optional string node_id = 8;
 }
 
 message SubmitResourceSamplesResponse {}
@@ -287,4 +297,33 @@ message ResolveShardPlanResponse {
   uint32 shard_count = 1;
   // Always exactly `shard_count` entries, in shard-index order.
   repeated ShardFiles shards = 2;
+}
+
+// Registers (or re-confirms) one shard group's merge-barrier configuration
+// for a managed run, so `ci.shard`'s `ShardOptions.reports` can reach
+// `RunCoordinator`'s real merge barrier instead of the local
+// `ShardReportsNotSupportedError` placeholder (docs/design/
+// parallelization.md's "Shard groups / merge barrier" section). `run_id`
+// resolves which run's `RunCoordinator` owns this group — auth and
+// run-ownership checks are identical to every other run-bound ingest call
+// (`StartJob` etc., docs/design/auth.md's Machine auth section): the
+// caller's ingest token must carry this exact `run_id`. `job_name`/
+// `expected_total`/`fail_fast`/`merge_on_failure` match
+// `coordinator::mod::RegisterShardGroupRequest` (the existing internal
+// Durable Object route) field-for-field; `merge_on_failure` must be one of
+// `"if_any_passed"` (default), `"always"`, or `"never"`
+// (`coordinator::logic::MergeOnFailure::from_db_str`). Idempotent: a
+// redelivered call for an already-registered `job_name` is a clean no-op,
+// never a conflict — matching the internal route's own documented
+// idempotency rule.
+message RegisterShardGroupRequest {
+  string run_id = 1;
+  string job_name = 2;
+  uint32 expected_total = 3;
+  bool fail_fast = 4;
+  string merge_on_failure = 5;
+}
+
+message RegisterShardGroupResponse {
+  string job_name = 1;
 }
