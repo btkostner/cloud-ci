@@ -1,0 +1,14 @@
+{
+  "name": "container-snapshot-spike-fixture",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Phase-0 'Container snapshots' spike fixture package.json — a real, non-trivial dependency tree so `pnpm install` (exec'd live inside the container, not run at image-build time) has measurable work to do.",
+  "dependencies": {
+    "express": "4.21.2",
+    "axios": "1.7.9",
+    "lodash": "4.17.21",
+    "dayjs": "1.11.13",
+    "zod": "3.24.1",
+    "uuid": "11.0.5"
+  }
+}
