@@ -21,7 +21,7 @@ serde_json = "1"
 sha2 = "0.10"
 wasm-bindgen = "0.2.129"
 web-sys = { version = "0.3", features = ["Crypto", "SubtleCrypto", "CryptoKey"] }
-worker = { version = "0.8.7", features = ["http", "d1"] }
+worker = { version = "0.8.7", features = ["http", "d1", "queue"] }
 
 # Patches `worker` to add `durable_object`-scheduling-policy Container
 # startup fields (image/instance/containerSnapshot/labels) and

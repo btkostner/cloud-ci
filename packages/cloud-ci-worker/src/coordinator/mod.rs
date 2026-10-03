@@ -1705,12 +1705,59 @@ impl RunCoordinator {
         self.project_run_to_d1(&run_row).await?;
         self.finalize_check_runs(sql, &run_row).await?;
         self.finalize_test_stats(sql, &run_row).await?;
+        // ai.md § "### Pipeline": "When a run reaches a terminal state,
+        // `RunCoordinator` enqueues one `AnalysisRequested` message onto
+        // the `cloud-ci-analysis` Queue." Only reached from this
+        // fresh-transition branch, never from the already-terminal
+        // short-circuit at this function's top (the early return a few
+        // lines up) — so a redelivered/retried close call never enqueues
+        // a second `AnalysisRequested` for the same run. Unlike
+        // `finalize_test_stats`'s own D1-gated idempotency (a redelivery
+        // must keep retrying that side effect even once the run is
+        // already terminal, since its own marker table is the real
+        // gate), one extra `AnalysisRequested` message has no D1-level
+        // dedupe anywhere downstream yet — the simplest correct
+        // idempotency discipline here is "only the state transition
+        // itself enqueues", which this call site already guarantees by
+        // construction, not a second marker table.
+        self.enqueue_analysis_requested(&run_row).await;
 
         let status = run_status_of(&run_row)?;
         Response::from_json(&CloseRunOutcome {
             run_id: run_row.id,
             status,
         })
+    }
+
+    /// `cloud-ci-analysis` (ai.md § "### Pipeline"). A send failure (the
+    /// `ANALYSIS_QUEUE` binding unreachable, a transient Queues API
+    /// error) is logged and swallowed, not propagated — same
+    /// degrade-and-log posture as `finalize_check_runs`'s own GitHub-call
+    /// failures: losing one run's AI summary must not fail the run's
+    /// close response, which every other part of this function (D1
+    /// projection, Check Run finalization) already committed by the time
+    /// this call happens.
+    async fn enqueue_analysis_requested(&self, run_row: &RunRow) {
+        let message = crate::ai_queue::AnalysisRequested {
+            run_id: run_row.id.clone(),
+            repo_id: run_row.repo_id,
+        };
+        let queue = match self.env.queue("ANALYSIS_QUEUE") {
+            Ok(q) => q,
+            Err(e) => {
+                worker::console_log!(
+                    "ai: ANALYSIS_QUEUE binding unavailable, skipping enqueue for run {}: {e}",
+                    run_row.id
+                );
+                return;
+            }
+        };
+        if let Err(e) = queue.send(message).await {
+            worker::console_log!(
+                "ai: enqueue AnalysisRequested failed for run {}: {e}",
+                run_row.id
+            );
+        }
     }
 
     /// Applies every canonical, parsed report's test outcomes to

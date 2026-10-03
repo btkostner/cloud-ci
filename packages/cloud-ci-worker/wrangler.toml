@@ -69,6 +69,38 @@ bucket_name = "cloud-ci-assets"
 binding = "METRICS"
 dataset = "cloud_ci_metrics"
 
+
+# `cloud-ci-analysis` Queue (docs/design/ai.md § "### Pipeline": "When a
+# run reaches a terminal state, `RunCoordinator` enqueues one
+# `AnalysisRequested` message onto the `cloud-ci-analysis` Queue"), plus
+# its dead-letter queue (ai.md § "### Pipeline", "Consumer settings"
+# paragraph: "failures go to a dead-letter queue, `cloud-ci-analysis-dlq`").
+# `[[queues.producers]]`/`[[queues.consumers]]` is the current Wrangler
+# TOML syntax for Queues bindings (developers.cloudflare.com/queues/configuration/configure-queues/,
+# checked 2026-10-02). Binding name matches `env.queue("ANALYSIS_QUEUE")`
+# in `src/coordinator/mod.rs`'s `handle_close_run` and the `#[event(queue)]`
+# consumer in `src/lib.rs`.
+[[queues.producers]]
+queue = "cloud-ci-analysis"
+binding = "ANALYSIS_QUEUE"
+
+# Consumer settings per ai.md's "### Pipeline" "Consumer settings"
+# paragraph verbatim: "`max_batch_size = 1`, because each message makes a
+# model call that can take several seconds. `max_retries = 3`, and
+# failures go to a dead-letter queue, `cloud-ci-analysis-dlq`." No
+# `max_batch_timeout` override: the default (5s) does not matter at
+# `max_batch_size = 1` since a single message never waits to fill a
+# bigger batch. No `max_concurrency` override either — this round's
+# consumer does not call `env.AI.run()` yet (see `ai_queue.rs` module
+# docs), so there is no rate-limit reason yet to cap concurrency below
+# the platform default; a future round revisits this once the real model
+# call is wired.
+[[queues.consumers]]
+queue = "cloud-ci-analysis"
+max_batch_size = 1
+max_retries = 3
+dead_letter_queue = "cloud-ci-analysis-dlq"
+
 # One SQLite-backed Durable Object per run (ADR 0004, docs/design/byo-ci.md).
 # Addressed by `(repo_id, sha, run_key, attempt)`, never by the run's own
 # ULID, so a redelivered or reordered BeginRun always lands on the same

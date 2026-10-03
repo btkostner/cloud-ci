@@ -1,4 +1,5 @@
 pub mod ai_insight;
+pub mod ai_queue;
 pub mod api_tokens;
 pub mod connect;
 pub mod container_probe;
@@ -34,7 +35,10 @@ use cloud_ci_proto::ingest::v1::{
 };
 use connect::{Code, Codec, ConnectError, NegotiationError, negotiate};
 use coordinator::{CoordinatorError, RunCoordinatorStore};
-use worker::{Context, Date, Env, Headers, Method, Request, RequestInit, Response, Result, event};
+use worker::wasm_bindgen::JsValue;
+use worker::{
+    Context, Date, Env, Headers, MessageExt, Method, Request, RequestInit, Response, Result, event,
+};
 
 #[event(fetch)]
 async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
@@ -150,6 +154,161 @@ async fn scheduled(event: worker::ScheduledEvent, env: Env, _ctx: worker::Schedu
             worker::console_log!("scheduled: no handler registered for cron {other:?}");
         }
     }
+}
+
+/// `[[queues.consumers]]`: `max_batch_size = 1` per ai.md's "###
+/// Pipeline" "Consumer settings" paragraph, so `batch` always holds
+/// exactly one message). Implements the pipeline diagram's
+/// `B{Budget + settings check}` and `CTX`/`RED` steps; deliberately stops
+/// before `CACHE`/`AI[env.AI.run via AI Gateway]` — see
+/// `src/ai_queue.rs`'s module doc comment for the full scope boundary and
+/// the honest gaps (settings integration, log tail, PR diff) this round
+/// does not close.
+///
+/// `worker`'s `#[event(queue)]` macro requires this exact
+/// `(MessageBatch<T>, Env, Context)` signature returning
+/// `worker::Result<()>` (confirmed against worker-macros-0.8.7's
+/// `event.rs`: the `Queue` branch's generated glue calls
+/// `#input_fn_ident(MessageBatch::from(event), env, ctx).await` and
+/// `panic!`s on `Err`, which the Workers runtime treats as a failed
+/// invocation — triggering a retry under this consumer's own
+/// `max_retries = 3`, and `cloud-ci-analysis-dlq` once those are
+/// exhausted). A genuine processing error (a D1/R2 read failure)
+/// therefore propagates with `?` rather than being swallowed; an
+/// expected "over budget" or "nothing to summarize" skip is not an
+/// error and acks the message directly instead.
+#[event(queue)]
+async fn queue(
+    batch: worker::MessageBatch<ai_queue::AnalysisRequested>,
+    env: Env,
+    _ctx: Context,
+) -> Result<()> {
+    for message in batch.messages()? {
+        handle_analysis_requested(&env, message.body()).await?;
+        message.ack();
+    }
+    Ok(())
+}
+
+/// One `AnalysisRequested` message's processing — budget check, context
+/// assembly from the run's own canonical parsed reports, and a
+/// `pending_model_call` `ai_insight` row per selected fingerprint. See
+/// [`queue`]'s doc comment for the retry/ack posture.
+async fn handle_analysis_requested(env: &Env, message: &ai_queue::AnalysisRequested) -> Result<()> {
+    let db = env.d1("DB")?;
+    let today = ai_queue::utc_date_string(Date::now().as_millis() as i64);
+
+    #[derive(serde::Deserialize)]
+    struct UsageRow {
+        neuron_count: i64,
+    }
+    let usage_row: Option<UsageRow> = db
+        .prepare("SELECT neuron_count FROM ai_usage_daily WHERE repo_id = ?1 AND date = ?2")
+        .bind(&[
+            JsValue::from_f64(message.repo_id as f64),
+            JsValue::from_str(&today),
+        ])?
+        .first(None)
+        .await?;
+    let usage_so_far = usage_row.map(|r| r.neuron_count).unwrap_or(0);
+
+    if ai_queue::is_over_daily_cap(usage_so_far, ai_queue::PLACEHOLDER_DAILY_NEURON_CAP) {
+        worker::console_log!(
+            "ai: repo {} over daily budget ({usage_so_far}/{} neurons — placeholder cap, \
+             pending real settings integration, see ai_queue.rs module docs); \
+             skipping analysis for run {}",
+            message.repo_id,
+            ai_queue::PLACEHOLDER_DAILY_NEURON_CAP,
+            message.run_id,
+        );
+        return Ok(());
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ReportRef {
+        kind: String,
+        r2_key: String,
+    }
+    let reports: Vec<ReportRef> = db
+        .prepare(
+            "SELECT reports.kind AS kind, reports.r2_key AS r2_key \
+             FROM reports JOIN jobs ON reports.job_id = jobs.id \
+             WHERE jobs.run_id = ?1 AND reports.is_canonical = 1 AND reports.parsed = 1",
+        )
+        .bind(&[JsValue::from_str(&message.run_id)])?
+        .all()
+        .await?
+        .results()?;
+
+    let bucket = env.bucket("ASSETS")?;
+    let mut failing_tests = Vec::new();
+    for report in &reports {
+        let Some(object) = bucket.get(&report.r2_key).execute().await? else {
+            continue;
+        };
+        let Some(body) = object.body() else {
+            continue;
+        };
+        let bytes = body.bytes().await?;
+        failing_tests.extend(ai_queue::extract_failing_tests(&report.kind, &bytes));
+    }
+
+    let assembled =
+        ai_queue::assemble_failure_context(&failing_tests, ai_insight::DEFAULT_CONTEXT_WINDOW);
+
+    if assembled.entries.is_empty() {
+        worker::console_log!(
+            "ai: run {} has no failing-test data to summarize (no canonical parsed \
+             reports, or none had failures); skipping",
+            message.run_id,
+        );
+        return Ok(());
+    }
+
+    let now_ms = Date::now().as_millis();
+    for entry in &assembled.entries {
+        let id = ulid::generate(now_ms)
+            .map_err(|e| worker::Error::RustError(format!("ulid generation failed: {e}")))?;
+        let context_json = serde_json::to_string(&serde_json::json!({
+            "entry": entry,
+            "systemic": assembled.systemic,
+            "selected_fingerprints": assembled.selected_fingerprints,
+            "model_context_window": assembled.model_context_window,
+            "failing_tests_token_estimate": assembled.failing_tests_token_estimate,
+            "failing_tests_token_allotment": assembled.failing_tests_token_allotment,
+        }))
+        .map_err(|e| worker::Error::RustError(format!("encoding ai_insight context_json: {e}")))?;
+
+        db.prepare(
+            "INSERT INTO ai_insight \
+             (id, repo_id, run_id, kind, fingerprint, diff_hash, prompt_version, status, context_json, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, 'failure_summary', ?4, NULL, ?5, 'pending_model_call', ?6, ?7, ?7)",
+        )
+        .bind(&[
+            JsValue::from_str(&id),
+            JsValue::from_f64(message.repo_id as f64),
+            JsValue::from_str(&message.run_id),
+            JsValue::from_str(&entry.fingerprint),
+            // No `PROMPT_SUMMARY_V1` template exists yet (this module's
+            // scope boundary) — "unversioned" is an honest placeholder,
+            // not a real prompt version, until that template exists.
+            JsValue::from_str("unversioned"),
+            JsValue::from_str(&context_json),
+            JsValue::from_f64(now_ms as f64),
+        ])?
+        .run()
+        .await?;
+
+        worker::console_log!(
+            "ai: run {} ready for model call (fingerprint {}, systemic={}) — \
+             stored ai_insight {id} with status=pending_model_call",
+            message.run_id,
+            entry.fingerprint,
+            assembled.systemic,
+        );
+    }
+
+    Ok(())
 }
 
 /// Hand-routes each `cloud_ci.ingest.v1.IngestService` procedure to its
