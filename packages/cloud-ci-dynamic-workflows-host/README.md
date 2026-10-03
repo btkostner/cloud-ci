@@ -40,6 +40,13 @@ the full Dynamic Pipelines feature (`docs/design/dynamic-pipelines.md`).
    method and the real, partial result (completed-step persistence is
    proven; full run-to-completion survival is not, due to a local-dev
    limitation documented there).
+6. Loads a real `@cloud-ci/pipeline-sdk`-built script (not hand-rolled
+   `WorkflowEntrypoint` JS) end to end: `DynamicWorkflow`'s
+   `getEntrypoint()` call (`src/index.ts`) takes no entrypoint name, the
+   default export `@cloud-ci/pipeline-sdk`'s `workflow()` already
+   produces — see "SDK fixture: real end-to-end load and step-durability
+   verification" below for the real result, including the one genuine
+   adapter a loaded SDK script needs beyond `workflow()` itself.
 
 ## Container-from-Workflow-step access pattern (investigated this round)
 
@@ -206,3 +213,128 @@ version pin was left at 4.145.0 (the bump was reverted after the retest)
 since the newer version fixes nothing here. This limitation stays open;
 re-check again only once a future `wrangler` changelog actually mentions
 a Workflows sleep/timer/resume fix.
+
+## SDK fixture: real end-to-end load and step-durability verification
+
+`test/fixtures/pipeline-script-sdk.src.js` is a real pipeline script
+authored through `@cloud-ci/pipeline-sdk`'s public `workflow()`/
+`ci.check`/`ci.container` API — the first script this package loads that
+was not hand-rolled raw `WorkflowEntrypoint` JS.
+`test/fixtures/build-sdk-fixture.mjs` bundles it with esbuild into the
+committed, self-contained `pipeline-script-sdk.js` `POST /scripts` loads
+verbatim (see that file's module doc comment: the host still never
+transpiles or resolves imports for a loaded script itself — bundling
+happens at authoring time, outside the host). The two existing raw-JS
+fixtures are unchanged and keep proving the host supports non-SDK scripts
+too.
+
+### The host-side fix, and the real adapter beyond it
+
+`src/index.ts`'s `DynamicWorkflow` entrypoint changed
+`getEntrypoint("PipelineWorkflow")` → `getEntrypoint()` (no name — the
+default export, same one `POST /scripts` already calls `.fetch()` on).
+Verified against `@cloudflare/dynamic-workflows`'s actual
+`dist/types.d.ts`: `WorkflowRunner` is purely structural
+(`run(event, step): Promise<R>`), and `WorkerStub.getEntrypoint`'s `name`
+parameter is optional (`@cloudflare/workers-types`), returning the
+default export's stub when omitted — nothing requires a
+`WorkflowEntrypoint` subclass.
+
+That one-line change was **not** sufficient by itself. A real
+`wrangler dev` session (2026-10-02) surfaced a genuine runtime constraint
+neither package's types caught: `@cloudflare/dynamic-workflows`'s
+`dispatchWorkflow` always calls `runner.run(innerEvent, step)` with
+**two** arguments, and workerd's RPC layer rejects that on a plain,
+non-class exported object:
+
+```
+TypeError: Attempted to call RPC function "run" with the wrong number of
+arguments. When calling a top-level handler function that is not
+declared as part of a class, you must always send exactly one argument.
+In order to support variable numbers of arguments, the server must use
+class-based syntax (extending WorkerEntrypoint) instead.
+```
+
+`workflow()`'s own `fetch(request, env)` call from `POST /scripts` is
+unaffected — it is called with exactly **one** argument
+(`stub.getEntrypoint().fetch(tenantRequest)`), confirmed working against
+the real engine (returned a real `instanceId`) with no wrapper. Only
+`run`'s two-argument RPC call needed one: the fixture's actual default
+export is a trivial `WorkflowEntrypoint` subclass (`cloudflare:workers`)
+that forwards both calls straight to `workflow()`'s plain object —
+`fetch(request) { return pipeline.fetch(request, env); }`,
+`run(event, step) { return pipeline.run(event, step); }` — giving `run`
+the class-based calling convention multi-argument RPC requires, while
+`workflow()` itself stays the plain, `cloudflare:workers`-free object
+`@cloud-ci/pipeline-sdk`'s own unit tests construct outside a Workers
+runtime. This wrapper is the "real minimal adapter" a script built with
+this SDK needs beyond calling `workflow()` — see
+`pipeline-script-sdk.src.js`'s module doc comment for the full
+evidence trail. A second, independent bug surfaced in the same session
+and was fixed in `@cloud-ci/pipeline-sdk` itself: `workflow()`'s `fetch`
+read `instance.id` without `await`— fine against the package's own
+in-memory test fake (a plain object), but a real `Workflow` binding's
+`.create()` resolves to an RPC stub whose `id` getter is a remote
+property read, silently resolving to `undefined` without `await`
+(`JSON.stringify` then drops the key, so `POST /scripts` returned
+`{"scriptId": "..."}` with no `instanceId` at all). Fixed to
+`await instance.id`, matching what both raw-JS fixtures already did.
+
+### Real result: step-durability through the SDK's own `ci.container`
+
+Method: `pipeline-script-sdk.src.js` runs two sequential `ci.container`
+calls (`step-a` then `step-b`, `step-b`'s command structurally dependent
+on `step-a`'s own recorded `startedAt`) with a real (not fake)
+`ContainerExecutor` reaching the Rust `cloud-ci-worker`'s `ContainerProbe`
+over `CONTAINER_WORKER` — the same proven chain `pipeline-script.js`
+uses. A bare, non-durable `await new Promise(setTimeout, ...)` sits
+between the two `ci.container` calls, in the script's plain `run`
+function body outside any `step.do` — deliberately, to give a real,
+easily-hittable window for a forced reload (same `touch src/index.ts`
+technique as "Isolate-recycle verification" above).
+
+Against a real `wrangler dev` session with Docker running: `step-a`
+completed (`step.do("container:step-a", ...)` recorded
+`{"startedAt":1790989774786, ...}`, confirmed via
+`GET /instances/:id`), then `touch src/index.ts` was run during the bare
+wait, producing the same real
+"⎔ Reloading local server... ⎔ Local server updated and ready" log as
+before. **Real result:** `step-a`'s recorded `startedAt` was unchanged
+across repeated polling after the reload — the injected
+`ContainerExecutor` was not invoked a second time for `step-a`, exactly
+`step.do`'s real, documented persistence contract, now proven through the
+SDK's own `ci.container` call instead of a raw `step.do`. An identical
+un-reloaded control run completed normally end to end in ~20.5 seconds,
+recording two distinct `startedAt` values (`1790991655937` and
+`1790991676441`, ~20.5s apart, matching the deliberate wait), confirming
+the fixture itself is correct independent of the reload.
+
+**But**, matching this package's own documented, pre-existing limitation
+for `step.sleep` above: the reloaded instance never resumed past the bare
+wait — it stayed `"running"` with only `step-a`'s output recorded for
+over 2 minutes after the reload (checked again after an additional 60
+seconds), the same failure signature as `pause-for-recycle-window`'s
+stuck sleep. This is consistent, not a new defect: a bare, non-durable
+`await` inside `run()` has even less protection than `step.sleep` (which
+at least is a Workflows-engine primitive) — when the isolate executing it
+is torn down by a hot reload, there is nothing durable for the engine to
+resume into. Full run-to-completion survival across a reload therefore
+stays **unproven locally** for the SDK path too, for the same open
+`wrangler dev` 4.145.0 local-dev limitation documented above;
+already-completed step persistence is **proven**, same honest split as the
+raw-JS fixture's result.
+
+### Reproducing this
+
+```sh
+npm run build:fixture
+mise run //packages/cloud-ci-dynamic-workflows-host:dev
+curl -s -X POST http://127.0.0.1:8787/scripts \
+  -H "content-type: application/json" \
+  -d "{\"script\": $(node -e 'console.log(JSON.stringify(require("fs").readFileSync("test/fixtures/pipeline-script-sdk.js", "utf8")))'), \"params\": {\"event\": {\"kind\": \"push\"}, \"changedFiles\": [], \"branch\": \"main\", \"labels\": []}}"
+```
+
+Poll `GET /instances/:id` the same way as the other fixtures; touch
+`src/index.ts` while `step-a`'s output is already recorded (within the
+20-second window after it completes) to repeat the reload test above.
+

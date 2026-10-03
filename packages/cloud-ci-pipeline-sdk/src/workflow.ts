@@ -94,7 +94,19 @@ export function workflow(
     async fetch(request, env) {
       const params = (await request.json()) as PipelineRunParams;
       const instance = await env.WORKFLOWS.create({ params });
-      return Response.json({ id: instance.id });
+      // `instance.id` must be awaited: a real `Workflow` binding's
+      // `.create()` resolves to an RPC stub (`InstanceStub` in
+      // `@cloudflare/dynamic-workflows`'s `wrapWorkflowBinding`), whose
+      // `id` getter is a remote property read — synchronous access
+      // resolves to `undefined` over the wire. Confirmed against a real
+      // `wrangler dev` session 2026-10-02: without this `await`,
+      // `POST /scripts` silently dropped `instanceId` from its response
+      // (`JSON.stringify` omits an `undefined` property) while the
+      // in-memory `WorkflowBindingLike` fake in `test/workflow.test.ts`
+      // (a plain, non-RPC object) masked the bug there. Both existing
+      // raw-JS fixtures (`pipeline-script.js`/`pipeline-script-dag.js`)
+      // already `await instance.id` for exactly this reason.
+      return Response.json({ id: await instance.id });
     },
 
     async run(event, step) {

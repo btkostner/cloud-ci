@@ -42,19 +42,24 @@ again" — and asserts a fake `ContainerExecutor`'s call count stays at 1
 across two `ci.container` calls with the same id within one simulated
 replay.
 
-**What is explicitly deferred, distinct from this package's own tested
-logic:** integration-level step-durability against the *real* Workflows
-engine (a local `wrangler dev` session, proving `step.do` itself persists
-across a forced isolate reload) is not re-proven in this package.
-`cloud-ci-dynamic-workflows-host`'s own README already carries that real
-result for the underlying primitive (`step1-plan`'s recorded output
-surviving a forced `wrangler dev` reload, see its "Isolate-recycle
-verification" section) — this package's test suite builds on that proven
-primitive via a faithful in-memory fake rather than re-running a `wrangler
-dev` session, since the primitive itself is not this package's to
-re-verify. If `step.do`'s real persistence semantics ever change, that
-package's README is the place that would need re-verification, not this
-one.
+**Unit-test scope vs. this round's real-engine proof:** the unit suite
+above deliberately stays against the fake — fast, deterministic,
+no `wrangler dev`/Docker dependency for every `vitest run`. The real
+engine proof instead lives where a loaded script actually runs:
+`cloud-ci-dynamic-workflows-host`'s
+`test/fixtures/pipeline-script-sdk.src.js` calls this exact
+`ci.container` API against a real (not fake) `ContainerExecutor`, through
+a real local `wrangler dev` + `@cloudflare/dynamic-workflows` session —
+see that package's README's "SDK fixture: real end-to-end load and
+step-durability verification" section for the full method and result
+(completed-step persistence across a forced reload: proven; full
+run-to-completion survival: not, due to a documented pre-existing local-
+dev limitation). `step.do`'s own primitive-level persistence was already
+proven independently for the underlying primitive in that package's
+"Isolate-recycle verification" section (`step1-plan`'s recorded output
+surviving a forced `wrangler dev` reload) — this round proved the same
+contract again through this package's own `ci.container` call, not just
+the raw primitive.
 
 ## `ci.container`'s two-step design vs. this round's one step
 
@@ -91,7 +96,7 @@ Ordinary `.cloud-ci/pipelines/*.ts` scripts never see or pass this — they
 only ever call `workflow({ on, run })`. `WorkflowDependencies` (the second,
 optional argument) exists purely as a test/integration seam.
 
-## `workflow()`'s adapter shape, and the one piece of follow-up glue
+## `workflow()`'s adapter shape, and the host-side load path (confirmed 2026-10-02)
 
 `workflow({ on, run })` returns a single object meant to be a script's
 `export default`:
@@ -101,47 +106,77 @@ export default workflow({ on: {...}, async run(ci) { ... } });
 ```
 
 That object is dual-purpose, matching the two roles
-`cloud-ci-dynamic-workflows-host`'s current code already calls on a loaded
-script's exports:
+`cloud-ci-dynamic-workflows-host`'s code calls on a loaded script's
+exports:
 
-- **`fetch(request, env)`** — same shape as both of that package's existing
-  test fixtures' default export: parses the posted params as the run's
-  `PipelineRunParams` and calls `env.WORKFLOWS.create({ params })`,
-  returning `{ id }`. `POST /scripts` already calls
-  `stub.getEntrypoint().fetch(tenantRequest)` — the *default* entrypoint —
-  so this half needs no host-side change.
+- **`fetch(request, env)`** — same shape as both of that package's
+  hand-rolled test fixtures' default export: parses the posted params as
+  the run's `PipelineRunParams` and calls `env.WORKFLOWS.create({
+  params })`, returning `{ id }`. `POST /scripts` calls
+  `stub.getEntrypoint().fetch(tenantRequest)` — the *default* entrypoint,
+  called with exactly one argument.
 - **`run(event, step)`** — satisfies `@cloudflare/dynamic-workflows`'s
   `WorkflowRunner` shape (`run(event, step): Promise<R>`) directly: builds
   a `CiContext` from `event.payload`, calls the script's `run(ci)`, then
   seals every check left unsealed.
 
-**The follow-up glue needed, stated explicitly rather than guessed
-silently:** `cloud-ci-dynamic-workflows-host/src/index.ts`'s
-`DynamicWorkflow` entrypoint currently loads the Workflow-step runner via
-`loadScript(env, metadata).getEntrypoint("PipelineWorkflow")` — it asks for
-a **named** export of a class called `PipelineWorkflow`. Both of that
-package's current test fixtures (plain JS, not using this SDK) satisfy
-that by declaring `export class PipelineWorkflow extends
-WorkflowEntrypoint { ... }` *alongside* a separate `export default { fetch
-}`. An SDK-built script's single `export default workflow(...)` statement
-cannot produce a second named export the way those fixtures do — ESM has
-exactly one default export per module — and `workflow()`'s returned object
-is a plain object, not a `WorkflowEntrypoint` subclass, since this package
-has no reason to depend on `cloudflare:workers` runtime classes to run its
-own unit tests outside a Workers runtime.
+**This is genuinely wired up and proven end to end**, not just typed
+compatibly: `cloud-ci-dynamic-workflows-host/src/index.ts`'s
+`DynamicWorkflow` entrypoint loads the Workflow-step runner via
+`loadScript(env, metadata).getEntrypoint()` — no entrypoint name, the
+*default* export, the same one `POST /scripts` already uses for `fetch`.
+`@cloudflare/dynamic-workflows`'s `WorkflowRunner` type is purely
+structural (checked against its actual `dist/types.d.ts`,
+2026-10-02) and `getEntrypoint()`'s `name` parameter is optional
+(`@cloudflare/workers-types`) — nothing requires a `WorkflowEntrypoint`
+subclass for this call.
 
-Because `workflow()`'s default export already implements `run(event,
-step)` matching `WorkflowRunner` directly, loading an SDK-built script only
-needs a **one-line change** on the host side:
-`getEntrypoint("PipelineWorkflow")` → `getEntrypoint()` (the default
-entrypoint, the same one `POST /scripts` already uses for `fetch`). That
-change — and rewriting `cloud-ci-dynamic-workflows-host`'s test fixtures to
-use this SDK instead of raw inline JS — is explicitly **not** made this
-round: it touches a sibling package's loader and its existing fixtures,
-both out of this round's stated scope ("do NOT rewrite the existing
-fixtures or touch that package's existing tests this round"). This is the
-one adapter-glue gap between what this package builds and a real script
-actually loading end-to-end through that host today.
+**One real adapter a loaded script needs beyond calling `workflow()`,
+discovered against a real `wrangler dev` session (not assumed):**
+`@cloudflare/dynamic-workflows`'s `dispatchWorkflow` always calls
+`runner.run(innerEvent, step)` with **two** arguments, and workerd's RPC
+layer rejects that on a plain, non-class exported object — confirmed by
+the exact runtime error (`"Attempted to call RPC function \"run\" with
+the wrong number of arguments ... the server must use class-based syntax
+(extending WorkerEntrypoint) instead"`), while `fetch`'s one-argument RPC
+call works on the same plain object with no wrapper (confirmed: a real
+`POST /scripts` call against an SDK-built script returned a real
+`instanceId`). So a script loaded by `cloud-ci-dynamic-workflows-host`
+wraps `workflow()`'s result in a trivial `WorkflowEntrypoint` subclass
+that forwards both calls — `fetch(request) { return pipeline.fetch(request,
+env); }`, `run(event, step) { return pipeline.run(event, step); }` — giving
+`run` the class-based calling convention multi-argument RPC requires,
+while `workflow()` itself stays exactly as it is: a plain,
+`cloudflare:workers`-free object this package's own unit tests construct
+outside a Workers runtime. See
+`cloud-ci-dynamic-workflows-host/test/fixtures/pipeline-script-sdk.src.js`
+for the real, working example of this wrapper and
+`cloud-ci-dynamic-workflows-host/README.md`'s "SDK fixture: real
+end-to-end load and step-durability verification" section for the full
+evidence trail, including a second bug this round's real-engine proof
+caught and fixed in this package itself: `workflow()`'s `fetch` used to
+read `instance.id` without `await`, which worked against this package's
+own in-memory test fake (a plain, synchronous object) but silently
+dropped `instanceId` from `POST /scripts`'s real response, since a real
+`Workflow` binding's `.create()` resolves to an RPC stub whose `id`
+getter is a remote property read. Fixed to `await instance.id`, matching
+what `cloud-ci-dynamic-workflows-host`'s raw-JS fixtures already did.
+
+**The real, proven result, against the actual local `wrangler dev` +
+`@cloudflare/dynamic-workflows` engine (not the in-memory
+`FakeWorkflowStep` this package's own unit tests use):** an SDK-built
+script's `ci.container` call is backed by `step.do`'s real persistence —
+a completed container step's recorded result survives a forced
+`wrangler dev` reload (`touch src/index.ts`, the same technique
+`cloud-ci-dynamic-workflows-host`'s own isolate-recycle investigation
+used) without the injected `ContainerExecutor` being invoked a second
+time. Full run-to-completion survival across that same reload is **not**
+proven — the same pre-existing `wrangler dev` 4.145.0 local-dev
+wake-timer limitation that package's README already documents for
+`step.sleep` blocks it here too, for an analogous reason (see that
+README section for the precise, honest split between what is and isn't
+proven).
+
 
 ## Explicitly out of scope this round
 
@@ -198,10 +233,14 @@ Each of these is a real, named gap — not a silent omission:
   proof through the public `workflow()` surface (not just `runContainer`
   directly).
 
-No integration test against a real `wrangler dev` Workflows engine was run
-for this package specifically — see "The step-durability contract, and
-what is and isn't proven this round" above for why that's a reasonable,
-explicitly-stated boundary rather than a silent gap: the underlying
-`step.do` primitive's real persistence is already proven in
-`cloud-ci-dynamic-workflows-host`, and this package only adds ordinary,
-directly-testable logic around a call to that primitive.
+No integration test against a real `wrangler dev` Workflows engine runs as
+part of this package's own `vitest run` — that proof instead lives in
+`cloud-ci-dynamic-workflows-host`'s
+`test/fixtures/pipeline-script-sdk.src.js`, a real script built with this
+SDK's `workflow()`/`ci.container`, run against a real local `wrangler dev`
+session (see "The step-durability contract" above and that package's
+README's "SDK fixture: real end-to-end load and step-durability
+verification" section for the full method and result). This package's own
+unit suite stays against a faithful in-memory fake for speed and
+determinism; the real-engine proof lives where a loaded script actually
+runs, not duplicated into every `vitest run` here.

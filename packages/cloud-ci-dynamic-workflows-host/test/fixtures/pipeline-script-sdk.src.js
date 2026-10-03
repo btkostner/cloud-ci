@@ -20,19 +20,36 @@
 // time, outside the host, which still never transpiles or resolves
 // imports for a loaded script itself.
 //
-// `workflow()`'s `run(event, step)` is a plain object method called over
-// `getEntrypoint()` RPC (see ../../src/index.ts), not a `WorkerEntrypoint`
-// subclass constructor — there is no `this.env`. The real binding-access
-// mechanism for a plain-object entrypoint is `cloudflare:workers`'s
-// exported live `env` accessor
+// `workflow()`'s returned object implements `run(event, step)` directly,
+// but a *plain object* cannot be the thing `getEntrypoint()` hands back to
+// `@cloudflare/dynamic-workflows`'s `dispatchWorkflow`, which always calls
+// `runner.run(innerEvent, step)` with **two** arguments. Confirmed against
+// a real `wrangler dev` session 2026-10-02: workerd's RPC layer rejects a
+// plain top-level (non-class) exported function called with more than one
+// argument — `"Attempted to call RPC function \"run\" with the wrong
+// number of arguments ... the server must use class-based syntax
+// (extending WorkerEntrypoint) instead"` — while the *one*-argument
+// `fetch(request)` call `POST /scripts` makes works fine on the same
+// plain object (confirmed by the same session: `POST /scripts` against
+// this exact fixture returned a real `instanceId`). So the minimal real
+// adapter a script needs, beyond `workflow()` itself, is this thin
+// `WorkflowEntrypoint` subclass: it forwards to the SDK's plain object,
+// giving `run` the class-based RPC calling convention multi-argument
+// calls require, while `workflow()` itself stays a plain, `cloudflare:
+// workers`-free object the SDK's own unit tests can construct outside a
+// Workers runtime (see that package's README).
+//
+// `workflow()`'s `run(event, step)`/`fetch(request, env)` never see
+// `this.env` themselves (they are plain functions, not class methods) —
+// the real binding-access mechanism this fixture uses instead is
+// `cloudflare:workers`'s exported live `env` accessor
 // (developers.cloudflare.com/workers/runtime-apis/bindings/#cloudflareworkers-env,
 // checked 2026-10-02): a module-scope import, resolved per-call by the
 // runtime rather than snapshotted once, so it stays correct across an
 // isolate recycle the same way `this.env` would inside a class — this is
 // what lets `workflow(opts, { executor })`'s real `ContainerExecutor` be
-// built once at module scope below instead of needing special per-call env
-// plumbing the SDK's `WorkflowRunner`/`ContainerExecutor` types don't
-// carry.
+// built once at module scope below instead of needing env threaded
+// through the wrapper class.
 //
 // Shape: two sequential `ci.container` steps with a real dependency —
 // `step-b`'s command embeds `step-a`'s own recorded result
@@ -57,7 +74,7 @@
 // package's "Isolate-recycle verification" section already proved for
 // `pipeline-script.js`'s `step1-plan`, now proved again through the SDK's
 // own `ci.container` call instead of a raw `step.do`.
-import { env } from "cloudflare:workers";
+import { env, WorkflowEntrypoint } from "cloudflare:workers";
 import { workflow } from "@cloud-ci/pipeline-sdk";
 
 /** Real (not fake) `ContainerExecutor`: calls back into the Rust
@@ -85,7 +102,7 @@ const executor = {
   },
 };
 
-export default workflow(
+const pipeline = workflow(
   {
     on: { push: true },
     async run(ci) {
@@ -120,3 +137,18 @@ export default workflow(
   },
   { executor },
 );
+
+// The real adapter a loaded script needs beyond `workflow()` itself — see
+// module doc comment above for exactly why (`run`'s 2-argument RPC call
+// requires class-based syntax; `fetch`'s 1-argument call does not). A
+// thin forwarding shim, not a reimplementation: every call delegates
+// straight to `pipeline`, the SDK's own real, tested `fetch`/`run`.
+export default class extends WorkflowEntrypoint {
+  fetch(request) {
+    return pipeline.fetch(request, env);
+  }
+
+  run(event, step) {
+    return pipeline.run(event, step);
+  }
+}

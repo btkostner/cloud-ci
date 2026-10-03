@@ -5,7 +5,7 @@
 // comment). Re-run `npm run build:fixture` after editing the `.src.js` file.
 
 // test/fixtures/pipeline-script-sdk.src.js
-import { env } from "cloudflare:workers";
+import { env, WorkflowEntrypoint } from "cloudflare:workers";
 
 // ../cloud-ci-pipeline-sdk/src/errors.ts
 var CheckSealedError = class extends Error {
@@ -156,7 +156,7 @@ function workflow(opts, deps = {}) {
     async fetch(request, env2) {
       const params = await request.json();
       const instance = await env2.WORKFLOWS.create({ params });
-      return Response.json({ id: instance.id });
+      return Response.json({ id: await instance.id });
     },
     async run(event, step) {
       const payload = event.payload;
@@ -194,7 +194,7 @@ var executor = {
     };
   }
 };
-var pipeline_script_sdk_src_default = workflow(
+var pipeline = workflow(
   {
     on: { push: true },
     async run(ci) {
@@ -215,6 +215,14 @@ var pipeline_script_sdk_src_default = workflow(
   },
   { executor }
 );
+var pipeline_script_sdk_src_default = class extends WorkflowEntrypoint {
+  fetch(request) {
+    return pipeline.fetch(request, env);
+  }
+  run(event, step) {
+    return pipeline.run(event, step);
+  }
+};
 export {
   pipeline_script_sdk_src_default as default
 };
