@@ -37,8 +37,9 @@ use cloud_ci_proto::ingest::v1::{
     BeginRunRequest, BeginRunResponse, CompleteShardRequest, CompleteShardResponse,
     CompleteUploadRequest, CompleteUploadResponse, CreateUploadRequest, CreateUploadResponse,
     FileTiming, GetRunRequest, GetRunResponse, GetTestTimingsRequest, GetTestTimingsResponse,
-    ResolveShardPlanRequest, StartJobRequest, StartJobResponse, SubmitReportRequest,
-    SubmitReportResponse, SubmitResourceSamplesRequest, SubmitResourceSamplesResponse,
+    RegisterShardGroupRequest, RegisterShardGroupResponse, ResolveShardPlanRequest,
+    StartJobRequest, StartJobResponse, SubmitReportRequest, SubmitReportResponse,
+    SubmitResourceSamplesRequest, SubmitResourceSamplesResponse,
 };
 use connect::{Code, Codec, ConnectError, NegotiationError, negotiate};
 use coordinator::{CoordinatorError, RunCoordinatorStore};
@@ -998,6 +999,9 @@ async fn route(
             handle_start_job(codec, body, env, bearer).await
         }
         "/cloud_ci.ingest.v1.IngestService/GetRun" => handle_get_run(codec, body, env).await,
+        "/cloud_ci.ingest.v1.IngestService/RegisterShardGroup" => {
+            handle_register_shard_group(codec, body, env, bearer).await
+        }
         "/cloud_ci.ingest.v1.IngestService/GetTestTimings" => {
             handle_get_test_timings(codec, body, env, bearer).await
         }
@@ -1286,6 +1290,51 @@ async fn handle_start_job(
 
     let resp = StartJobResponse {
         job_id: outcome.job_id,
+        ..Default::default()
+    };
+    codec.encode(&resp)
+}
+
+/// `RegisterShardGroup` is the public `IngestService` counterpart to
+/// `coordinator::mod::RegisterShardGroupRequest`'s existing internal
+/// `/register-shard-group` Durable Object route — docs/design/
+/// parallelization.md's "Shard groups / merge barrier" section documents
+/// that gap exactly: no public RPC let a managed run's `ci.shard` reach
+/// it, so `ShardOptions.reports` had no real call to make. Auth is
+/// identical to every other run-bound ingest call
+/// ([`handle_start_job`]'s own doc comment, docs/design/auth.md's Machine
+/// auth section): the ingest token minted by `BeginRun` must carry this
+/// exact `run_id`, cross-checked against the run `run_id` actually
+/// resolves to via D1, never trusted from the request alone. `run_id`
+/// itself only resolves routing/auth here — the forwarded internal
+/// request carries just `job_name`/`expected_total`/`fail_fast`/
+/// `merge_on_failure`, identical in shape to the internal route's own
+/// request, and inherits that route's idempotency (a redelivered call for
+/// an already-registered `job_name` is a clean no-op) and validation (an
+/// unknown `merge_on_failure` value is a 400) unchanged.
+async fn handle_register_shard_group(
+    codec: Codec,
+    body: &[u8],
+    env: &Env,
+    bearer: Option<&str>,
+) -> std::result::Result<Vec<u8>, ConnectError> {
+    let req: RegisterShardGroupRequest = codec.decode(body)?;
+    let claims = authenticate_ingest_bearer(env, bearer)?;
+    let identity = resolve_run_identity(env, &req.run_id).await?;
+    require_matching_identity(&claims, &identity)?;
+    let store = RunCoordinatorStore::new(env, &identity.do_name).map_err(coordinator_error)?;
+    let outcome = store
+        .register_shard_group(&coordinator::RegisterShardGroupRequest {
+            job_name: req.job_name,
+            expected_total: req.expected_total,
+            fail_fast: req.fail_fast,
+            merge_on_failure: req.merge_on_failure,
+        })
+        .await
+        .map_err(coordinator_error)?;
+
+    let resp = RegisterShardGroupResponse {
+        job_name: outcome.job_name,
         ..Default::default()
     };
     codec.encode(&resp)
@@ -2387,6 +2436,75 @@ mod tests {
             coordinator_error(CoordinatorError::Internal("x".into())).code,
             Code::Internal
         );
+    }
+
+    // `require_matching_identity` is the exact mechanism every run-bound
+    // ingest RPC uses for the "wrong run" / "cross-run" auth check
+    // (`StartJob`, `SubmitReport`, `SubmitResourceSamples`, `CompleteShard`,
+    // and now `RegisterShardGroup`, which reuses it unchanged) — see its own
+    // doc comment and docs/design/auth.md's Machine auth section: "a token
+    // valid for one run authorizes nothing for a different run, even under
+    // the same repo." `authenticate_ingest_bearer`'s own "missing bearer"
+    // branch (→ `Code::Unauthenticated`, HTTP 401 per
+    // `connect::tests::http_status_matches_connect_spec`) returns before
+    // ever touching `Env`, but `Env` itself is an opaque Workers-runtime
+    // type this crate's plain `cargo test` has no way to construct, so that
+    // branch — and the full HTTP-wired 401/403 round trip — needs a live
+    // `wrangler dev` smoke test, not a unit test.
+
+    #[test]
+    fn require_matching_identity_accepts_a_matching_run_and_repo() {
+        let claims = ingest_token::VerifiedClaims {
+            repo_id: 42,
+            run_id: "run-1".to_string(),
+        };
+        let identity = JobRunIdentity {
+            do_name: "do-1".to_string(),
+            repo_id: 42,
+            run_id: "run-1".to_string(),
+        };
+        assert!(require_matching_identity(&claims, &identity).is_ok());
+    }
+
+    #[test]
+    fn require_matching_identity_rejects_a_token_scoped_to_a_different_run() -> Result<(), String> {
+        // Cross-run rejection: same repo, different run — e.g. a token
+        // minted for one `RegisterShardGroup`-eligible run presented
+        // against a different run's `run_id`.
+        let claims = ingest_token::VerifiedClaims {
+            repo_id: 42,
+            run_id: "run-1".to_string(),
+        };
+        let identity = JobRunIdentity {
+            do_name: "do-2".to_string(),
+            repo_id: 42,
+            run_id: "run-2".to_string(),
+        };
+        let Err(err) = require_matching_identity(&claims, &identity) else {
+            return Err("expected a mismatched run to be rejected".to_string());
+        };
+        assert_eq!(err.code, Code::PermissionDenied);
+        assert_eq!(err.code.http_status(), 403);
+        Ok(())
+    }
+
+    #[test]
+    fn require_matching_identity_rejects_a_token_scoped_to_a_different_repo() -> Result<(), String>
+    {
+        let claims = ingest_token::VerifiedClaims {
+            repo_id: 1,
+            run_id: "run-1".to_string(),
+        };
+        let identity = JobRunIdentity {
+            do_name: "do-1".to_string(),
+            repo_id: 2,
+            run_id: "run-1".to_string(),
+        };
+        let Err(err) = require_matching_identity(&claims, &identity) else {
+            return Err("expected a mismatched repo to be rejected".to_string());
+        };
+        assert_eq!(err.code, Code::PermissionDenied);
+        Ok(())
     }
 
     #[test]

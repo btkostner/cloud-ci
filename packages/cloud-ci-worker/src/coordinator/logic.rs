@@ -1192,7 +1192,17 @@ pub fn resolve_submit_resource_samples(
 /// of the decoded fields instead (same length-prefixing discipline
 /// `coordinator::do_name` already uses, for the same "two different
 /// inputs must never collide" reason) is codec-independent by
-/// construction.
+/// construction. `node_id` folds in via the same `push_len_prefixed`
+/// framing as `job_id`/`instance_type` above, normalizing an absent value
+/// to an empty string first (`unwrap_or("")`) rather than a separate
+/// presence flag -- `SubmitResourceSamplesRequest.node_id`'s own doc
+/// comment (`cloud-ci-proto`) requires an unset value and an explicit
+/// empty one to "be treated identically", which this framing gives for
+/// free: both hash exactly like a zero-length `job_id` would. An old
+/// agent (which never sends this field) and a redelivery that only later
+/// started sending an empty string therefore resolve to the exact same
+/// identity -- never a spurious conflict.
+#[allow(clippy::too_many_arguments)]
 pub fn resource_sample_batch_content_hash(
     job_id: &str,
     shard_index: u32,
@@ -1200,6 +1210,7 @@ pub fn resource_sample_batch_content_hash(
     instance_type: &str,
     memory_peak_bytes: Option<u64>,
     oom_detected: bool,
+    node_id: Option<&str>,
     samples: &[ResourceSampleInput],
 ) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -1210,6 +1221,7 @@ pub fn resource_sample_batch_content_hash(
     buf.extend_from_slice(&memory_peak_bytes.unwrap_or(u64::MAX).to_le_bytes());
     buf.push(u8::from(memory_peak_bytes.is_some()));
     buf.push(u8::from(oom_detected));
+    push_len_prefixed(&mut buf, node_id.unwrap_or("").as_bytes());
     buf.extend_from_slice(&(samples.len() as u64).to_le_bytes());
     for sample in samples {
         buf.extend_from_slice(&sample.timestamp_unix_ms.to_le_bytes());
@@ -1413,6 +1425,37 @@ impl MergeOnFailure {
             "never" => Some(MergeOnFailure::Never),
             _ => None,
         }
+    }
+}
+
+/// What `registerShardGroup` should do, given whether a `job_group` row
+/// already exists for this `job_name` — `coordinator::mod::
+/// handle_register_shard_group`'s own doc comment: "a redelivered call
+/// for an already-registered `job_name` is a clean no-op (existing config
+/// untouched), never a conflict — nothing in parallelization.md documents
+/// a config-mismatch rejection the way `StartJob`'s `shard_total`/
+/// `BeginRun`'s `expect_jobs` do". Deliberately total over only
+/// `existing`, not the incoming fields: a reordered or duplicate
+/// redelivery (same `job_name`, any field values, arriving in any order)
+/// always resolves to [`AlreadyRegistered`](RegisterShardGroupDecision::AlreadyRegistered)
+/// once a row exists, so two concurrent `RegisterShardGroup` calls racing
+/// for the same never-yet-registered group can never both decide
+/// [`Insert`](RegisterShardGroupDecision::Insert) against a row that only
+/// one of them actually created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegisterShardGroupDecision {
+    /// No `job_group` row exists yet for this `job_name` — the caller
+    /// should insert one.
+    Insert,
+    /// A row already exists — a no-op; its config is left untouched.
+    AlreadyRegistered,
+}
+
+pub fn resolve_register_shard_group(existing: bool) -> RegisterShardGroupDecision {
+    if existing {
+        RegisterShardGroupDecision::AlreadyRegistered
+    } else {
+        RegisterShardGroupDecision::Insert
     }
 }
 
@@ -2378,6 +2421,7 @@ mod tests {
             "standard-2",
             Some(2048),
             false,
+            None,
             &samples,
         );
         let b = resource_sample_batch_content_hash(
@@ -2387,6 +2431,7 @@ mod tests {
             "standard-2",
             Some(2048),
             false,
+            None,
             &samples,
         );
         assert_eq!(a, b);
@@ -2413,6 +2458,7 @@ mod tests {
             "standard-2",
             Some(2048),
             false,
+            None,
             &samples_a,
         );
         let b = resource_sample_batch_content_hash(
@@ -2422,6 +2468,7 @@ mod tests {
             "standard-2",
             Some(2048),
             false,
+            None,
             &samples_b,
         );
         assert_ne!(a, b);
@@ -2431,10 +2478,85 @@ mod tests {
     fn content_hash_distinguishes_unset_peak_from_a_genuine_zero_peak() {
         let samples: Vec<ResourceSampleInput> = vec![];
         let unset =
-            resource_sample_batch_content_hash("job-1", 0, 1, "basic", None, false, &samples);
-        let zero =
-            resource_sample_batch_content_hash("job-1", 0, 1, "basic", Some(0), false, &samples);
+            resource_sample_batch_content_hash("job-1", 0, 1, "basic", None, false, None, &samples);
+        let zero = resource_sample_batch_content_hash(
+            "job-1",
+            0,
+            1,
+            "basic",
+            Some(0),
+            false,
+            None,
+            &samples,
+        );
         assert_ne!(unset, zero);
+    }
+
+    #[test]
+    fn content_hash_treats_absent_node_id_identically_to_empty_string() {
+        // `SubmitResourceSamplesRequest.node_id`'s own doc comment
+        // (`cloud-ci-proto`): "an unset (or empty) value is treated
+        // identically" -- an old agent that never sends this field must
+        // hash exactly like a new agent that explicitly sends `""`, so
+        // neither ever looks like a conflicting batch against the other.
+        let samples: Vec<ResourceSampleInput> = vec![];
+        let absent =
+            resource_sample_batch_content_hash("job-1", 0, 1, "basic", None, false, None, &samples);
+        let empty = resource_sample_batch_content_hash(
+            "job-1",
+            0,
+            1,
+            "basic",
+            None,
+            false,
+            Some(""),
+            &samples,
+        );
+        assert_eq!(absent, empty);
+    }
+
+    #[test]
+    fn content_hash_differs_for_a_real_node_id() {
+        let samples: Vec<ResourceSampleInput> = vec![];
+        let no_node =
+            resource_sample_batch_content_hash("job-1", 0, 1, "basic", None, false, None, &samples);
+        let with_node = resource_sample_batch_content_hash(
+            "job-1",
+            0,
+            1,
+            "basic",
+            None,
+            false,
+            Some("shard:job-1:0:1"),
+            &samples,
+        );
+        assert_ne!(no_node, with_node);
+    }
+
+    #[test]
+    fn content_hash_differs_between_two_distinct_node_ids() {
+        let samples: Vec<ResourceSampleInput> = vec![];
+        let node_a = resource_sample_batch_content_hash(
+            "job-1",
+            0,
+            1,
+            "basic",
+            None,
+            false,
+            Some("node-a"),
+            &samples,
+        );
+        let node_b = resource_sample_batch_content_hash(
+            "job-1",
+            0,
+            1,
+            "basic",
+            None,
+            false,
+            Some("node-b"),
+            &samples,
+        );
+        assert_ne!(node_a, node_b);
     }
 
     #[test]
@@ -3437,6 +3559,63 @@ mod tests {
         assert_eq!(deduped[0].test_id, "a");
         assert_eq!(deduped[0].duration_ms, 10);
         assert_eq!(deduped[1].test_id, "b");
+    }
+
+    #[test]
+    fn merge_on_failure_from_db_str_accepts_all_three_documented_values() {
+        assert_eq!(
+            MergeOnFailure::from_db_str("if_any_passed"),
+            Some(MergeOnFailure::IfAnyPassed)
+        );
+        assert_eq!(
+            MergeOnFailure::from_db_str("always"),
+            Some(MergeOnFailure::Always)
+        );
+        assert_eq!(
+            MergeOnFailure::from_db_str("never"),
+            Some(MergeOnFailure::Never)
+        );
+    }
+
+    #[test]
+    fn merge_on_failure_from_db_str_rejects_a_malformed_value() {
+        // `handle_register_shard_group`'s own validation: an unknown
+        // `merge_on_failure` string (typo, wrong case, empty) is a 400,
+        // never silently coerced to the default.
+        assert_eq!(MergeOnFailure::from_db_str("IfAnyPassed"), None);
+        assert_eq!(MergeOnFailure::from_db_str("sometimes"), None);
+        assert_eq!(MergeOnFailure::from_db_str(""), None);
+    }
+
+    #[test]
+    fn resolve_register_shard_group_inserts_when_no_row_exists() {
+        assert_eq!(
+            resolve_register_shard_group(false),
+            RegisterShardGroupDecision::Insert
+        );
+    }
+
+    #[test]
+    fn resolve_register_shard_group_is_a_noop_for_a_duplicate_delivery() {
+        assert_eq!(
+            resolve_register_shard_group(true),
+            RegisterShardGroupDecision::AlreadyRegistered
+        );
+    }
+
+    #[test]
+    fn resolve_register_shard_group_reordered_delivery_still_resolves_to_the_same_decision() {
+        // A "reordered" delivery here means: by the time either call is
+        // actually evaluated against storage, a row may or may not exist
+        // yet, regardless of which `RegisterShardGroup` call was issued
+        // first by the caller -- the decision depends only on current
+        // storage state (`existing`), never on delivery order, so
+        // evaluating the same `existing` twice (simulating two redelivered
+        // calls racing to observe the same storage snapshot) always agrees.
+        let first = resolve_register_shard_group(true);
+        let second = resolve_register_shard_group(true);
+        assert_eq!(first, second);
+        assert_eq!(first, RegisterShardGroupDecision::AlreadyRegistered);
     }
 
     fn row(idx: u32, attempt: u32, status: ShardTerminalStatus) -> ShardStateRow {

@@ -2002,6 +2002,7 @@ impl RunCoordinator {
             &req.instance_type,
             req.memory_peak_bytes,
             req.oom_detected,
+            req.node_id.as_deref(),
             &samples,
         ));
         let existing_hash =
@@ -3579,14 +3580,17 @@ impl RunCoordinator {
         if logic::MergeOnFailure::from_db_str(&req.merge_on_failure).is_none() {
             return error_response(400, "unknown merge_on_failure value");
         }
-        if read_job_group(sql, &req.job_name)?.is_none() {
-            insert_job_group(
-                sql,
-                &req.job_name,
-                req.expected_total,
-                req.fail_fast,
-                &req.merge_on_failure,
-            )?;
+        match logic::resolve_register_shard_group(read_job_group(sql, &req.job_name)?.is_some()) {
+            logic::RegisterShardGroupDecision::Insert => {
+                insert_job_group(
+                    sql,
+                    &req.job_name,
+                    req.expected_total,
+                    req.fail_fast,
+                    &req.merge_on_failure,
+                )?;
+            }
+            logic::RegisterShardGroupDecision::AlreadyRegistered => {}
         }
         Response::from_json(&RegisterShardGroupOutcome {
             job_name: req.job_name,
