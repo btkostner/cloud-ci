@@ -1,6 +1,7 @@
 pub mod api_tokens;
 pub mod connect;
 pub mod container_probe;
+pub mod container_snapshot_spike;
 pub mod coordinator;
 pub mod github_app;
 pub mod github_checks;

@@ -40,18 +40,21 @@
 //! # Scope boundary
 //!
 //! Standalone proof DO, same posture as `container_probe.rs`/`node_container.rs`: no
-//! `RunCoordinator`/`RepoState`/`PullRequestState` wiring. Driven during this round only by a
-//! throwaway local `/internal/snapshot-spike/{id}/{setup,restore}` `lib.rs` route and matching
-//! `wrangler.toml` `[[containers]]`/`durable_objects.bindings`/`[[migrations]]` entries — both
-//! fully reverted after the real numbers in `/tmp/container-snapshot-spike-findings.txt` and
-//! the docs/roadmap.md row were captured, so this module is **not** declared as a `pub mod` in
-//! `lib.rs` and is not part of the compiled Worker; it is kept, uncompiled, as the exact
-//! reviewable source this round's real local run used (re-wiring it is a one-line `pub mod
-//! container_snapshot_spike;` plus the `wrangler.toml` entries this file's own git history
-//! shows were added and removed). `durable_object` scheduling policy when wired, image built
-//! locally from `container_snapshot_spike/Dockerfile` and passed as a Docker-tag `image`
-//! string at call time — the same "already Docker-cached image, passed by tag" local-dev
-//! convention the cold-start spike used (`/tmp/cold-start-spike-findings.txt`).
+//! `RunCoordinator`/`RepoState`/`PullRequestState` wiring, no production HTTP route. Declared as
+//! a `pub mod` in `lib.rs` (same as `container_probe`/`node_container`) so it is compiled,
+//! `clippy -D warnings`-checked, and covered by `cargo test` on every `mise run check` — but
+//! unlike those two, it has no `wrangler.toml` `[[containers]]`/`durable_objects.bindings`/
+//! `[[migrations]]` registration, since nothing in this crate's compiled output instantiates a
+//! `SnapshotSpike` Durable Object this round. This round's real local measurement used a
+//! throwaway `/internal/snapshot-spike/{id}/{setup,restore}` `lib.rs` route and matching
+//! `wrangler.toml` entries, both fully reverted afterward (see
+//! `/tmp/container-snapshot-spike-findings.txt` and the docs/roadmap.md row for the captured
+//! numbers); re-wiring this module to run again is the `wrangler.toml` entries this file's own
+//! git history shows were added and removed, plus a route or other caller. `durable_object`
+//! scheduling policy when wired, image built locally from `container_snapshot_spike/Dockerfile`
+//! and passed as a Docker-tag `image` string at call time — the same "already Docker-cached
+//! image, passed by tag" local-dev convention the cold-start spike used
+//! (`/tmp/cold-start-spike-findings.txt`).
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -154,7 +157,10 @@ impl SnapshotSpike {
         let (snapshot, snapshot_error) = match snapshot_container(&container, "spike").await {
             Ok(value) => match js_to_json(&value) {
                 Ok(json) => (Some(json), None),
-                Err(e) => (None, Some(format!("snapshot result was not JSON-serializable: {e}"))),
+                Err(e) => (
+                    None,
+                    Some(format!("snapshot result was not JSON-serializable: {e}")),
+                ),
             },
             Err(e) => (None, Some(e)),
         };
@@ -209,16 +215,23 @@ impl SnapshotSpike {
 /// reflection — see this module's doc comment for why no typed `worker` crate wrapper
 /// exists for it. Returns the raw JS result (Cloudflare's "plain data object" snapshot
 /// handle) on success.
-async fn snapshot_container(container: &Container, name: &str) -> std::result::Result<JsValue, String> {
+async fn snapshot_container(
+    container: &Container,
+    name: &str,
+) -> std::result::Result<JsValue, String> {
     let this: &JsValue = container.as_ref();
     let func = Reflect::get(this, &JsValue::from_str("snapshotContainer"))
         .map_err(|e| format!("looking up snapshotContainer: {}", js_error_to_string(&e)))?;
-    let func: worker::js_sys::Function = func
-        .dyn_into()
-        .map_err(|_| "ctx.container.snapshotContainer is not a function in this runtime".to_string())?;
+    let func: worker::js_sys::Function = func.dyn_into().map_err(|_| {
+        "ctx.container.snapshotContainer is not a function in this runtime".to_string()
+    })?;
     let opts = Object::new();
-    Reflect::set(&opts, &JsValue::from_str("name"), &JsValue::from_str(name))
-        .map_err(|e| format!("building snapshotContainer() options: {}", js_error_to_string(&e)))?;
+    Reflect::set(&opts, &JsValue::from_str("name"), &JsValue::from_str(name)).map_err(|e| {
+        format!(
+            "building snapshotContainer() options: {}",
+            js_error_to_string(&e)
+        )
+    })?;
     let promise = func
         .call1(this, &opts.into())
         .map_err(|e| format!("calling snapshotContainer(): {}", js_error_to_string(&e)))?;
@@ -251,6 +264,10 @@ fn js_to_json(value: &JsValue) -> std::result::Result<JsonValue, String> {
 fn json_to_js(value: &JsonValue) -> Result<JsValue> {
     let text = serde_json::to_string(value)
         .map_err(|e| worker::Error::RustError(format!("cannot encode snapshot handle: {e}")))?;
-    JSON::parse(&text)
-        .map_err(|e| worker::Error::RustError(format!("cannot decode snapshot handle: {}", js_error_to_string(&e))))
+    JSON::parse(&text).map_err(|e| {
+        worker::Error::RustError(format!(
+            "cannot decode snapshot handle: {}",
+            js_error_to_string(&e)
+        ))
+    })
 }
