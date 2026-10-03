@@ -988,6 +988,232 @@ pub fn split_for_invocation_budget<T>(events: &[T], budget: usize) -> (&[T], &[T
     events.split_at(split)
 }
 
+/// One `sample`-kind Analytics Engine data point, in
+/// docs/design/analytics.md's "Analytics Engine schema" table's `sample`
+/// row shape, extended beyond that table's original four-blob/three-
+/// double sketch to carry the per-sample identity/timing fields a real
+/// `SubmitResourceSamples` request supplies: `blob1="sample"`,
+/// `blob2=run_id`, `blob3=job_id`, `blob4=instance_type`,
+/// `blob5=shard_index` (decimal string), `blob6=attempt` (decimal
+/// string), `double1=cpu_usage_usec_delta`, `double2=memory_current_bytes`,
+/// `double3=memory_peak_bytes`, `double4=elapsed_usec`,
+/// `double5=timestamp_unix_ms`, `double6=memory_peak_known`
+/// (`1.0`/`0.0`), `index1=repo_id`. Pure data, no `worker`-crate
+/// dependency — the thin `write_sample_events`/`flush_sample_event_overflow`
+/// callers in `coordinator::mod` turn this into the actual
+/// `AnalyticsEngineDataPointBuilder` calls, same split as [`TestEventPoint`].
+///
+/// **Why a presence flag instead of a `NaN` sentinel.** An earlier
+/// version of this struct used `f64::NAN` for "the kernel never
+/// recorded a peak". That is unsafe for this exact transport: `double3`
+/// round-trips through both a real `write_data_point` call (Cloudflare's
+/// documented behavior for non-finite doubles there is not verified
+/// against this deployment, and some analytics/telemetry backends
+/// reject or silently coerce non-finite values) and this DO's own
+/// `sample_event_overflow` SQLite table (a value can sit queued there
+/// across a crash/restart before ever reaching AE). `JSON.stringify`
+/// also cannot represent `NaN` at all (it serializes to `null`), which
+/// would silently corrupt it the moment it touched *any* JSON encoding
+/// path. `memory_peak_bytes` instead always holds a finite number
+/// (`0.0` when unknown — never treated as "the real peak" on its own),
+/// and `memory_peak_known` is the only thing a query should ever branch
+/// on to tell a real zero-byte peak apart from "not recorded"; a
+/// rollup/dashboard query MUST filter or group on `double6` before
+/// trusting `double3`, exactly as `recent_outcomes`/`flakiness_score`
+/// readers already have to respect this schema's other derived-field
+/// conventions.
+///
+/// `memory_peak_bytes`/`memory_peak_known` are deliberately the *same*
+/// value on every point built from one batch (job-level, not
+/// per-sample). Analytics Engine rows are flat and unjoinable — every
+/// other kind in the schema table already repeats its own
+/// row-identifying context (`blob2=run_id`, `blob3=job_id`,
+/// `index1=repo_id`) on every single row rather than storing it once
+/// and joining later — so repeating the batch's one peak value/presence
+/// pair across all of its sample rows follows the same
+/// denormalized-by-design pattern, not an accident.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SampleEventPoint {
+    pub run_id: String,
+    pub job_id: String,
+    pub shard_index: u32,
+    pub attempt: u32,
+    pub instance_type: String,
+    pub timestamp_unix_ms: f64,
+    pub elapsed_usec: f64,
+    pub cpu_usage_usec_delta: f64,
+    pub memory_current_bytes: f64,
+    /// Always finite. `0.0` and `memory_peak_known: false` together mean
+    /// "not recorded" — never treat this field alone as "the real peak"
+    /// without checking [`Self::memory_peak_known`] first.
+    pub memory_peak_bytes: f64,
+    pub memory_peak_known: bool,
+    pub repo_id: i64,
+}
+
+/// One batched sample's input shape to [`build_sample_events`] — the
+/// per-sample fields a `SubmitResourceSamplesRequest`'s
+/// `repeated ResourceSample samples` carries. Mirrors
+/// `cloud_ci_proto::ingest::v1::ResourceSample`'s fields exactly; kept
+/// as its own small struct here (rather than depending on the generated
+/// proto type directly) so this module's pure functions stay provable
+/// with plain Rust values in `cargo test`, independent of `buffa`'s
+/// generated code shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceSampleInput {
+    pub timestamp_unix_ms: u64,
+    pub elapsed_usec: u64,
+    pub cpu_usage_usec_delta: u64,
+    pub memory_current_bytes: u64,
+}
+
+/// Builds one `sample` Analytics Engine data point per batched
+/// [`ResourceSampleInput`] — the complete per-2s-tick series a real
+/// agent accumulates for one job (or shard attempt) and submits once,
+/// at job end, via `SubmitResourceSamples` (docs/design/analytics.md's
+/// "Data flow"). `memory_peak_bytes: None` (the kernel never recorded
+/// one) becomes `(0.0, false)` on every row — see [`SampleEventPoint`]'s
+/// own doc comment for why a presence flag replaces an earlier `NaN`
+/// sentinel.
+#[allow(clippy::too_many_arguments)]
+pub fn build_sample_events(
+    run_id: &str,
+    job_id: &str,
+    shard_index: u32,
+    attempt: u32,
+    repo_id: i64,
+    instance_type: &str,
+    memory_peak_bytes: Option<u64>,
+    samples: &[ResourceSampleInput],
+) -> Vec<SampleEventPoint> {
+    let memory_peak_known = memory_peak_bytes.is_some();
+    let memory_peak_bytes = memory_peak_bytes.map(|v| v as f64).unwrap_or(0.0);
+    samples
+        .iter()
+        .map(|sample| SampleEventPoint {
+            run_id: run_id.to_string(),
+            job_id: job_id.to_string(),
+            shard_index,
+            attempt,
+            instance_type: instance_type.to_string(),
+            timestamp_unix_ms: sample.timestamp_unix_ms as f64,
+            elapsed_usec: sample.elapsed_usec as f64,
+            cpu_usage_usec_delta: sample.cpu_usage_usec_delta as f64,
+            memory_current_bytes: sample.memory_current_bytes as f64,
+            memory_peak_bytes,
+            memory_peak_known,
+            repo_id,
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// `SubmitResourceSamples` idempotency (`resource_sample_batch`'s DO row,
+// keyed by `(job_id, shard_index, attempt)` — this execution identity
+// accepts exactly one immutable batch; `coordinator::mod`'s own module
+// docs cover the full DO-local-atomicity/overflow/AE-delivery mechanism).
+// ---------------------------------------------------------------------------
+
+/// What a `SubmitResourceSamples` call should do, once the execution
+/// identity's existing content hash (if any) is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmitResourceSamplesDecision {
+    /// No row exists yet for this `(job_id, shard_index, attempt)` —
+    /// accept it: insert the batch row and its AE points/overflow rows.
+    Accepted,
+    /// A row already exists with the identical content hash — a clean
+    /// no-op replay; nothing is re-inserted or re-delivered.
+    AlreadyAccepted,
+    /// A row already exists with a *different* content hash — rejected,
+    /// never silently overwritten (same "same shape, different domain"
+    /// pattern as [`resolve_complete_shard`]/[`resolve_shard_terminal`]).
+    Conflict,
+}
+
+/// Resolves a `SubmitResourceSamples` call against whatever content hash
+/// (if any) `resource_sample_batch` already has for this exact
+/// `(job_id, shard_index, attempt)` key.
+pub fn resolve_submit_resource_samples(
+    existing_hash: Option<&str>,
+    incoming_hash: &str,
+) -> SubmitResourceSamplesDecision {
+    match existing_hash {
+        None => SubmitResourceSamplesDecision::Accepted,
+        Some(existing) if existing == incoming_hash => {
+            SubmitResourceSamplesDecision::AlreadyAccepted
+        }
+        Some(_) => SubmitResourceSamplesDecision::Conflict,
+    }
+}
+
+/// Deterministic content hash over `SubmitResourceSamplesRequest`'s own
+/// *typed* fields — never over raw wire bytes. `buffa`'s Connect
+/// transport supports more than one codec (JSON, binary protobuf); two
+/// requests carrying identical logical content encoded through different
+/// codecs would hash differently if this hashed the raw request body,
+/// which would make [`resolve_submit_resource_samples`]'s idempotency
+/// check codec-dependent — a client retry that happens to switch codec
+/// would then look like a content *conflict* instead of the identical
+/// replay it actually is. Hashing a fixed, length-prefixed concatenation
+/// of the decoded fields instead (same length-prefixing discipline
+/// `coordinator::do_name` already uses, for the same "two different
+/// inputs must never collide" reason) is codec-independent by
+/// construction.
+pub fn resource_sample_batch_content_hash(
+    job_id: &str,
+    shard_index: u32,
+    attempt: u32,
+    instance_type: &str,
+    memory_peak_bytes: Option<u64>,
+    oom_detected: bool,
+    samples: &[ResourceSampleInput],
+) -> Vec<u8> {
+    let mut buf = Vec::new();
+    push_len_prefixed(&mut buf, job_id.as_bytes());
+    buf.extend_from_slice(&shard_index.to_le_bytes());
+    buf.extend_from_slice(&attempt.to_le_bytes());
+    push_len_prefixed(&mut buf, instance_type.as_bytes());
+    buf.extend_from_slice(&memory_peak_bytes.unwrap_or(u64::MAX).to_le_bytes());
+    buf.push(u8::from(memory_peak_bytes.is_some()));
+    buf.push(u8::from(oom_detected));
+    buf.extend_from_slice(&(samples.len() as u64).to_le_bytes());
+    for sample in samples {
+        buf.extend_from_slice(&sample.timestamp_unix_ms.to_le_bytes());
+        buf.extend_from_slice(&sample.elapsed_usec.to_le_bytes());
+        buf.extend_from_slice(&sample.cpu_usage_usec_delta.to_le_bytes());
+        buf.extend_from_slice(&sample.memory_current_bytes.to_le_bytes());
+    }
+    buf
+}
+
+fn push_len_prefixed(buf: &mut Vec<u8>, bytes: &[u8]) {
+    buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    buf.extend_from_slice(bytes);
+}
+
+/// Splits one Worker invocation's shared `budget` (docs/design/
+/// analytics.md's confirmed 250-data-point-per-invocation Analytics
+/// Engine limit) between two overflow backlogs being drained in the
+/// *same* invocation — `coordinator::mod`'s `alarm()`, which must never
+/// let `test_event_overflow` and `sample_event_overflow` each spend a
+/// full independent 250 in one fire (that would write up to 500 points
+/// in one invocation, over the real platform cap). Drains `first_pending`
+/// up to `budget`, then whatever budget remains (if any) from
+/// `second_pending` — first-backlog priority is an arbitrary but
+/// deterministic tie-break (older DO code already drains
+/// `test_event_overflow` first), not a fairness guarantee; a backlog
+/// that is never first keeps draining across subsequent alarm fires
+/// either way, since nothing here drops anything.
+pub fn allocate_shared_overflow_budget(
+    budget: usize,
+    first_pending: usize,
+    second_pending: usize,
+) -> (usize, usize) {
+    let first = first_pending.min(budget);
+    let second = second_pending.min(budget - first);
+    (first, second)
+}
+
 /// Partitions a drained `test_event_overflow` batch's own `seq`s by
 /// whether their paired write attempt succeeded, so the deferred-flush
 /// caller (`coordinator::mod`'s `flush_test_event_overflow`) deletes
@@ -1361,6 +1587,19 @@ fn shard_node_prefix(job_name: &str, idx: u32) -> String {
     format!("shard:{job_name}:{idx}:")
 }
 
+/// Job names can contain colons; the suffix must be one canonical attempt number.
+fn shard_node_matches(node_id: &str, prefix: &str) -> bool {
+    match node_id.strip_prefix(prefix) {
+        Some(rest) => {
+            let bytes = rest.as_bytes();
+            !(bytes.is_empty() || bytes[0] == b'0' && bytes.len() > 1)
+                && bytes.iter().all(u8::is_ascii_digit)
+                && rest.parse::<u32>().is_ok()
+        }
+        None => false,
+    }
+}
+
 /// Which of `nodes`' ids are shard `idx` of `job_name`'s own running
 /// node(s) — [`evaluate_barrier`]'s `FailFastTriggered { cancel_idxs }`
 /// decision names only shard *indices*, never node ids or attempts (it
@@ -1383,7 +1622,7 @@ pub fn shard_nodes_to_cancel(
     let prefix = shard_node_prefix(job_name, idx);
     nodes
         .iter()
-        .filter(|(id, status)| id.starts_with(&prefix) && !status.is_terminal())
+        .filter(|(id, status)| shard_node_matches(id, &prefix) && !status.is_terminal())
         .map(|(id, _)| id.clone())
         .collect()
 }
@@ -1521,6 +1760,195 @@ mod tests {
     #[test]
     fn build_test_events_on_empty_rows_is_empty() {
         assert!(build_test_events("run-1", "job-1", 99, &[]).is_empty());
+    }
+
+    #[test]
+    fn build_sample_events_repeats_job_level_peak_shard_attempt_instance_type_per_row() {
+        let samples = vec![
+            ResourceSampleInput {
+                timestamp_unix_ms: 1_000,
+                elapsed_usec: 2_000_000,
+                cpu_usage_usec_delta: 500_000,
+                memory_current_bytes: 100_000_000,
+            },
+            ResourceSampleInput {
+                timestamp_unix_ms: 3_000,
+                elapsed_usec: 2_000_000,
+                cpu_usage_usec_delta: 600_000,
+                memory_current_bytes: 120_000_000,
+            },
+        ];
+
+        let events = build_sample_events(
+            "run-1",
+            "job-1",
+            2,
+            3,
+            99,
+            "standard-2",
+            Some(150_000_000),
+            &samples,
+        );
+
+        assert_eq!(
+            events,
+            vec![
+                SampleEventPoint {
+                    run_id: "run-1".to_string(),
+                    job_id: "job-1".to_string(),
+                    shard_index: 2,
+                    attempt: 3,
+                    instance_type: "standard-2".to_string(),
+                    timestamp_unix_ms: 1_000.0,
+                    elapsed_usec: 2_000_000.0,
+                    cpu_usage_usec_delta: 500_000.0,
+                    memory_current_bytes: 100_000_000.0,
+                    memory_peak_bytes: 150_000_000.0,
+                    memory_peak_known: true,
+                    repo_id: 99,
+                },
+                SampleEventPoint {
+                    run_id: "run-1".to_string(),
+                    job_id: "job-1".to_string(),
+                    shard_index: 2,
+                    attempt: 3,
+                    instance_type: "standard-2".to_string(),
+                    timestamp_unix_ms: 3_000.0,
+                    elapsed_usec: 2_000_000.0,
+                    cpu_usage_usec_delta: 600_000.0,
+                    memory_current_bytes: 120_000_000.0,
+                    memory_peak_bytes: 150_000_000.0,
+                    memory_peak_known: true,
+                    repo_id: 99,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn build_sample_events_unset_peak_becomes_zero_with_known_flag_false() {
+        let samples = vec![ResourceSampleInput {
+            timestamp_unix_ms: 1_000,
+            elapsed_usec: 2_000_000,
+            cpu_usage_usec_delta: 10,
+            memory_current_bytes: 20,
+        }];
+
+        let events = build_sample_events("run-1", "job-1", 0, 1, 1, "basic", None, &samples);
+
+        assert_eq!(events[0].memory_peak_bytes, 0.0);
+        assert!(!events[0].memory_peak_known);
+    }
+
+    #[test]
+    fn build_sample_events_on_empty_samples_is_empty() {
+        assert!(build_sample_events("run-1", "job-1", 0, 1, 1, "basic", Some(1), &[]).is_empty());
+    }
+
+    #[test]
+    fn resolve_submit_resource_samples_accepts_a_fresh_identity() {
+        assert_eq!(
+            resolve_submit_resource_samples(None, "hash-a"),
+            SubmitResourceSamplesDecision::Accepted
+        );
+    }
+
+    #[test]
+    fn resolve_submit_resource_samples_identical_replay_is_a_noop() {
+        assert_eq!(
+            resolve_submit_resource_samples(Some("hash-a"), "hash-a"),
+            SubmitResourceSamplesDecision::AlreadyAccepted
+        );
+    }
+
+    #[test]
+    fn resolve_submit_resource_samples_different_content_is_a_conflict() {
+        assert_eq!(
+            resolve_submit_resource_samples(Some("hash-a"), "hash-b"),
+            SubmitResourceSamplesDecision::Conflict
+        );
+    }
+
+    #[test]
+    fn content_hash_is_stable_for_identical_typed_fields() {
+        let samples = vec![ResourceSampleInput {
+            timestamp_unix_ms: 1_000,
+            elapsed_usec: 2_000_000,
+            cpu_usage_usec_delta: 500,
+            memory_current_bytes: 1024,
+        }];
+        let a = resource_sample_batch_content_hash(
+            "job-1",
+            0,
+            1,
+            "standard-2",
+            Some(2048),
+            false,
+            &samples,
+        );
+        let b = resource_sample_batch_content_hash(
+            "job-1",
+            0,
+            1,
+            "standard-2",
+            Some(2048),
+            false,
+            &samples,
+        );
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn content_hash_differs_for_different_sample_content() {
+        let samples_a = vec![ResourceSampleInput {
+            timestamp_unix_ms: 1_000,
+            elapsed_usec: 2_000_000,
+            cpu_usage_usec_delta: 500,
+            memory_current_bytes: 1024,
+        }];
+        let samples_b = vec![ResourceSampleInput {
+            timestamp_unix_ms: 1_000,
+            elapsed_usec: 2_000_000,
+            cpu_usage_usec_delta: 999,
+            memory_current_bytes: 1024,
+        }];
+        let a = resource_sample_batch_content_hash(
+            "job-1",
+            0,
+            1,
+            "standard-2",
+            Some(2048),
+            false,
+            &samples_a,
+        );
+        let b = resource_sample_batch_content_hash(
+            "job-1",
+            0,
+            1,
+            "standard-2",
+            Some(2048),
+            false,
+            &samples_b,
+        );
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn content_hash_distinguishes_unset_peak_from_a_genuine_zero_peak() {
+        let samples: Vec<ResourceSampleInput> = vec![];
+        let unset =
+            resource_sample_batch_content_hash("job-1", 0, 1, "basic", None, false, &samples);
+        let zero =
+            resource_sample_batch_content_hash("job-1", 0, 1, "basic", Some(0), false, &samples);
+        assert_ne!(unset, zero);
+    }
+
+    #[test]
+    fn allocate_shared_overflow_budget_splits_without_exceeding_total() {
+        assert_eq!(allocate_shared_overflow_budget(250, 300, 300), (250, 0));
+        assert_eq!(allocate_shared_overflow_budget(250, 100, 300), (100, 150));
+        assert_eq!(allocate_shared_overflow_budget(250, 0, 300), (0, 250));
+        assert_eq!(allocate_shared_overflow_budget(250, 10, 5), (10, 5));
     }
 
     #[test]
@@ -2663,6 +3091,47 @@ mod tests {
         assert_eq!(
             shard_nodes_to_cancel("e2e", 0, &nodes),
             Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn shard_nodes_to_cancel_does_not_match_a_different_colon_containing_job_name() {
+        // Regression test for a real selection bug: `job_name` is
+        // free-form, caller-supplied text and may itself contain `:` —
+        // the same separator `shard_node_id` joins its own fields with.
+        // A short job's `shard_node_prefix` used to be a literal
+        // `starts_with` byte-prefix of a *longer, unrelated* job's own
+        // shard node id: `shard_node_prefix("build", 1)` ==
+        // `"shard:build:1:"`, which is a literal prefix of
+        // `shard_node_id("build:1", 2, 3)` == `"shard:build:1:2:3"` — a
+        // different job ("build:1", not "build"), index (2, not 1), and
+        // attempt (3). Fail-fast for job "build" idx 1 must never select
+        // job "build:1"'s node.
+        let unrelated_node_id = shard_node_id("build:1", 2, 3);
+        let nodes = vec![(unrelated_node_id, NodeState::Running)];
+        assert_eq!(
+            shard_nodes_to_cancel("build", 1, &nodes),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn shard_nodes_to_cancel_picks_the_right_attempt_among_colon_containing_job_names_and_terminal_siblings()
+     {
+        // Combines every selection edge case this function must get
+        // right at once: an OOM-retried shard's *latest* running attempt
+        // is selected, its own already-terminal earlier attempt is
+        // skipped (never relabelled), and an unrelated job whose name
+        // embeds "build:1:" is never matched despite sharing a byte
+        // prefix with "build" idx 1's own node ids.
+        let nodes = vec![
+            (shard_node_id("build", 1, 1), NodeState::Succeeded),
+            (shard_node_id("build", 1, 2), NodeState::Running),
+            (shard_node_id("build:1", 2, 3), NodeState::Running),
+        ];
+        assert_eq!(
+            shard_nodes_to_cancel("build", 1, &nodes),
+            vec![shard_node_id("build", 1, 2)]
         );
     }
 

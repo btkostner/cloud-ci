@@ -297,37 +297,18 @@ pub struct LintArgs {
     pub file: std::path::PathBuf,
 }
 
-/// `cloud-ci agent --cgroup-path <path> --duration-secs <n>`.
+/// `cloud-ci agent --job-id <id> --shard <n> --attempt <n> --instance-type <t> --duration-secs <n>`.
 ///
-/// # This round is a scope-limited placeholder, not a real job runner
-///
-/// `cloud-ci agent`'s full job per `docs/architecture.md` is "pulls its
-/// job spec, runs steps, streams logs, samples resource usage where
-/// available, and uploads reports/artifacts through the public ingest
-/// API." Only the **resource-sampling** piece exists this round:
-///
-/// - **"pulls its job spec"**: NOT implemented. `RunCoordinator` has no
-///   job-spec-serving API yet — Dynamic Pipelines, the thing that would
-///   define what steps to run, is explicitly Phase 2 and not built.
-/// - **"runs steps"**: NOT implemented, for the same reason (no
-///   `Executor`/container dispatch mechanism exists to run steps against).
-/// - **"samples resource usage"**: implemented — this command reads the
-///   cgroup v2 pseudofiles under `--cgroup-path` every 2s for
-///   `--duration-secs`, via `cloud_ci_core::cgroup`/`cloud_ci_core::sampler`
-///   (`docs/design/analytics.md`'s "What is collected" table).
-/// - **"uploads reports/artifacts"**: deferred. Uploading needs a real
-///   `Report` to attach the collected samples to (`docs/design/analytics.md`:
-///   samples are emitted "as part of the job's end-of-run Report"), which
-///   needs real step execution to produce. This command instead prints the
-///   collected samples as JSON to stdout on exit, so the sampling +
-///   credential-reading mechanism is provably exercised without inventing
-///   fake job execution.
-///
-/// The per-job token `RunCoordinator` mints and injects as `CLOUD_CI_JOB_TOKEN`
-/// (`docs/design/auth.md`'s "Per-job tokens") is read and resolved through
-/// the same `resolve_credential` path `cloud-ci upload` uses, proving the
-/// credential-reading mechanism works — but, per the deferred-upload note
-/// above, nothing is sent over the wire with it yet.
+/// Samples cgroup v2 resource usage every 2s for `--duration-secs`
+/// (`cloud_ci_core::cgroup`/`cloud_ci_core::sampler`,
+/// `docs/design/analytics.md`'s "What is collected" table), then submits
+/// the complete batch once via `SubmitResourceSamples`
+/// (`cloud_ci_proto::ingest::v1`). `cloud-ci agent` does not pull a job
+/// spec or run steps — `RunCoordinator` has no job-spec-serving API and
+/// no `Executor`/container dispatch mechanism to run steps against — so
+/// `--job-id`/`--shard`/`--attempt` identify an already-started job
+/// explicitly rather than being resolved from a spec this command would
+/// have to pull itself.
 #[derive(Debug, Parser)]
 pub struct AgentArgs {
     /// Root of the cgroup v2 hierarchy to sample from. Defaults to the
@@ -337,12 +318,39 @@ pub struct AgentArgs {
     #[arg(long, default_value = "/sys/fs/cgroup")]
     pub cgroup_path: PathBuf,
 
-    /// How long to run the 2s sampling loop before printing results and
-    /// exiting. Stands in for the real job's lifetime, since there is no
-    /// real step execution to bound this on yet — see this struct's own
-    /// doc comment.
+    /// How long to run the 2s sampling loop before submitting the batch
+    /// and exiting.
     #[arg(long, default_value_t = 60)]
     pub duration_secs: u64,
+
+    /// The job's id (not name) — already minted by an earlier `StartJob`
+    /// call for this job.
+    #[arg(long = "job-id")]
+    pub job_id: Option<String>,
+
+    /// 0-based shard index, matching every other shard-scoped RPC in
+    /// this service.
+    #[arg(long, default_value_t = 0)]
+    pub shard: u32,
+
+    /// 1-based execution attempt. `0` is invalid.
+    #[arg(long, default_value_t = 1)]
+    pub attempt: u32,
+
+    /// This job's runner/instance size label.
+    #[arg(long = "instance-type")]
+    pub instance_type: Option<String>,
+
+    /// Base URL of the cloud-ci deployment to submit samples to
+    /// (`CLOUD_CI_SERVER_URL`).
+    #[arg(long = "server-url")]
+    pub server_url: Option<String>,
+
+    /// Bearer credential. Falls back to `CLOUD_CI_JOB_TOKEN`, then the
+    /// same `CLOUD_CI_TOKEN`/GitHub Actions OIDC chain `cloud-ci upload`
+    /// resolves through.
+    #[arg(long)]
+    pub token: Option<String>,
 }
 
 #[derive(Debug, Parser)]

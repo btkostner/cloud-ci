@@ -37,7 +37,7 @@ use cloud_ci_proto::ingest::v1::{
     CompleteUploadRequest, CompleteUploadResponse, CreateUploadRequest, CreateUploadResponse,
     FileTiming, GetRunRequest, GetRunResponse, GetTestTimingsRequest, GetTestTimingsResponse,
     ResolveShardPlanRequest, StartJobRequest, StartJobResponse, SubmitReportRequest,
-    SubmitReportResponse,
+    SubmitReportResponse, SubmitResourceSamplesRequest, SubmitResourceSamplesResponse,
 };
 use connect::{Code, Codec, ConnectError, NegotiationError, negotiate};
 use coordinator::{CoordinatorError, RunCoordinatorStore};
@@ -936,6 +936,9 @@ async fn route(
         "/cloud_ci.ingest.v1.IngestService/SubmitReport" => {
             handle_submit_report(codec, body, env).await
         }
+        "/cloud_ci.ingest.v1.IngestService/SubmitResourceSamples" => {
+            handle_submit_resource_samples(codec, body, env, bearer).await
+        }
         "/cloud_ci.ingest.v1.IngestService/CompleteShard" => {
             handle_complete_shard(codec, body, env).await
         }
@@ -1414,6 +1417,45 @@ async fn handle_submit_report(
     codec.encode(&SubmitReportResponse::default())
 }
 
+async fn handle_submit_resource_samples(
+    codec: Codec,
+    body: &[u8],
+    env: &Env,
+    bearer: Option<&str>,
+) -> std::result::Result<Vec<u8>, ConnectError> {
+    let req: SubmitResourceSamplesRequest = codec.decode(body)?;
+
+    let Some(bearer) = bearer else {
+        return Err(ConnectError::new(
+            Code::Unauthenticated,
+            "missing bearer ingest token",
+        ));
+    };
+    let secret = ingest_token_secret(env)?;
+    let now_s = Date::now().as_millis() / 1000;
+    let claims = ingest_token::verify(&secret, bearer, now_s).map_err(|e| {
+        ConnectError::new(
+            Code::Unauthenticated,
+            format!("invalid or expired ingest token: {e}"),
+        )
+    })?;
+
+    let identity = resolve_job_run_identity_for_resource_samples(env, &req.job_id).await?;
+    if claims.repo_id != identity.repo_id || claims.run_id != identity.run_id {
+        return Err(ConnectError::new(
+            Code::PermissionDenied,
+            "ingest token does not match this job's own run/repo",
+        ));
+    }
+
+    let store = RunCoordinatorStore::new(env, &identity.do_name).map_err(coordinator_error)?;
+    store
+        .submit_resource_samples(&req)
+        .await
+        .map_err(coordinator_error)?;
+    codec.encode(&SubmitResourceSamplesResponse::default())
+}
+
 async fn handle_complete_shard(
     codec: Codec,
     body: &[u8],
@@ -1465,6 +1507,60 @@ async fn resolve_do_name_for_job(
             &r.run_key,
             r.attempt as u32,
         )),
+        None => Err(ConnectError::new(
+            Code::NotFound,
+            format!("job {job_id} not found"),
+        )),
+    }
+}
+
+/// `SubmitResourceSamples`-only sibling of [`resolve_do_name_for_job`]:
+/// also returns the owning run's own `id` (the ULID `run_id`), not just
+/// enough to derive the DO name, so [`handle_submit_resource_samples`]
+/// can cross-check an ingest token's `run_id`/`repo_id` claims against
+/// this job's *real* run before ever reaching the DO — "run/repo
+/// inferred from the authorized job, never trusted client linkage"
+/// (docs/design/auth.md's Machine auth section).
+struct JobRunIdentity {
+    do_name: String,
+    repo_id: u64,
+    run_id: String,
+}
+
+async fn resolve_job_run_identity_for_resource_samples(
+    env: &Env,
+    job_id: &str,
+) -> std::result::Result<JobRunIdentity, ConnectError> {
+    #[derive(serde::Deserialize)]
+    struct RunIdentity {
+        run_id: String,
+        repo_id: i64,
+        sha: String,
+        run_key: String,
+        attempt: i64,
+    }
+
+    let db = env
+        .d1("DB")
+        .map_err(|e| ConnectError::new(Code::Internal, format!("D1 unavailable: {e}")))?;
+    let row: Option<RunIdentity> = db
+        .prepare(
+            "SELECT runs.id as run_id, runs.repo_id as repo_id, runs.sha as sha, \
+             runs.run_key as run_key, runs.attempt as attempt \
+             FROM jobs JOIN runs ON jobs.run_id = runs.id WHERE jobs.id = ?1",
+        )
+        .bind(&[job_id.into()])
+        .map_err(|e| ConnectError::new(Code::Internal, format!("D1 bind failed: {e}")))?
+        .first(None)
+        .await
+        .map_err(|e| ConnectError::new(Code::Internal, format!("D1 query failed: {e}")))?;
+
+    match row {
+        Some(r) => Ok(JobRunIdentity {
+            do_name: coordinator::do_name(r.repo_id as u64, &r.sha, &r.run_key, r.attempt as u32),
+            repo_id: r.repo_id as u64,
+            run_id: r.run_id,
+        }),
         None => Err(ConnectError::new(
             Code::NotFound,
             format!("job {job_id} not found"),

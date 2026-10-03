@@ -1,55 +1,38 @@
-//! Orchestrates `cloud-ci agent`: reads the per-job token, runs the 2s
-//! cgroup v2 sampling loop (`cloud_ci_core::cgroup`/`cloud_ci_core::sampler`)
-//! for `--duration-secs`, and prints the collected samples as JSON to
-//! stdout. See `crate::cli::AgentArgs`' doc comment (this command's own
-//! `--help` text) for the full scope boundary; summarized here:
+//! Orchestrates `cloud-ci agent`: reads the per-job credential, runs the
+//! 2s cgroup v2 sampling loop (`cloud_ci_core::cgroup`/`cloud_ci_core::sampler`)
+//! for `--duration-secs`, and submits the complete batch once via
+//! `SubmitResourceSamples`. See `crate::cli::AgentArgs`' doc comment
+//! (this command's own `--help` text) for the full identity/credential
+//! shape.
 //!
-//! # Scope this round
-//!
-//! `cloud-ci agent`'s full job per `docs/architecture.md` is "pulls its job
-//! spec, runs steps, streams logs, samples resource usage where available,
-//! and uploads reports/artifacts through the public ingest API." This
-//! module implements **only** the resource-sampling piece:
-//!
-//! - Pulling a job spec and running steps need a `RunCoordinator`
-//!   job-spec-serving API and an `Executor`/container dispatch mechanism,
-//!   neither of which exists yet (Dynamic Pipelines, Phase 2, not built).
-//!   This command never attempts either.
-//! - Uploading is deferred: there is no real `Report` yet to attach the
-//!   samples to (that needs real step execution), so this command prints
-//!   JSON to stdout instead of calling any ingest RPC.
-//!
-//! This is the same "capability built ahead of its full caller" pattern as
-//! `cloud-ci split`'s `--strategy timing` (see `crate::split`'s module
-//! doc): the sampling mechanism is genuinely self-contained and fully
-//! specified independent of job-spec-pulling/step-execution, so it is
-//! built now and wired into the real job runner once that exists.
+//! `cloud-ci agent` does not pull a job spec or run steps —
+//! `RunCoordinator` has no job-spec-serving API and no
+//! `Executor`/container dispatch mechanism to run steps against yet
+//! (Dynamic Pipelines, not built) — so `--job-id`/`--shard`/`--attempt`
+//! identify an already-started job explicitly.
 //!
 //! # Credential
 //!
-//! `RunCoordinator` mints a per-job token and injects it into the
-//! container's environment as `CLOUD_CI_JOB_TOKEN`
-//! (`docs/design/auth.md`'s "Per-job tokens": "never logged"). Per that
-//! doc, "The in-container `cloud-ci agent` uses it exactly like a BYO-CI
-//! API token against the same ingest RPCs" — so [`resolve_job_token`]
-//! reads `CLOUD_CI_JOB_TOKEN` and passes it as the `explicit` credential to
-//! `crate::upload::resolve_credential`, the same function `cloud-ci upload`
-//! resolves its `--token`/`CLOUD_CI_TOKEN`/OIDC credential through,
-//! instead of building a parallel resolution path. Resolution failing (no
-//! job token, no `CLOUD_CI_TOKEN`, no GitHub Actions OIDC) is a hard error:
-//! unlike `upload`, a real agent always runs with a token `RunCoordinator`
-//! minted for it.
+//! [`resolve_job_token`] reads `CLOUD_CI_JOB_TOKEN` first, then falls back
+//! to `crate::upload::resolve_credential`'s own `CLOUD_CI_TOKEN`/GitHub
+//! Actions OIDC chain — the same resolution `cloud-ci upload` uses for
+//! every call after `BeginRun`, not a parallel path. Resolution failing
+//! is a hard error: a real agent always runs with a valid bearer
+//! credential for its own run.
 
 use std::fmt;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cloud_ci_core::cgroup::CgroupReader;
 use cloud_ci_core::sampler::{JobSummary, Sample, Sampler};
-use serde::Serialize;
+use cloud_ci_proto::ingest::v1::{
+    ResourceSample, SubmitResourceSamplesRequest, SubmitResourceSamplesResponse,
+};
 
 use crate::cli::AgentArgs;
-use crate::identity::EnvSource;
+use crate::connect_client::{Client, Codec};
+use crate::identity::{EnvSource, resolve_server_url};
 use crate::upload::resolve_credential;
 
 /// Sampling cadence, per `docs/design/analytics.md`: "The agent samples
@@ -79,39 +62,81 @@ impl fmt::Display for AgentError {
 
 impl std::error::Error for AgentError {}
 
-/// Resolves the per-job token this round's agent authenticates with — see
-/// module docs' "Credential" section. `Ok(None)` means no token could be
+/// Resolves the per-job token this agent authenticates with — see module
+/// docs' "Credential" section. `Ok(None)` means no token could be
 /// resolved through any source `resolve_credential` checks.
-pub(crate) fn resolve_job_token(env: &dyn EnvSource) -> Result<Option<String>, String> {
+pub(crate) fn resolve_job_token(
+    explicit: Option<&str>,
+    env: &dyn EnvSource,
+) -> Result<Option<String>, String> {
+    if let Some(token) = explicit.filter(|t| !t.is_empty()) {
+        return Ok(Some(token.to_string()));
+    }
     let job_token = env.var("CLOUD_CI_JOB_TOKEN").filter(|t| !t.is_empty());
     resolve_credential(job_token.as_deref(), env)
 }
 
-/// Runs the bounded sampling loop and prints the resulting [`JobSummary`]
-/// as JSON to stdout. See module docs for the full scope boundary —
-/// notably, this never calls a job-spec or step-execution API, and never
-/// uploads anything.
+/// Runs the bounded sampling loop, then submits the resulting
+/// [`JobSummary`] as one `SubmitResourceSamples` call.
 pub fn run(args: &AgentArgs, env: &dyn EnvSource) -> Result<(), AgentError> {
-    let token = resolve_job_token(env).map_err(|e| AgentError::new("resolve job token", e))?;
-    if token.is_none() {
+    let token = resolve_job_token(args.token.as_deref(), env)
+        .map_err(|e| AgentError::new("resolve job token", e))?;
+    let Some(token) = token else {
         return Err(AgentError::new(
             "resolve job token",
             "no CLOUD_CI_JOB_TOKEN (or CLOUD_CI_TOKEN/GitHub Actions OIDC fallback) credential \
-             found; RunCoordinator should have injected CLOUD_CI_JOB_TOKEN into this container's \
-             environment",
+             found",
+        ));
+    };
+    let Some(job_id) = args.job_id.clone().filter(|v| !v.is_empty()) else {
+        return Err(AgentError::new("resolve job id", "--job-id is required"));
+    };
+    let Some(instance_type) = args.instance_type.clone().filter(|v| !v.is_empty()) else {
+        return Err(AgentError::new(
+            "resolve instance type",
+            "--instance-type is required",
+        ));
+    };
+    if args.attempt == 0 {
+        return Err(AgentError::new(
+            "validate attempt",
+            "--attempt must be 1 or greater",
         ));
     }
-    // `token` is resolved but intentionally unused past this point: this
-    // round defers uploading (see module docs' "Scope this round"), so
-    // there is nothing yet to present the credential to.
+    let Some(server_url) = resolve_server_url(args.server_url.clone(), env) else {
+        return Err(AgentError::new(
+            "resolve server url",
+            "--server-url (or CLOUD_CI_SERVER_URL) is required",
+        ));
+    };
 
     let reader = CgroupReader::new(&args.cgroup_path);
     let summary = sample_for(&reader, args.duration_secs, SAMPLE_INTERVAL, thread::sleep)?;
 
-    let output = AgentOutput::from(summary);
-    let json = serde_json::to_string_pretty(&output)
-        .map_err(|e| AgentError::new("serialize samples", e.to_string()))?;
-    println!("{json}");
+    let request = SubmitResourceSamplesRequest {
+        job_id,
+        shard_index: args.shard,
+        attempt: args.attempt,
+        instance_type,
+        samples: summary
+            .samples
+            .iter()
+            .copied()
+            .map(resource_sample_from)
+            .collect(),
+        memory_peak_bytes: summary.memory_peak_bytes,
+        oom_detected: summary.oom_detected,
+        ..Default::default()
+    };
+
+    let client = Client::new(server_url, Codec::Json, Some(token));
+    client
+        .call::<SubmitResourceSamplesRequest, SubmitResourceSamplesResponse>(
+            "SubmitResourceSamples",
+            &request,
+        )
+        .map_err(|e| AgentError::new("SubmitResourceSamples", e.to_string()))?;
+
     Ok(())
 }
 
@@ -140,7 +165,7 @@ fn sample_for(
     let baseline = reader
         .read_raw()
         .map_err(|e| AgentError::new("read cgroup sample (baseline)", e.to_string()))?;
-    sampler.record(now_unix_ms(), baseline);
+    sampler.record(now_unix_ms(), Instant::now(), baseline);
 
     let interval_secs = interval.as_secs().max(1);
     let ticks = duration_secs / interval_secs;
@@ -149,7 +174,7 @@ fn sample_for(
         let raw = reader
             .read_raw()
             .map_err(|e| AgentError::new("read cgroup sample", e.to_string()))?;
-        sampler.record(now_unix_ms(), raw);
+        sampler.record(now_unix_ms(), Instant::now(), raw);
     }
 
     let memory_peak_bytes = reader
@@ -169,45 +194,13 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Serializable mirror of [`JobSummary`]/[`Sample`] — kept as a thin
-/// `From` wrapper here rather than deriving `Serialize` directly on the
-/// `cloud-ci-core` types, since JSON-shape stability for this printed
-/// output is this CLI's concern, not `cloud-ci-core`'s.
-#[derive(Debug, Serialize)]
-struct AgentOutput {
-    samples: Vec<SampleOutput>,
-    memory_peak_bytes: Option<u64>,
-    oom_detected: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct SampleOutput {
-    timestamp_unix_ms: u64,
-    cpu_usage_usec_delta: u64,
-    memory_current_bytes: u64,
-}
-
-impl From<Sample> for SampleOutput {
-    fn from(s: Sample) -> Self {
-        Self {
-            timestamp_unix_ms: s.timestamp_unix_ms,
-            cpu_usage_usec_delta: s.cpu_usage_usec_delta,
-            memory_current_bytes: s.memory_current_bytes,
-        }
-    }
-}
-
-impl From<JobSummary> for AgentOutput {
-    fn from(summary: JobSummary) -> Self {
-        Self {
-            samples: summary
-                .samples
-                .into_iter()
-                .map(SampleOutput::from)
-                .collect(),
-            memory_peak_bytes: summary.memory_peak_bytes,
-            oom_detected: summary.oom_detected,
-        }
+fn resource_sample_from(s: Sample) -> ResourceSample {
+    ResourceSample {
+        timestamp_unix_ms: s.timestamp_unix_ms,
+        elapsed_usec: s.elapsed_usec,
+        cpu_usage_usec_delta: s.cpu_usage_usec_delta,
+        memory_current_bytes: s.memory_current_bytes,
+        ..Default::default()
     }
 }
 
@@ -236,25 +229,63 @@ mod tests {
             "/sys/fs/cgroup/job-123",
             "--duration-secs",
             "30",
+            "--job-id",
+            "job-abc",
+            "--shard",
+            "2",
+            "--attempt",
+            "3",
+            "--instance-type",
+            "standard-2",
+            "--server-url",
+            "https://example.test",
+            "--token",
+            "tok",
         ]);
         assert_eq!(
             args.cgroup_path,
             std::path::PathBuf::from("/sys/fs/cgroup/job-123")
         );
         assert_eq!(args.duration_secs, 30);
+        assert_eq!(args.job_id.as_deref(), Some("job-abc"));
+        assert_eq!(args.shard, 2);
+        assert_eq!(args.attempt, 3);
+        assert_eq!(args.instance_type.as_deref(), Some("standard-2"));
+        assert_eq!(args.server_url.as_deref(), Some("https://example.test"));
+        assert_eq!(args.token.as_deref(), Some("tok"));
     }
 
     #[test]
-    fn defaults_to_real_cgroupfs_mount_and_sixty_seconds() {
+    fn defaults_to_real_cgroupfs_mount_sixty_seconds_shard_zero_attempt_one() {
         let args = parse(&["cloud-ci", "agent"]);
         assert_eq!(args.cgroup_path, std::path::PathBuf::from("/sys/fs/cgroup"));
         assert_eq!(args.duration_secs, 60);
+        assert_eq!(args.shard, 0);
+        assert_eq!(args.attempt, 1);
+        assert_eq!(args.job_id, None);
+        assert_eq!(args.instance_type, None);
+    }
+
+    #[test]
+    fn resolve_job_token_explicit_flag_wins_over_everything() -> Result<(), String> {
+        let env = MapEnv::new(&[
+            ("CLOUD_CI_JOB_TOKEN", "job-token"),
+            ("CLOUD_CI_TOKEN", "should-not-be-used"),
+        ]);
+        assert_eq!(
+            resolve_job_token(Some("explicit-token"), &env)?,
+            Some("explicit-token".to_string())
+        );
+        Ok(())
     }
 
     #[test]
     fn resolve_job_token_reads_cloud_ci_job_token() -> Result<(), String> {
         let env = MapEnv::new(&[("CLOUD_CI_JOB_TOKEN", "job-token-abc")]);
-        assert_eq!(resolve_job_token(&env)?, Some("job-token-abc".to_string()));
+        assert_eq!(
+            resolve_job_token(None, &env)?,
+            Some("job-token-abc".to_string())
+        );
         Ok(())
     }
 
@@ -265,7 +296,10 @@ mod tests {
         // resolve_credential's own precedence (CLOUD_CI_TOKEN here), proving
         // it is reused rather than reimplemented.
         let env = MapEnv::new(&[("CLOUD_CI_TOKEN", "fallback-token")]);
-        assert_eq!(resolve_job_token(&env)?, Some("fallback-token".to_string()));
+        assert_eq!(
+            resolve_job_token(None, &env)?,
+            Some("fallback-token".to_string())
+        );
         Ok(())
     }
 
@@ -275,14 +309,17 @@ mod tests {
             ("CLOUD_CI_JOB_TOKEN", "job-token"),
             ("CLOUD_CI_TOKEN", "should-not-be-used"),
         ]);
-        assert_eq!(resolve_job_token(&env)?, Some("job-token".to_string()));
+        assert_eq!(
+            resolve_job_token(None, &env)?,
+            Some("job-token".to_string())
+        );
         Ok(())
     }
 
     #[test]
     fn resolve_job_token_none_when_nothing_resolves() -> Result<(), String> {
         let env = MapEnv::new(&[]);
-        assert_eq!(resolve_job_token(&env)?, None);
+        assert_eq!(resolve_job_token(None, &env)?, None);
         Ok(())
     }
 
@@ -368,6 +405,19 @@ mod tests {
         Ok(())
     }
 
+    fn base_args(dir: &std::path::Path) -> AgentArgs {
+        AgentArgs {
+            cgroup_path: dir.to_path_buf(),
+            duration_secs: 0,
+            job_id: Some("job-abc".to_string()),
+            shard: 0,
+            attempt: 1,
+            instance_type: Some("standard-2".to_string()),
+            server_url: Some("https://example.test".to_string()),
+            token: None,
+        }
+    }
+
     #[test]
     fn run_errors_when_no_credential_resolves() {
         let dir = scratch_dir("run-no-token");
@@ -375,14 +425,75 @@ mod tests {
         let _ = std::fs::write(dir.join("memory.peak"), "max\n");
         let _ = std::fs::write(dir.join("memory.events"), "oom_kill 0\n");
 
-        let args = AgentArgs {
-            cgroup_path: dir.clone(),
-            duration_secs: 0,
-        };
+        let args = base_args(&dir);
         let env = MapEnv::new(&[]);
         let result = run(&args, &env);
         assert!(result.is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_errors_when_job_id_missing() -> Result<(), String> {
+        let dir = scratch_dir("run-no-job-id");
+        write_fixture(&dir, 0, 0);
+        let mut args = base_args(&dir);
+        args.job_id = None;
+        let env = MapEnv::new(&[("CLOUD_CI_TOKEN", "tok")]);
+        let Err(err) = run(&args, &env) else {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err("expected run() to fail".to_string());
+        };
+        assert!(err.to_string().contains("resolve job id"));
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn run_errors_when_instance_type_missing() -> Result<(), String> {
+        let dir = scratch_dir("run-no-instance-type");
+        write_fixture(&dir, 0, 0);
+        let mut args = base_args(&dir);
+        args.instance_type = None;
+        let env = MapEnv::new(&[("CLOUD_CI_TOKEN", "tok")]);
+        let Err(err) = run(&args, &env) else {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err("expected run() to fail".to_string());
+        };
+        assert!(err.to_string().contains("resolve instance type"));
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn run_errors_when_attempt_is_zero() -> Result<(), String> {
+        let dir = scratch_dir("run-zero-attempt");
+        write_fixture(&dir, 0, 0);
+        let mut args = base_args(&dir);
+        args.attempt = 0;
+        let env = MapEnv::new(&[("CLOUD_CI_TOKEN", "tok")]);
+        let Err(err) = run(&args, &env) else {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err("expected run() to fail".to_string());
+        };
+        assert!(err.to_string().contains("validate attempt"));
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn run_errors_when_server_url_missing() -> Result<(), String> {
+        let dir = scratch_dir("run-no-server-url");
+        write_fixture(&dir, 0, 0);
+        let mut args = base_args(&dir);
+        args.server_url = None;
+        let env = MapEnv::new(&[("CLOUD_CI_TOKEN", "tok")]);
+        let Err(err) = run(&args, &env) else {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err("expected run() to fail".to_string());
+        };
+        assert!(err.to_string().contains("resolve server url"));
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
     }
 }

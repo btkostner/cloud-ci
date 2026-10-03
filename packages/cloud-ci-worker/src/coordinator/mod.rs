@@ -4,7 +4,6 @@
 //! from `(repo_id, sha, run_key, attempt)` — so a redelivered or reordered
 //! `BeginRun` always lands on the same instance. The instance owns minting
 //! the run's ULID, holding `status`/`expect_jobs`/job rows in its own SQLite
-//! storage (authoritative), and projecting that state into the D1
 //! `runs`/`jobs` tables it also writes (ADR 0004: "D1 rows are its
 //! projection"). Nothing outside this module talks to a raw [`Stub`]; use
 //! [`RunCoordinatorStore`].
@@ -211,8 +210,8 @@ use crate::github_checks;
 use buffa::Enumeration;
 use cloud_ci_proto::ingest::v1::{
     BeginRunRequest, CompleteShardRequest, CompleteUploadRequest, Conclusion, CreateUploadRequest,
-    JobState, RunStatus, StartJobRequest, SubmitReportRequest, Trigger, UploadKind,
-    submit_report_request,
+    JobState, RunStatus, StartJobRequest, SubmitReportRequest, SubmitResourceSamplesRequest,
+    Trigger, UploadKind, submit_report_request,
 };
 use logic::RunState;
 use serde::de::DeserializeOwned;
@@ -305,6 +304,13 @@ pub struct CompleteUploadOutcome {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmitReportOutcome {}
+
+/// `handle_submit_resource_samples`'s outcome on success (accepted or
+/// idempotent replay). A content conflict never reaches this type —
+/// it returns a plain 409 `error_response`, same as
+/// `CompleteShardError::ConflictingConclusion`'s pattern.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmitResourceSamplesOutcome {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompleteShardOutcome {}
@@ -671,6 +677,36 @@ struct TestEventOverflowRow {
     outcome: String,
 }
 
+/// `sample_event_overflow`'s per-row read shape — `flush_sample_event_overflow`'s
+/// input, reconstructed back into a [`logic::SampleEventPoint`] by
+/// [`read_sample_event_overflow_batch`]. Mirrors `TestEventOverflowRow`
+/// exactly, for `sample`-kind points instead of `test`-kind ones.
+#[derive(Debug, Clone, Deserialize)]
+struct SampleEventOverflowRow {
+    seq: i64,
+    run_id: String,
+    job_id: String,
+    shard_index: i64,
+    attempt: i64,
+    instance_type: String,
+    timestamp_unix_ms: f64,
+    elapsed_usec: f64,
+    cpu_usage_usec_delta: f64,
+    memory_current_bytes: f64,
+    memory_peak_bytes: f64,
+    memory_peak_known: i64,
+    repo_id: i64,
+}
+
+/// `resource_sample_batch`'s per-identity row — one per accepted
+/// `(job_id, shard_index, attempt)` execution identity
+/// (`coordinator` module docs' `SubmitResourceSamples` section).
+/// `content_hash` is hex-encoded `logic::resource_sample_batch_content_hash`.
+#[derive(Debug, Clone, Deserialize)]
+struct ResourceSampleBatchRow {
+    content_hash: String,
+}
+
 fn trigger_db_name(trigger: Trigger) -> &'static str {
     trigger.proto_name()
 }
@@ -755,6 +791,10 @@ impl DurableObject for RunCoordinator {
                 let body: SubmitReportRequest = req.json().await?;
                 self.handle_submit_report(&sql, body).await
             }
+            (Method::Post, "/submit-resource-samples") => {
+                let body: SubmitResourceSamplesRequest = req.json().await?;
+                self.handle_submit_resource_samples(&sql, body).await
+            }
             (Method::Post, "/complete-shard") => {
                 let body: CompleteShardRequest = req.json().await?;
                 self.handle_complete_shard(&sql, body).await
@@ -788,21 +828,31 @@ impl DurableObject for RunCoordinator {
     /// Fires for two reasons, both sharing this DO's single alarm slot:
     /// the run's own `now + timeout_s` deadline set by `handle_begin_run`
     /// (byo-ci.md's third completion trigger, § Completion semantics'
-    /// "Timeout" bullet), or `write_test_events`'
+    /// "Timeout" bullet), or `write_test_events`'/`write_sample_events`'
     /// [`RunCoordinator::schedule_overflow_flush_alarm`] pulling the
-    /// alarm earlier to drain `test_event_overflow`. Every fire drains the
-    /// overflow backlog first ([`RunCoordinator::flush_test_event_overflow`]):
-    /// if rows remain after one invocation's budget, this re-schedules
-    /// itself soon and returns *without* evaluating the timeout — an
-    /// overflow-triggered fire must never close the run early just
-    /// because it happened to be the thing that woke the DO up. Only once
-    /// the backlog is empty does this fall through to the run's real
-    /// deadline (recomputed from `run.created_at + run.timeout_s`, not
-    /// from whatever time this particular alarm fired at, since an
-    /// overflow flush may have pulled it earlier): if the deadline has
-    /// passed, closes the run exactly as before; otherwise it
-    /// re-schedules the alarm for that deadline, restoring ordinary
-    /// timeout behavior.
+    /// alarm earlier to drain `test_event_overflow`/`sample_event_overflow`.
+    /// Every fire drains both overflow backlogs first, sharing **one**
+    /// 250-data-point invocation budget between them
+    /// ([`logic::allocate_shared_overflow_budget`]) rather than letting
+    /// each spend an independent 250 — two independent 250s in the same
+    /// alarm fire would write up to 500 points in one Worker invocation,
+    /// over the real Analytics Engine per-invocation cap (confirmed
+    /// against developers.cloudflare.com/analytics/analytics-engine/limits:
+    /// "You can write a maximum of 250 data points per Worker invocation
+    /// ... Each call to writeDataPoint counts toward this limit").
+    /// `test_event_overflow` is allocated first (an arbitrary, documented
+    /// tie-break — see that function's own doc comment); if rows remain
+    /// in either backlog after this invocation's share, this
+    /// re-schedules itself soon and returns *without* evaluating the
+    /// timeout — an overflow-triggered fire must never close the run
+    /// early just because it happened to be the thing that woke the DO
+    /// up. Only once both backlogs are empty does this fall through to
+    /// the run's real deadline (recomputed from `run.created_at +
+    /// run.timeout_s`, not from whatever time this particular alarm
+    /// fired at, since an overflow flush may have pulled it earlier): if
+    /// the deadline has passed, closes the run exactly as before;
+    /// otherwise it re-schedules the alarm for that deadline, restoring
+    /// ordinary timeout behavior.
     ///
     /// `handle_close_run`'s own terminal-state no-op guard still makes
     /// this idempotent: if the run already closed via the webhook or
@@ -811,12 +861,25 @@ impl DurableObject for RunCoordinator {
     /// `Abandoned` unconditionally rather than computing it from the
     /// jobs' conclusions (see `logic::run_state_for_close`'s docs).
     async fn alarm(&self) -> worker::Result<Response> {
+        const SHARED_INVOCATION_BUDGET: i64 = 250;
         let sql = self.state.storage().sql();
         ensure_schema(&sql)?;
-        let remaining = self.flush_test_event_overflow(&sql).await?;
-        if remaining > 0 {
+        let test_pending = count_test_event_overflow(&sql)?;
+        let sample_pending = count_sample_event_overflow(&sql)?;
+        let (test_budget, sample_budget) = logic::allocate_shared_overflow_budget(
+            SHARED_INVOCATION_BUDGET as usize,
+            test_pending as usize,
+            sample_pending as usize,
+        );
+        let remaining_test = self
+            .flush_test_event_overflow(&sql, test_budget as i64)
+            .await?;
+        let remaining_sample = self
+            .flush_sample_event_overflow(&sql, sample_budget as i64)
+            .await?;
+        if remaining_test > 0 || remaining_sample > 0 {
             self.schedule_overflow_flush_alarm().await?;
-            return Response::ok("test_event_overflow flush in progress");
+            return Response::ok("event overflow flush in progress");
         }
         let Some(run_row) = read_run(&sql)? else {
             return Response::ok("no run to close");
@@ -1274,10 +1337,18 @@ impl RunCoordinator {
     /// Returns how many rows are still queued afterward, so
     /// [`alarm`][DurableObject::alarm] knows whether to keep
     /// re-scheduling itself before it considers the run's own timeout
-    /// deadline.
-    async fn flush_test_event_overflow(&self, sql: &SqlStorage) -> worker::Result<i64> {
-        const MAX_DATA_POINTS_PER_INVOCATION: i64 = 250;
-        let batch = read_test_event_overflow_batch(sql, MAX_DATA_POINTS_PER_INVOCATION)?;
+    /// deadline. `budget` is this invocation's *share* of the real
+    /// 250-data-point-per-invocation Analytics Engine limit — `alarm()`
+    /// computes it via [`logic::allocate_shared_overflow_budget`] so a
+    /// single alarm fire never spends a full independent 250 here *and*
+    /// another full independent 250 in [`Self::flush_sample_event_overflow`],
+    /// which together would exceed the real per-invocation cap.
+    async fn flush_test_event_overflow(
+        &self,
+        sql: &SqlStorage,
+        budget: i64,
+    ) -> worker::Result<i64> {
+        let batch = read_test_event_overflow_batch(sql, budget)?;
         if batch.is_empty() {
             return Ok(0);
         }
@@ -1302,6 +1373,117 @@ impl RunCoordinator {
             delete_test_event_overflow_rows(sql, &succeeded_seqs)?;
         }
         count_test_event_overflow(sql)
+    }
+
+    /// `sample`-kind sibling of [`Self::write_test_event_batch`] — same
+    /// per-row `write_data_point` loop and best-effort-but-tracked
+    /// posture (missing binding or an individual write failure logged,
+    /// not propagated; per-row success returned so overflow flushing can
+    /// delete only what actually wrote). Called only against rows
+    /// already durably queued in `sample_event_overflow` — see
+    /// [`Self::handle_submit_resource_samples`]'s doc comment for why
+    /// every sample in a batch is queued *before* any delivery attempt,
+    /// not only the tail beyond one invocation's budget.
+    ///
+    /// **No exactly-once guarantee against Analytics Engine itself.**
+    /// `resource_sample_batch`'s row makes *acceptance* exactly-once per
+    /// execution identity (a redelivered identical request never
+    /// re-queues the same content twice), but `write_data_point` has no
+    /// idempotency key or ack Cloudflare exposes back to this DO — a
+    /// crash between a successful `write_to` call here and this DO's
+    /// own bookkeeping of that success (the per-row `bool` this method
+    /// returns, which the caller uses to delete only delivered rows)
+    /// can still cause the same point to be attempted again on a later
+    /// retry. That is a real, inherent platform limitation (AE's write
+    /// path has no transactional coupling to DO storage), not something
+    /// this module can close from the Worker side.
+    fn write_sample_event_batch(&self, events: &[logic::SampleEventPoint]) -> Vec<bool> {
+        if events.is_empty() {
+            return Vec::new();
+        }
+        let dataset = match self.env.analytics_engine("METRICS") {
+            Ok(dataset) => dataset,
+            Err(e) => {
+                worker::console_log!("analytics: METRICS binding unavailable: {e}");
+                return vec![false; events.len()];
+            }
+        };
+        events
+            .iter()
+            .map(|event| {
+                let repo_id_str = event.repo_id.to_string();
+                let shard_index_str = event.shard_index.to_string();
+                let attempt_str = event.attempt.to_string();
+                let result = AnalyticsEngineDataPointBuilder::new()
+                    .indexes([repo_id_str.as_str()])
+                    .blobs([
+                        "sample",
+                        event.run_id.as_str(),
+                        event.job_id.as_str(),
+                        event.instance_type.as_str(),
+                        shard_index_str.as_str(),
+                        attempt_str.as_str(),
+                    ])
+                    .doubles([
+                        event.cpu_usage_usec_delta,
+                        event.memory_current_bytes,
+                        event.memory_peak_bytes,
+                        event.elapsed_usec,
+                        event.timestamp_unix_ms,
+                        if event.memory_peak_known { 1.0 } else { 0.0 },
+                    ])
+                    .write_to(&dataset);
+                match result {
+                    Ok(()) => true,
+                    Err(e) => {
+                        worker::console_log!(
+                            "analytics: write_data_point failed for a sample of job {}: {e}",
+                            event.job_id
+                        );
+                        false
+                    }
+                }
+            })
+            .collect()
+    }
+
+    /// `sample`-kind sibling of [`Self::flush_test_event_overflow`] —
+    /// identical drain-oldest-first-delete-only-successes mechanism,
+    /// against `sample_event_overflow`, and the same shared-`budget`
+    /// contract (see that method's doc comment for both the mixed-
+    /// outcome-safe delete reasoning and why `budget` is a share of one
+    /// combined invocation cap, not an independent 250).
+    async fn flush_sample_event_overflow(
+        &self,
+        sql: &SqlStorage,
+        budget: i64,
+    ) -> worker::Result<i64> {
+        let batch = read_sample_event_overflow_batch(sql, budget)?;
+        if batch.is_empty() {
+            return Ok(0);
+        }
+        let seqs: Vec<i64> = batch.iter().map(|(seq, _)| *seq).collect();
+        let events: Vec<logic::SampleEventPoint> = batch.into_iter().map(|(_, e)| e).collect();
+        worker::console_log!(
+            "analytics: flushing {} overflowed resource sample(s) from sample_event_overflow",
+            events.len()
+        );
+        let succeeded = self.write_sample_event_batch(&events);
+        let (succeeded_seqs, failed_seqs) =
+            logic::partition_seqs_by_write_result(&seqs, &succeeded);
+        if !failed_seqs.is_empty() {
+            worker::console_log!(
+                "analytics: {} of {} overflowed resource sample(s) failed to write this \
+                 flush; leaving them in sample_event_overflow for the next \
+                 alarm-triggered retry",
+                failed_seqs.len(),
+                events.len()
+            );
+        }
+        if !succeeded_seqs.is_empty() {
+            delete_sample_event_overflow_rows(sql, &succeeded_seqs)?;
+        }
+        count_sample_event_overflow(sql)
     }
 
     /// Ensures the DO alarm fires soon enough to drain `test_event_overflow`
@@ -1474,6 +1656,200 @@ impl RunCoordinator {
         .await?;
 
         Response::from_json(&SubmitReportOutcome {})
+    }
+
+    /// `SubmitResourceSamples(job_id, shard_index, attempt, instance_type,
+    /// samples, memory_peak_bytes?, oom_detected)` — one job's (or shard
+    /// attempt's) complete, immutable batch of cgroup v2 resource
+    /// samples, submitted once at job end (docs/design/analytics.md's
+    /// "Data flow"). `run_id`/`repo_id` are never read from the request
+    /// — only from this DO's own `run` row (`run_row`, below), matching
+    /// `lib.rs`'s own ingest-token auth check, which rejects the call
+    /// before it ever reaches this DO if the token's claims don't match
+    /// this job's real run/repo.
+    ///
+    /// **Idempotency.** `(job_id, shard_index, attempt)` is this batch's
+    /// execution identity; `resource_sample_batch` accepts exactly one
+    /// immutable content hash per identity
+    /// (`logic::resolve_submit_resource_samples`): an identical replay
+    /// is a clean no-op (nothing re-inserted, nothing re-delivered to
+    /// AE), a *different* batch for the same identity is a 409
+    /// conflict, never a silent overwrite — there is no "replace a
+    /// resource-sample batch" operation, unlike `SubmitReport`'s
+    /// canonical-row replacement.
+    ///
+    /// **Atomicity.** Cloudflare documents each individual `sql.exec()`
+    /// *call* as its own implicit transaction ("Each method is
+    /// implicitly wrapped inside a transaction, such that its results
+    /// are atomic and isolated from all other storage operations" —
+    /// developers.cloudflare.com/durable-objects/api/sqlite-storage-api/,
+    /// verified 2026-10-02) — **not** a sequence of separate `exec()`
+    /// calls with no `.await` between them, which an earlier version of
+    /// this handler incorrectly relied on: if the `resource_sample_batch`
+    /// insert's own `exec()` call had succeeded while a *later*,
+    /// separate `exec()` call inserting overflow rows then failed
+    /// partway through, the identity would be durably marked accepted
+    /// with an incomplete (or empty) delivery queue behind it — silent
+    /// data loss on a crash/error between the two calls. This handler
+    /// instead builds **one** semicolon-joined SQL string — the
+    /// `resource_sample_batch` row as a literal-valued `INSERT` (every
+    /// embedded value is either an integer or a value this deployment
+    /// itself generated: `job_id` is a ULID already resolved to a real
+    /// existing row by `lib.rs`'s auth check before this DO is ever
+    /// reached, `content_hash` is this function's own hex-SHA-256
+    /// output — both alphanumeric by construction, additionally
+    /// quote-escaped defensively) followed by a single multi-row
+    /// `INSERT` covering *every* sample in the batch, bound via `?`
+    /// placeholders — and executes it as **one** `exec()` call. Per
+    /// Cloudflare's own documented multi-statement semantics
+    /// ("parameter bindings are applied to the last SQL statement in
+    /// the query"), only the final statement may use bound parameters,
+    /// which is exactly why the batch-row insert (few, simple scalar
+    /// fields) is the one built as a literal and the per-sample insert
+    /// (arbitrary count, real floating-point payloads) is the one that
+    /// keeps `?` binding.
+    ///
+    /// **Every sample is queued before any AE delivery is attempted —
+    /// not only the tail beyond one invocation's budget.** An earlier
+    /// version of this handler wrote the first 250 samples straight to
+    /// Analytics Engine immediately and only persisted the *overflow*
+    /// remainder; a crash between that immediate write and this
+    /// method returning would have silently lost whichever of the
+    /// first 250 samples had not yet reached `write_data_point`, with
+    /// no durable record of them anywhere. Every sample now lands in
+    /// `sample_event_overflow` as part of the one atomic acceptance
+    /// transaction above; delivery (via [`Self::flush_sample_event_overflow`],
+    /// the exact same drain this DO's `alarm()` uses later) only starts
+    /// *after* that durable queue already exists, so a crash at any
+    /// point after this method's one `exec()` call returns can only
+    /// ever delay delivery, never lose a sample.
+    async fn handle_submit_resource_samples(
+        &self,
+        sql: &SqlStorage,
+        req: SubmitResourceSamplesRequest,
+    ) -> worker::Result<Response> {
+        let Some(run_row) = read_run(sql)? else {
+            return error_response(404, "run not found");
+        };
+        let run_terminal = run_state_of(&run_row)?.is_terminal();
+        let shard_state = match read_job_shard(sql, &req.job_id, req.shard_index)? {
+            Some(row) => shard_state_of(&row)?,
+            None => logic::ShardState::Pending,
+        };
+        if !logic::upload_allowed_for_shard(run_terminal, shard_state) {
+            return error_response(409, "shard is missing, or the run is already terminal");
+        }
+        if req.attempt == 0 {
+            return error_response(400, "attempt must be 1 or greater");
+        }
+
+        let samples: Vec<logic::ResourceSampleInput> = req
+            .samples
+            .iter()
+            .map(|s| logic::ResourceSampleInput {
+                timestamp_unix_ms: s.timestamp_unix_ms,
+                elapsed_usec: s.elapsed_usec,
+                cpu_usage_usec_delta: s.cpu_usage_usec_delta,
+                memory_current_bytes: s.memory_current_bytes,
+            })
+            .collect();
+
+        let content_hash = hex_sha256(&logic::resource_sample_batch_content_hash(
+            &req.job_id,
+            req.shard_index,
+            req.attempt,
+            &req.instance_type,
+            req.memory_peak_bytes,
+            req.oom_detected,
+            &samples,
+        ));
+        let existing_hash =
+            read_resource_sample_batch_hash(sql, &req.job_id, req.shard_index, req.attempt)?;
+        match logic::resolve_submit_resource_samples(existing_hash.as_deref(), &content_hash) {
+            logic::SubmitResourceSamplesDecision::AlreadyAccepted => {
+                // Safety net for a crash that landed between the
+                // accept-and-queue transaction committing and this same
+                // call's own `schedule_overflow_flush_alarm` running: a
+                // replay reaching this fast path must still re-arm the
+                // alarm if this identity's batch (or any other pending
+                // batch) is still sitting unqueued-for-delivery, or it
+                // could be stuck with no alarm ever scheduled again.
+                if count_sample_event_overflow(sql)? > 0 {
+                    self.schedule_overflow_flush_alarm().await?;
+                }
+                return Response::from_json(&SubmitResourceSamplesOutcome {});
+            }
+            logic::SubmitResourceSamplesDecision::Conflict => {
+                return error_response(
+                    409,
+                    "a different resource-sample batch was already accepted for this \
+                     job/shard/attempt",
+                );
+            }
+            logic::SubmitResourceSamplesDecision::Accepted => {}
+        }
+
+        let sample_events = logic::build_sample_events(
+            &run_row.id,
+            &req.job_id,
+            req.shard_index,
+            req.attempt,
+            run_row.repo_id,
+            &req.instance_type,
+            req.memory_peak_bytes,
+            &samples,
+        );
+
+        let now_ms = worker::Date::now().as_millis() as i64;
+        // `ctx.storage.transaction(callback)`: for SQLite-backed Durable
+        // Objects, every `sql.exec()` call made inside the callback
+        // participates in one real transaction, rolled back whole if
+        // the callback returns/rejects with an error (developers.
+        // cloudflare.com/durable-objects/api/sqlite-storage-api/
+        // `transaction` and `transactionSync` entries, "Last updated
+        // Sep 21, 2026", verified 2026-10-02).
+        let sql_for_txn = sql.clone();
+        let job_id = req.job_id;
+        let shard_index = req.shard_index;
+        let attempt = req.attempt;
+        let oom_detected = req.oom_detected;
+        self.state
+            .storage()
+            .transaction(move |_txn| async move {
+                accept_resource_sample_batch_and_queue_all(
+                    &sql_for_txn,
+                    &job_id,
+                    shard_index,
+                    attempt,
+                    &content_hash,
+                    oom_detected,
+                    now_ms,
+                    &sample_events,
+                )
+            })
+            .await?;
+
+        // Best-effort immediate delivery of up to one invocation's own
+        // budget, from the queue the call above just durably committed
+        // — the exact same drain `alarm()` uses later for whatever this
+        // call's own budget could not cover. Never loses data: anything
+        // not delivered here simply stays queued — but staying queued
+        // is only safe if something re-schedules the alarm to drain it
+        // later; an earlier version of this call ignored the returned
+        // remaining count entirely, so a run whose *only* overflow
+        // source was resource samples (no `test`-kind overflow ever
+        // re-arming the alarm as a side effect) could leave a residual
+        // sample backlog stuck with no alarm ever scheduled to drain
+        // it.
+        const MAX_DATA_POINTS_PER_INVOCATION: i64 = 250;
+        let remaining = self
+            .flush_sample_event_overflow(sql, MAX_DATA_POINTS_PER_INVOCATION)
+            .await?;
+        if remaining > 0 {
+            self.schedule_overflow_flush_alarm().await?;
+        }
+
+        Response::from_json(&SubmitResourceSamplesOutcome {})
     }
 
     async fn handle_complete_shard(
@@ -3333,6 +3709,54 @@ fn ensure_schema(sql: &SqlStorage) -> worker::Result<()> {
         )",
         None,
     )?;
+    // `write_sample_events`' overflow backlog — the exact same role
+    // `test_event_overflow` plays for `test`-kind points, for
+    // `sample`-kind points instead (a 1-hour job at 2s intervals is
+    // ~1800 samples, well over the 250-data-point-per-invocation cap,
+    // so this path is the common case for `SubmitResourceSamples`
+    // calls, not a rare edge case the way it is for `test_event_overflow`).
+    // DO-local only, same reasoning as `test_event_overflow`.
+    sql.exec(
+        "CREATE TABLE IF NOT EXISTS sample_event_overflow ( \
+            seq INTEGER PRIMARY KEY AUTOINCREMENT, \
+            run_id TEXT NOT NULL, \
+            job_id TEXT NOT NULL, \
+            shard_index INTEGER NOT NULL, \
+            attempt INTEGER NOT NULL, \
+            instance_type TEXT NOT NULL, \
+            timestamp_unix_ms REAL NOT NULL, \
+            elapsed_usec REAL NOT NULL, \
+            cpu_usage_usec_delta REAL NOT NULL, \
+            memory_current_bytes REAL NOT NULL, \
+            memory_peak_bytes REAL NOT NULL, \
+            memory_peak_known INTEGER NOT NULL, \
+            repo_id INTEGER NOT NULL, \
+            created_at INTEGER NOT NULL \
+        )",
+        None,
+    )?;
+    // One row per accepted `SubmitResourceSamples` execution identity
+    // (`coordinator` module docs' `SubmitResourceSamples` section):
+    // `(job_id, shard_index, attempt)` accepts exactly one immutable
+    // batch, identified by `content_hash`
+    // (`logic::resource_sample_batch_content_hash`, hex-encoded). A
+    // redelivered call with the same hash is a no-op
+    // (`logic::resolve_submit_resource_samples`'s `AlreadyAccepted`); a
+    // different hash for the same identity is a conflict, never an
+    // overwrite. DO-local only, same reasoning as `job_group`/
+    // `shard_state` — no D1 projection exists yet (no reader needs one).
+    sql.exec(
+        "CREATE TABLE IF NOT EXISTS resource_sample_batch ( \
+            job_id TEXT NOT NULL, \
+            shard_index INTEGER NOT NULL, \
+            attempt INTEGER NOT NULL, \
+            content_hash TEXT NOT NULL, \
+            oom_detected INTEGER NOT NULL, \
+            accepted_at INTEGER NOT NULL, \
+            PRIMARY KEY (job_id, shard_index, attempt) \
+        )",
+        None,
+    )?;
     Ok(())
 }
 
@@ -4285,20 +4709,196 @@ fn read_test_event_overflow_batch(
 /// No-op (and no query issued) when `seqs` is empty — callers should
 /// still prefer checking that themselves to avoid the allocation below.
 fn delete_test_event_overflow_rows(sql: &SqlStorage, seqs: &[i64]) -> worker::Result<()> {
-    if seqs.is_empty() {
-        return Ok(());
+    delete_overflow_rows_chunked(sql, "test_event_overflow", seqs)
+}
+
+// ---------------------------------------------------------------------------
+// `sample_event_overflow` — the durable delivery queue every
+// `SubmitResourceSamples` batch's samples land in, atomically with their
+// `resource_sample_batch` acceptance row (see
+// `accept_resource_sample_batch_and_queue_all`, below, and
+// `RunCoordinator::handle_submit_resource_samples`'s own doc comment).
+// ---------------------------------------------------------------------------
+
+fn count_sample_event_overflow(sql: &SqlStorage) -> worker::Result<i64> {
+    let rows: Vec<MaxSeqRow> = sql
+        .exec("SELECT COUNT(*) as m FROM sample_event_overflow", None)?
+        .to_array()?;
+    Ok(rows.first().map(|r| r.m).unwrap_or(0))
+}
+
+/// Up to `limit` oldest-queued overflow rows, paired with their own
+/// `seq` — mirrors `read_test_event_overflow_batch` exactly, for
+/// `sample`-kind points.
+fn read_sample_event_overflow_batch(
+    sql: &SqlStorage,
+    limit: i64,
+) -> worker::Result<Vec<(i64, logic::SampleEventPoint)>> {
+    let rows: Vec<SampleEventOverflowRow> = sql
+        .exec(
+            "SELECT seq, run_id, job_id, shard_index, attempt, instance_type, \
+             timestamp_unix_ms, elapsed_usec, cpu_usage_usec_delta, memory_current_bytes, \
+             memory_peak_bytes, memory_peak_known, repo_id \
+             FROM sample_event_overflow ORDER BY seq ASC LIMIT ?1",
+            vec![SqlStorageValue::try_from_i64(limit)?],
+        )?
+        .to_array()?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.seq,
+                logic::SampleEventPoint {
+                    run_id: row.run_id,
+                    job_id: row.job_id,
+                    shard_index: row.shard_index as u32,
+                    attempt: row.attempt as u32,
+                    instance_type: row.instance_type,
+                    timestamp_unix_ms: row.timestamp_unix_ms,
+                    elapsed_usec: row.elapsed_usec,
+                    cpu_usage_usec_delta: row.cpu_usage_usec_delta,
+                    memory_current_bytes: row.memory_current_bytes,
+                    memory_peak_bytes: row.memory_peak_bytes,
+                    memory_peak_known: row.memory_peak_known != 0,
+                    repo_id: row.repo_id,
+                },
+            )
+        })
+        .collect())
+}
+
+/// Deletes exactly the overflow rows named by `seqs` — mirrors
+/// `delete_test_event_overflow_rows` exactly, including its
+/// mixed-outcome-safety reasoning (see that function's doc comment).
+fn delete_sample_event_overflow_rows(sql: &SqlStorage, seqs: &[i64]) -> worker::Result<()> {
+    delete_overflow_rows_chunked(sql, "sample_event_overflow", seqs)
+}
+
+/// Shared by [`delete_test_event_overflow_rows`]/[`delete_sample_event_overflow_rows`]:
+/// deletes `seqs` from `table` in chunks of at most 100 — Durable
+/// Object SQLite accepts at most 100 bound parameters per query
+/// (confirmed live: a single `DELETE ... WHERE seq IN (?1..?N)` with
+/// `N > 100` fails with `SQLITE_ERROR: variable number must be between
+/// ?1 and ?100`, surfaced by this exact codepath during a real flush
+/// of more than 250 queued samples before this fix). A batch this
+/// deletes from is already bounded by the 250-data-point invocation
+/// budget (`flush_test_event_overflow`/`flush_sample_event_overflow`'s
+/// own `budget` parameter), so at most 3 chunks per call.
+fn delete_overflow_rows_chunked(sql: &SqlStorage, table: &str, seqs: &[i64]) -> worker::Result<()> {
+    const MAX_BOUND_PARAMS_PER_QUERY: usize = 100;
+    for chunk in seqs.chunks(MAX_BOUND_PARAMS_PER_QUERY) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let placeholders = (1..=chunk.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let params = chunk
+            .iter()
+            .map(|seq| SqlStorageValue::try_from_i64(*seq))
+            .collect::<worker::Result<Vec<_>>>()?;
+        sql.exec(
+            &format!("DELETE FROM {table} WHERE seq IN ({placeholders})"),
+            params,
+        )?;
     }
-    let placeholders = (1..=seqs.len())
-        .map(|i| format!("?{i}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let params = seqs
-        .iter()
-        .map(|seq| SqlStorageValue::try_from_i64(*seq))
-        .collect::<worker::Result<Vec<_>>>()?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `resource_sample_batch` — `SubmitResourceSamples`'s execution-identity
+// idempotency row (`coordinator` module docs' `SubmitResourceSamples`
+// section).
+// ---------------------------------------------------------------------------
+
+/// The content hash already accepted for this exact `(job_id,
+/// shard_index, attempt)` identity, if any —
+/// [`logic::resolve_submit_resource_samples`]'s `existing_hash` input.
+fn read_resource_sample_batch_hash(
+    sql: &SqlStorage,
+    job_id: &str,
+    shard_index: u32,
+    attempt: u32,
+) -> worker::Result<Option<String>> {
+    let rows: Vec<ResourceSampleBatchRow> = sql
+        .exec(
+            "SELECT content_hash FROM resource_sample_batch \
+             WHERE job_id = ?1 AND shard_index = ?2 AND attempt = ?3",
+            vec![
+                SqlStorageValue::from(job_id),
+                SqlStorageValue::try_from_i64(shard_index as i64)?,
+                SqlStorageValue::try_from_i64(attempt as i64)?,
+            ],
+        )?
+        .to_array()?;
+    Ok(rows.into_iter().next().map(|r| r.content_hash))
+}
+
+/// Inserts every sample as its own `INSERT` plus a final
+/// `resource_sample_batch` acceptance row — per-row, not one giant
+/// multi-row `INSERT`, because Durable Object SQLite accepts at most
+/// 100 bound parameters per query (live-confirmed: a single batched
+/// `INSERT` exceeding it failed with `SQLITE_ERROR: variable number
+/// must be between ?1 and ?100` against this exact deployment,
+/// 2026-10-02); at 13 columns per row, per-row `exec()` calls (13
+/// params each) stay far under that cap for any batch size.
+///
+/// **Caller MUST run this inside `ctx.storage.transaction(callback)`.**
+/// This function alone does not guarantee atomicity — only Cloudflare's
+/// real transaction wrapper does, which the SQLite backend applies to
+/// every `sql.exec()` call made inside its callback (developers.
+/// cloudflare.com/durable-objects/api/sqlite-storage-api/
+/// `transaction`/`transactionSync` entries, verified 2026-10-02). See
+/// [`RunCoordinator::handle_submit_resource_samples`] for the real
+/// caller wiring this through `self.state.storage().transaction(...)`.
+#[allow(clippy::too_many_arguments)]
+fn accept_resource_sample_batch_and_queue_all(
+    sql: &SqlStorage,
+    job_id: &str,
+    shard_index: u32,
+    attempt: u32,
+    content_hash: &str,
+    oom_detected: bool,
+    now_ms: i64,
+    events: &[logic::SampleEventPoint],
+) -> worker::Result<()> {
+    for event in events {
+        sql.exec(
+            "INSERT INTO sample_event_overflow \
+             (run_id, job_id, shard_index, attempt, instance_type, timestamp_unix_ms, \
+              elapsed_usec, cpu_usage_usec_delta, memory_current_bytes, memory_peak_bytes, \
+              memory_peak_known, repo_id, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            vec![
+                SqlStorageValue::from(event.run_id.as_str()),
+                SqlStorageValue::from(event.job_id.as_str()),
+                SqlStorageValue::try_from_i64(event.shard_index as i64)?,
+                SqlStorageValue::try_from_i64(event.attempt as i64)?,
+                SqlStorageValue::from(event.instance_type.as_str()),
+                SqlStorageValue::from(event.timestamp_unix_ms),
+                SqlStorageValue::from(event.elapsed_usec),
+                SqlStorageValue::from(event.cpu_usage_usec_delta),
+                SqlStorageValue::from(event.memory_current_bytes),
+                SqlStorageValue::from(event.memory_peak_bytes),
+                SqlStorageValue::try_from_i64(i64::from(event.memory_peak_known))?,
+                SqlStorageValue::try_from_i64(event.repo_id)?,
+                SqlStorageValue::try_from_i64(now_ms)?,
+            ],
+        )?;
+    }
     sql.exec(
-        &format!("DELETE FROM test_event_overflow WHERE seq IN ({placeholders})"),
-        params,
+        "INSERT INTO resource_sample_batch \
+         (job_id, shard_index, attempt, content_hash, oom_detected, accepted_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        vec![
+            SqlStorageValue::from(job_id),
+            SqlStorageValue::try_from_i64(shard_index as i64)?,
+            SqlStorageValue::try_from_i64(attempt as i64)?,
+            SqlStorageValue::from(content_hash),
+            SqlStorageValue::try_from_i64(i64::from(oom_detected))?,
+            SqlStorageValue::try_from_i64(now_ms)?,
+        ],
     )?;
     Ok(())
 }
@@ -4603,6 +5203,14 @@ impl RunCoordinatorStore {
         req: &SubmitReportRequest,
     ) -> Result<SubmitReportOutcome, CoordinatorError> {
         self.call(Method::Post, "/submit-report", Some(req)).await
+    }
+
+    pub async fn submit_resource_samples(
+        &self,
+        req: &SubmitResourceSamplesRequest,
+    ) -> Result<SubmitResourceSamplesOutcome, CoordinatorError> {
+        self.call(Method::Post, "/submit-resource-samples", Some(req))
+            .await
     }
 
     pub async fn complete_shard(

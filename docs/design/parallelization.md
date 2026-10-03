@@ -268,18 +268,43 @@ token) RPCs into `RunCoordinator`, which updates `shard_state` and checks:
   `always`, or `never`. `if_any_passed` runs the merge using only the successful shards' reports so
   the dashboard still shows partial results; the parent node's own status is still `failed` if any
   shard failed.
-- On satisfaction, `RunCoordinator` enqueues the merge step via the `job-dispatch` Queue, same as
-  any other node — merge dispatch still respects `RepoState`'s per-repo concurrency cap, so it may
-  wait briefly behind other running containers.
+- On satisfaction with `merge: true`, `RunCoordinator` enqueues a `ShardMergeRequested` message
+  onto the `cloud-ci-merge` Queue (`coordinator::mod`'s `enqueue_shard_merge`) — a Worker-side
+  merge for `junit`/`lcov` only, no container, no `RepoState` concurrency cap. The enqueue call
+  is fire-and-forget: a send failure is logged, not retried.
 
-**Implementation status.** `shard_state`/`job_group` and the barrier logic above are built as a
-state machine only (`cloud-ci-worker`'s `coordinator::logic` "Shard groups / merge barrier"
-section, `coordinator::mod`'s `handle_register_shard_group`/`handle_shard_terminal`): every rule
-on this page is decided correctly and unit-tested, but nothing dispatches the decision yet — no
-real `job-dispatch` Queue enqueue, no generated `<id>/merge` node, and `fail_fast`'s cancellation
-is a computed shard-index set only, not a real `stop_node_container`/`handle_cancel_run` call
-(shards are not yet modeled as `node` rows, so there is nothing to stop). See
-`coordinator::mod`'s "Shard groups / merge barrier" module-doc section for the exact boundary.
+**Implementation status.**
+
+Merge: real for `junit`/`lcov`. The Queue consumer (`src/lib.rs`'s `handle_shard_merge_requested`,
+`src/shard_merge.rs`, `cloud_ci_reports::merge`) reads the included shards' canonical reports from
+D1/R2, merges them, and writes the result to R2 plus a `shard_merges` row. Not built: a generated
+`<id>/merge` container node for `playwright-blob`/`vitest-blob`. `ci.shard` itself exists
+(`cloud-ci-pipeline-sdk`'s `src/shard.ts`: split/count/files/run/check) but its `reports`/merge
+options — the ones that would drive generating that node — are not implemented
+(`ShardOptions`/`ShardResult` in `src/types.ts` carry no `reports`/merge field yet). A
+`playwright-blob`/`vitest-blob` report reaching the consumer today is logged and skipped, not
+merged.
+
+Cancellation: real for `fail_fast`. A dispatched shard is a `node` row, registered via the
+existing `startNode` RPC under id `shard:{job_name}:{idx}:{attempt}`. `handle_shard_terminal`'s
+`FailFastTriggered` branch calls `stop_node_container` then `mark_node_cancelled` for each
+cancelled index's node — same path `handle_cancel_run` uses for whole-run cancellation. Selection
+is exact: `(job_name, idx)` plus a canonical decimal attempt suffix, not a bare string prefix — a
+job name containing `:` cannot match another job's node (job `build` idx 1 never selects job
+`build:1` idx 2's node). A node already terminal (succeeded, failed, or already cancelled) is left
+untouched. Only this selection is verified; `stop_node_container`/`mark_node_cancelled`'s own
+reliability is not (see Known gap below).
+
+**Known gap.** Two effects are not retried on failure:
+- `stop_node_container` swallows its own error (logs, does not propagate). A cancel call can mark
+  a node `Cancelled` even if the real container failed to stop.
+- A shard-terminal call whose D1 projection or own-node completion fails after its `shard_state`
+  row already committed is not retried: a redelivered call with the same terminal status is
+  treated as an already-applied duplicate and skips both those writes and barrier re-evaluation.
+
+Neither is fixed yet.
+
+See `coordinator::mod`'s "Shard groups / merge barrier" module-doc section for the exact boundary.
 
 ### Merge strategies per report type
 

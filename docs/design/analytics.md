@@ -90,9 +90,10 @@ size) is this doc's concern, below.
 ### CLI
 
 ```
-$ cloud-ci agent --job test --runner standard-2 ...
+$ cloud-ci agent --job-id <id> --shard <n> --attempt <n> --instance-type standard-2 ...
 # agent samples /sys/fs/cgroup/{memory.current,memory.peak,cpu.stat} every 2s,
-# uploads samples as part of the job's Report on exit.
+# submits the complete batch once via SubmitResourceSamples on exit (its own
+# typed RPC, not embedded in the job's Report — see "Data flow", below).
 
 $ cloud-ci upload --report junit:./target/junit.xml --report timing:./target/step-timings.json
 # BYO-CI path (same binary, no agent/cgroup sampling since there's no container we control).
@@ -137,7 +138,8 @@ A repo can opt a template into showing these sections inline (see
 flowchart LR
     subgraph Container
       Agent[cloud-ci agent] -->|cgroup v2 samples every 2s| Agent
-      Agent -->|Report: timings + samples + test results| Worker
+      Agent -->|Report: timings + test results| Worker
+      Agent -->|SubmitResourceSamples: complete batch, once| Worker
     end
     CLI[cloud-ci upload BYO-CI] -->|Report: timings + test results, no samples| Worker
     Worker -->|writeDataPoint per step/sample/test| AE[(Analytics Engine)]
@@ -155,6 +157,20 @@ flowchart LR
     Cron2 -->|write chosen instance size + insights| D1Roll
 ```
 
+Resource samples travel over their own typed RPC, `SubmitResourceSamples`
+(`job_id`, `shard_index`, `attempt`, `instance_type`, `repeated ResourceSample samples`,
+optional `memory_peak_bytes`, `oom_detected`) — not embedded in the job's end-of-run
+`Report` the way an earlier design sketch described. `run_id`/`repo_id` are never
+client-supplied fields on this RPC: the Worker authenticates the caller's
+run-scoped ingest token (the same HMAC token `BeginRun` mints and the raw
+upload-part PUT path already verifies) and cross-checks its `repo_id`/`run_id`
+claims against the job's real owning run (resolved independently via D1), so a
+request can never attribute samples to a run/repo it does not hold a credential
+for. `(job_id, shard_index, attempt)` is this batch's execution identity:
+`RunCoordinator` accepts exactly one immutable content hash per identity — an
+identical redelivery is a clean no-op, a *different* batch for the same identity
+is rejected (409), never silently overwritten.
+
 RunCoordinator (per-run Durable Object, see [../architecture.md](../architecture.md)) writes
 job/step start and end timestamps directly to D1 as the run progresses (`runs`, `jobs`, `steps`
 tables — "live" tables, small, always current). High-cardinality and high-frequency data (every
@@ -162,16 +178,30 @@ resource sample, every test case result, every step's fine-grained duration) goe
 Engine via `writeDataPoint`, because D1 is not suited to write volumes of that shape and because
 Analytics Engine's 3-month retention and sampling-at-scale are a better fit for raw time series
 (verified 2026-09-30, developers.cloudflare.com/analytics/analytics-engine/limits/: 3-month
-retention, up to 20 blobs/20 doubles/1 index per data point, 16 KB blob budget per data point, 250
-`writeDataPoint` calls per Worker invocation). A single `SubmitReport` call whose report has more
-than 250 individual test-case outcomes cannot write all of them in that call's own invocation;
-`RunCoordinator` persists the overflow in its own DO-local `test_event_overflow` table (never
-drops it) and drains it across one or more later alarm-triggered invocations, each with its own
-fresh 250-write budget — see `coordinator/mod.rs`'s `write_test_events`/`flush_test_event_overflow`
-doc comments for the exact mechanism. The same ingest path also writes a per-upload
-summary row and that upload's full parsed report to R2 immediately on ingest, and separately
-applies the touched tests' rolling aggregates exactly once per finalized run — see D1 rollup
-tables and R2, below.
+retention, up to 20 blobs/20 doubles/1 index per data point, 16 KB blob budget per data point).
+The 250 figure is a **per-Worker-invocation data-point cap**, not a call cap — "You can write a
+maximum of 250 data points per Worker invocation (client HTTP request). Each call to
+`writeDataPoint` counts towards this limit" (same source) — the Workers `analytics_engine`
+binding exposes only a single-point `write_data_point`, no platform batch call, so this is
+enforced as a hard cap on how many of a request's events/samples one invocation writes
+immediately. A single `SubmitReport` call whose report has more than 250 individual test-case
+outcomes cannot write all of them in that call's own invocation; the overflow beyond the first 250
+is persisted to `RunCoordinator`'s own DO-local `test_event_overflow` table (never dropped) for a
+later alarm-triggered flush. `SubmitResourceSamples` is stricter: **every** sample in the batch —
+not only the tail beyond one invocation's 250-point budget — is durably queued into
+`sample_event_overflow` inside one atomic DO-storage transaction before any `write_data_point`
+call is attempted, so a crash between acceptance and delivery can only delay delivery, never lose
+a sample (a replay of the same batch is also a clean no-op via its content hash — see "Data flow",
+above). Once that queue is durably committed, up to one invocation's own 250-point budget is
+delivered immediately; any remainder drains across one or more later alarm-triggered invocations,
+sharing **one** 250-data-point budget with `test_event_overflow` per alarm fire rather than
+letting each spend an independent 250 (which would exceed the real per-invocation cap) — see
+`coordinator/mod.rs`'s `write_test_events`/`write_sample_events`/`flush_test_event_overflow`/
+`flush_sample_event_overflow`/`alarm` and `coordinator/logic.rs`'s `allocate_shared_overflow_budget`
+doc comments for the exact mechanism.
+The same ingest path also writes a per-upload summary row and that upload's full parsed report to
+R2 immediately on ingest, and separately applies the touched tests' rolling aggregates exactly
+once per finalized run — see D1 rollup tables and R2, below.
 
 ### What is collected
 
@@ -199,12 +229,16 @@ retry-one-size-up [source: docs.kernel.org cgroup-v2.rst, `cpu.stat`/`memory.pea
 sections; exact kernel doc version not pinned, cross-checked 2026-09-30].
 
 The agent samples every 2 seconds and keeps all samples in memory for the duration of the job (a
-1-hour job at 2s intervals is 1800 samples × 2 doubles × 8 bytes ≈ 29 KB, well inside per-job
-memory), then emits them as part of the job's end-of-run Report rather than streaming each sample
-individually — this keeps the Worker's `writeDataPoint` call count low (one batch write per job
-via `writeDataPoints()`, not one call per 2s tick) and avoids the 250-calls-per-invocation
-Analytics Engine limit on busy runs with many concurrent jobs reporting to the same Worker
-invocation.
+1-hour job at 2s intervals is 1800 samples × 4 fields × 8 bytes ≈ 58 KB, well inside per-job
+memory), then submits the complete batch once, at job end, via `SubmitResourceSamples` — one
+typed RPC call, not a stream of per-sample calls. The Worker's own `write_data_point` calls
+against that batch (the Workers `analytics_engine` binding exposes only a single-point call, no
+platform batch API) still face the real 250-data-point-per-invocation cap on that one RPC call's
+own Worker invocation: for a job whose batch exceeds 250 samples (anything over ~8 minutes at this
+cadence — the common case, not an edge case), every sample in the batch is durably queued into
+`sample_event_overflow` in one atomic transaction first, then up to 250 are delivered immediately
+and the remainder drains via later DO-alarm-triggered flushes rather than being dropped — see
+"Data flow", above, for the exact mechanism.
 
 ### Analytics Engine schema
 
@@ -219,6 +253,21 @@ one binding is simplest to operate for a single-tenant deployment):
 | `sample` | run_id | job_id | instance_type | cpu_usage_usec_delta | memory_current_bytes | memory_peak_bytes | repo_id |
 | `test` | run_id | job_id | test_id | duration_ms | pass(1)/fail(0)/skip(-1) | — | repo_id |
 | `cache` | run_id | job_id | cache_key_prefix | hit(1)/miss(0) | bytes_restored | — | repo_id |
+
+`sample` rows carry five more fields than fit in the generic table above — `SubmitResourceSamples`'s
+execution identity (`shard_index`, `attempt`) and the batched
+[`ResourceSample`](#data-flow)'s own elapsed and wall-clock timing — well inside Analytics Engine's
+documented 20-blob/20-double per-data-point budget: `blob5=shard_index` (decimal string),
+`blob6=attempt` (decimal string), `double4=elapsed_usec` (monotonic time since the *previous*
+sample on this shard/attempt, per the agent's own `Instant`-based clock — never derived from
+wall-clock subtraction, which a backward clock jump could corrupt), `double5=timestamp_unix_ms`
+(wall-clock capture time, for display/ordering only), `double6=memory_peak_known` (`1.0` if
+`memory_peak_bytes` (`double3`) is a real reading, `0.0` if the batch's peak was unset — the kernel
+never recorded one, `memory.peak` reading `max` — in which case `double3` itself is a harmless
+`0.0` placeholder, never `NaN`; downstream readers must consult `double6`, not treat an unflagged
+zero `double3` as a genuine zero-byte peak). There is no `oom_detected` column in any `sample` row;
+that flag lives only on `RunCoordinator`'s own `resource_sample_batch` DO row (no D1 projection
+yet — no reader needs one).
 
 `repo_id` is the index because the brief's deployment model is single-tenant-per-org-but-many-repos:
 repos are the natural "customer" subgroup for Analytics Engine's equitable sampling (see Sampling,

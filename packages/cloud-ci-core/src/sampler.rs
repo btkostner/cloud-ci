@@ -12,27 +12,30 @@
 //! concern (`cloud-ci-cli`'s `agent.rs`), not this module's. Tests below
 //! feed synthetic, not real-time, sequences.
 //!
-//! # Scope
+//! # Wire format
 //!
-//! See `crate::cgroup`'s module doc and `cloud-ci-cli`'s `agent.rs` module
-//! doc: this is only the resource-sampling piece of `cloud-ci agent`'s
-//! full job, built ahead of job-spec-pulling and step-execution, which do
-//! not exist yet.
+//! This module has no wire format of its own — `cloud-ci-cli`'s
+//! `agent.rs` builds `cloud_ci_proto::ingest::v1::SubmitResourceSamplesRequest`
+//! directly from [`JobSummary`]/[`Sample`]'s fields (one
+//! `cloud_ci_proto::ingest::v1::ResourceSample` per [`Sample`]); the
+//! typed proto message is the transport, not a `serde` encoding of these
+//! types. `cloud-ci-core` stays free of both `serde` and any proto
+//! dependency, matching its "no Worker/cloud dependency" scope.
 
 use crate::cgroup::RawReading;
+use std::time::Instant;
 
-/// One batched resource sample, matching the field names/shapes of
-/// `docs/design/analytics.md`'s "Analytics Engine schema" `sample` row
-/// (`cpu_usage_usec_delta`, `memory_current_bytes`) for forward
-/// compatibility, even though this round never writes to Analytics
-/// Engine — `cloud-ci-core` has no Worker/cloud dependency. The row's
-/// other fields (`run_id`, `job_id`, `instance_type`, `memory_peak_bytes`,
-/// `repo_id`) are context the real upload path attaches later; they are
-/// not part of this per-sample batch (`memory_peak_bytes` in particular
-/// is job-level, not per-sample — see [`JobSummary`]).
+/// One batched resource sample: CPU usage as a delta since the previous
+/// tick, the live `memory.current` gauge, and `elapsed_usec` — the real
+/// wall-clock time since the previous tick (or since [`Sampler::new`]'s
+/// baseline reading, for the first emitted sample), carried explicitly
+/// so `cpu_usage_usec_delta / elapsed_usec` normalizes to a CPU
+/// fraction without a consumer needing the whole ordered batch to
+/// re-derive it from consecutive `timestamp_unix_ms` values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Sample {
     pub timestamp_unix_ms: u64,
+    pub elapsed_usec: u64,
     pub cpu_usage_usec_delta: u64,
     pub memory_current_bytes: u64,
 }
@@ -53,7 +56,9 @@ pub struct JobSummary {
 /// apart, and reports OOM status at [`Sampler::finish`].
 #[derive(Debug, Clone)]
 pub struct Sampler {
-    last_reading: Option<RawReading>,
+    /// The previous tick's reading and the monotonic instant it was
+    /// taken at.
+    last: Option<(RawReading, Instant)>,
     oom_kill_at_start: u64,
     samples: Vec<Sample>,
 }
@@ -64,13 +69,18 @@ impl Sampler {
     /// against.
     pub fn new(oom_kill_at_start: u64) -> Self {
         Self {
-            last_reading: None,
+            last: None,
             oom_kill_at_start,
             samples: Vec::new(),
         }
     }
 
-    /// Feeds one raw tick, `timestamp_unix_ms` being when it was taken.
+    /// Feeds one raw tick. `timestamp_unix_ms` is the real wall-clock
+    /// time this tick was taken, recorded on the [`Sample`] for display.
+    /// `now` is a monotonic [`Instant`] the caller reads via
+    /// `Instant::now()` once per tick, used to compute `elapsed_usec`
+    /// instead: wall-clock time can move backward, which would corrupt
+    /// CPU-percent normalization.
     ///
     /// `cpu.stat`'s `usage_usec` is a monotonic cumulative counter: the
     /// delta against the previous tick is this tick's CPU usage. If the
@@ -81,18 +91,20 @@ impl Sampler {
     /// pushed for it) instead of emitting a garbage negative number. The
     /// very first tick has no previous reading to diff against and is
     /// likewise not pushed as a `Sample`, only recorded as the baseline
-    /// for the next tick's delta.
-    pub fn record(&mut self, timestamp_unix_ms: u64, raw: RawReading) {
-        if let Some(prev) = self.last_reading
+    /// for the next tick's delta (and `elapsed_usec`).
+    pub fn record(&mut self, timestamp_unix_ms: u64, now: Instant, raw: RawReading) {
+        if let Some((prev, prev_instant)) = self.last
             && raw.cpu_usage_usec >= prev.cpu_usage_usec
         {
+            let elapsed_usec = now.saturating_duration_since(prev_instant).as_micros() as u64;
             self.samples.push(Sample {
                 timestamp_unix_ms,
+                elapsed_usec,
                 cpu_usage_usec_delta: raw.cpu_usage_usec - prev.cpu_usage_usec,
                 memory_current_bytes: raw.memory_current_bytes,
             });
         }
-        self.last_reading = Some(raw);
+        self.last = Some((raw, now));
     }
 
     /// Samples recorded so far, in record order.
@@ -116,6 +128,7 @@ impl Sampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn raw(cpu_usage_usec: u64, memory_current_bytes: u64) -> RawReading {
         RawReading {
@@ -126,20 +139,27 @@ mod tests {
 
     #[test]
     fn first_tick_has_no_delta_and_is_not_sampled() {
+        let base = Instant::now();
         let mut sampler = Sampler::new(0);
-        sampler.record(2000, raw(1_000_000, 1024));
+        sampler.record(2000, base, raw(1_000_000, 1024));
         assert_eq!(sampler.samples(), &[]);
     }
 
     #[test]
     fn second_tick_emits_the_delta_since_the_first() {
+        let base = Instant::now();
         let mut sampler = Sampler::new(0);
-        sampler.record(2000, raw(1_000_000, 1024));
-        sampler.record(4000, raw(1_300_000, 2048));
+        sampler.record(2000, base, raw(1_000_000, 1024));
+        sampler.record(
+            4000,
+            base + Duration::from_millis(2000),
+            raw(1_300_000, 2048),
+        );
         assert_eq!(
             sampler.samples(),
             &[Sample {
                 timestamp_unix_ms: 4000,
+                elapsed_usec: 2_000_000,
                 cpu_usage_usec_delta: 300_000,
                 memory_current_bytes: 2048,
             }]
@@ -147,21 +167,24 @@ mod tests {
     }
 
     #[test]
-    fn multiple_ticks_each_emit_their_own_delta() {
+    fn multiple_ticks_each_emit_their_own_delta_and_elapsed() {
+        let base = Instant::now();
         let mut sampler = Sampler::new(0);
-        sampler.record(2000, raw(0, 100));
-        sampler.record(4000, raw(500, 200));
-        sampler.record(6000, raw(1_500, 150));
+        sampler.record(2000, base, raw(0, 100));
+        sampler.record(4500, base + Duration::from_millis(2500), raw(500, 200));
+        sampler.record(6600, base + Duration::from_millis(4600), raw(1_500, 150));
         assert_eq!(
             sampler.samples(),
             &[
                 Sample {
-                    timestamp_unix_ms: 4000,
+                    timestamp_unix_ms: 4500,
+                    elapsed_usec: 2_500_000,
                     cpu_usage_usec_delta: 500,
                     memory_current_bytes: 200,
                 },
                 Sample {
-                    timestamp_unix_ms: 6000,
+                    timestamp_unix_ms: 6600,
+                    elapsed_usec: 2_100_000,
                     cpu_usage_usec_delta: 1_000,
                     memory_current_bytes: 150,
                 },
@@ -171,16 +194,20 @@ mod tests {
 
     #[test]
     fn counter_reset_discards_that_ticks_delta_without_going_negative() {
+        let base = Instant::now();
         let mut sampler = Sampler::new(0);
-        sampler.record(2000, raw(5_000_000, 1024));
+        sampler.record(2000, base, raw(5_000_000, 1024));
         // Counter dropped: cgroup reused/recreated, not real CPU usage.
-        sampler.record(4000, raw(100, 512));
-        // Normal delta resumes from the post-reset baseline.
-        sampler.record(6000, raw(400, 256));
+        sampler.record(4000, base + Duration::from_millis(2000), raw(100, 512));
+        // Normal delta resumes from the post-reset baseline; elapsed_usec
+        // is still measured from the immediately-preceding tick (4000ms),
+        // not from the last *emitted* sample (there was none yet).
+        sampler.record(6000, base + Duration::from_millis(4000), raw(400, 256));
         assert_eq!(
             sampler.samples(),
             &[Sample {
                 timestamp_unix_ms: 6000,
+                elapsed_usec: 2_000_000,
                 cpu_usage_usec_delta: 300,
                 memory_current_bytes: 256,
             }]
@@ -189,13 +216,15 @@ mod tests {
 
     #[test]
     fn zero_delta_is_a_valid_sample_not_a_reset() {
+        let base = Instant::now();
         let mut sampler = Sampler::new(0);
-        sampler.record(2000, raw(1_000, 10));
-        sampler.record(4000, raw(1_000, 10));
+        sampler.record(2000, base, raw(1_000, 10));
+        sampler.record(4000, base + Duration::from_millis(2000), raw(1_000, 10));
         assert_eq!(
             sampler.samples(),
             &[Sample {
                 timestamp_unix_ms: 4000,
+                elapsed_usec: 2_000_000,
                 cpu_usage_usec_delta: 0,
                 memory_current_bytes: 10,
             }]
@@ -203,10 +232,24 @@ mod tests {
     }
 
     #[test]
+    fn elapsed_usec_survives_a_backward_wall_clock_jump() {
+        // Wall clock regresses (NTP adjustment) between two ticks, but
+        // the monotonic Instant never does — elapsed_usec must reflect
+        // the real monotonic gap, not go to zero or underflow.
+        let base = Instant::now();
+        let mut sampler = Sampler::new(0);
+        sampler.record(10_000, base, raw(0, 10));
+        sampler.record(9_000, base + Duration::from_millis(2000), raw(500, 20));
+        assert_eq!(sampler.samples()[0].elapsed_usec, 2_000_000);
+        assert_eq!(sampler.samples()[0].timestamp_unix_ms, 9_000);
+    }
+
+    #[test]
     fn finish_reports_memory_peak_and_no_oom_when_counter_unchanged() {
+        let base = Instant::now();
         let mut sampler = Sampler::new(3);
-        sampler.record(2000, raw(0, 10));
-        sampler.record(4000, raw(100, 20));
+        sampler.record(2000, base, raw(0, 10));
+        sampler.record(4000, base + Duration::from_millis(2000), raw(100, 20));
         let summary = sampler.finish(Some(2048), 3);
         assert_eq!(summary.memory_peak_bytes, Some(2048));
         assert!(!summary.oom_detected);

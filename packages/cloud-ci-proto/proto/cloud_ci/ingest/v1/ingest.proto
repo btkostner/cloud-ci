@@ -12,6 +12,7 @@ service IngestService {
   rpc CreateUpload(CreateUploadRequest) returns (CreateUploadResponse);
   rpc CompleteUpload(CompleteUploadRequest) returns (CompleteUploadResponse);
   rpc SubmitReport(SubmitReportRequest) returns (SubmitReportResponse);
+  rpc SubmitResourceSamples(SubmitResourceSamplesRequest) returns (SubmitResourceSamplesResponse);
   rpc CompleteShard(CompleteShardRequest) returns (CompleteShardResponse);
   rpc GetRun(GetRunRequest) returns (GetRunResponse);
   rpc GetTestTimings(GetTestTimingsRequest) returns (GetTestTimingsResponse);
@@ -127,6 +128,49 @@ message SubmitReportRequest {
 }
 
 message SubmitReportResponse {}
+
+// One batched cgroup v2 resource sample (docs/design/analytics.md's "What
+// is collected" table): `elapsed_usec` is the real wall-clock time since
+// the previous sample (or job start, for the first sample), carried
+// explicitly rather than re-derived from consecutive `timestamp_unix_ms`
+// values downstream, so a consumer can normalize `cpu_usage_usec_delta`
+// into a CPU fraction (`cpu_usage_usec_delta / elapsed_usec`) without
+// needing the whole ordered batch in hand.
+message ResourceSample {
+  uint64 timestamp_unix_ms = 1;
+  uint64 elapsed_usec = 2;
+  uint64 cpu_usage_usec_delta = 3;
+  uint64 memory_current_bytes = 4;
+}
+
+// One job's (or shard attempt's) complete, immutable batch of resource
+// samples, submitted once at job end (docs/design/analytics.md's "Data
+// flow": "the agent ... emits them as part of the job's end-of-run
+// Report rather than streaming each sample individually"). `job_id` is
+// used to resolve routing/auth (cross-checked against the caller's
+// ingest-token claims, never trusted alone — docs/design/auth.md's
+// Machine auth section); `run_id`/`repo_id` are never client-supplied
+// fields, only ever inferred from the authorized job. `shard_index`
+// (0-based, matching every other shard-scoped RPC in this service) and
+// `attempt` (1-based; 0 is invalid) together with `job_id` form this
+// batch's execution identity — resubmitting the identical batch for the
+// same identity is a no-op; a *different* batch for the same identity is
+// a conflict, never a silent overwrite (see `SubmitResourceSamples`'s own
+// handler doc comment for the exact idempotency rule).
+message SubmitResourceSamplesRequest {
+  string job_id = 1;
+  uint32 shard_index = 2;
+  uint32 attempt = 3;
+  string instance_type = 4;
+  repeated ResourceSample samples = 5;
+  // Unset (proto3 `optional`) when the kernel never recorded a peak
+  // (`memory.peak` reads literal `max` — `cloud_ci_core::cgroup`'s
+  // `parse_memory_peak` module doc) — distinct from a genuine `0`.
+  optional uint64 memory_peak_bytes = 6;
+  bool oom_detected = 7;
+}
+
+message SubmitResourceSamplesResponse {}
 
 message CompleteShardRequest {
   string job_id = 1;
