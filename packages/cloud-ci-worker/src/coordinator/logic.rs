@@ -965,6 +965,263 @@ pub fn dedupe_test_outcomes(rows: Vec<TestOutcomeRow>) -> Vec<TestOutcomeRow> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Shard groups / merge barrier (`RunCoordinator`'s own `shard_state`/
+// `job_group` rows, docs/design/parallelization.md's "### Merge barrier
+// (RunCoordinator)" and "### Failed-shard retry semantics"). Pure decision
+// logic only, same split as every other section in this module — see
+// `coordinator` module docs for the DO-side storage wiring.
+//
+// **Scope boundary for this round.** This section decides, for a shard
+// group: (1) whether a terminal shard-ingest call is new or a duplicate
+// redelivery (idempotency, matching `resolve_complete_node`'s exact
+// discipline: same status replayed is a no-op, a *different* terminal
+// status for the same key is a conflict); (2) whether `fail_fast` should
+// fire immediately, and if so which shard indices need cancelling; (3)
+// once every shard (by its latest attempt only) is terminal, whether to
+// merge and which shards' reports to include. It does **not** build real
+// merge execution (no JUnit/coverage parsing, no generated `<id>/merge`
+// node, no Queue consumer — docs/design/parallelization.md's "Merge
+// strategies per report type" table is entirely out of scope here) and it
+// does **not** itself stop any container: [`evaluate_barrier`]'s
+// `FailFastTriggered` arm only returns the *set* of shard indices a caller
+// should cancel. `coordinator::mod`'s `handle_shard_terminal` (this
+// round's only caller) records that decision but does not wire it to
+// `stop_node_container`/`handle_cancel_run` — shards are not yet modeled
+// as `node` rows this round (no RPC registers "shard N started running"),
+// so there is no real container handle to stop yet; that wiring is a
+// separate, later round once shards are dispatched as real nodes.
+// ---------------------------------------------------------------------------
+
+/// `job_group.merge_on_failure`'s three documented values exactly
+/// (parallelization.md: "`if_any_passed` (default), `always`, or
+/// `never`").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeOnFailure {
+    IfAnyPassed,
+    Always,
+    Never,
+}
+
+impl MergeOnFailure {
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            MergeOnFailure::IfAnyPassed => "if_any_passed",
+            MergeOnFailure::Always => "always",
+            MergeOnFailure::Never => "never",
+        }
+    }
+
+    pub fn from_db_str(s: &str) -> Option<Self> {
+        match s {
+            "if_any_passed" => Some(MergeOnFailure::IfAnyPassed),
+            "always" => Some(MergeOnFailure::Always),
+            "never" => Some(MergeOnFailure::Never),
+            _ => None,
+        }
+    }
+}
+
+/// A shard's terminal outcome — `shard_state.status`'s two terminal
+/// values (the broader `queued | running | passed | failed | retrying`
+/// column, per the Data model section, is narrowed to just the two this
+/// module's barrier math cares about: "terminal" means one of these).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShardTerminalStatus {
+    Passed,
+    Failed,
+}
+
+impl ShardTerminalStatus {
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            ShardTerminalStatus::Passed => "passed",
+            ShardTerminalStatus::Failed => "failed",
+        }
+    }
+
+    pub fn from_db_str(s: &str) -> Option<Self> {
+        match s {
+            "passed" => Some(ShardTerminalStatus::Passed),
+            "failed" => Some(ShardTerminalStatus::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// A terminal shard-ingest call for a `(job_name, idx, attempt)` key that
+/// already has a *different* terminal status recorded — mirrors
+/// `CompleteNodeError::ConflictingStatus`'s "same shape, different
+/// domain" pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConflictingShardStatus;
+
+/// Whether this terminal-ingest call is new or an already-applied
+/// redelivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShardTerminalDecision {
+    /// Fresh terminal status for this exact `(job_name, idx, attempt)` —
+    /// the caller should write the row and go on to evaluate the barrier.
+    Recorded,
+    /// The exact same status was already recorded for this key — a
+    /// redelivered call. The caller must not write again and must not
+    /// re-run [`evaluate_barrier`]: "a redelivered/duplicate
+    /// terminal-ingest call ... must not double-count or re-trigger the
+    /// barrier logic".
+    AlreadyRecorded,
+}
+
+/// Resolves a terminal shard-ingest call against whatever status (if any)
+/// is already recorded for the exact same `(job_name, idx, attempt)` key
+/// — the same idempotency discipline [`resolve_complete_node`] already
+/// established for node completions: a replayed call with the identical
+/// terminal value is a clean no-op, a replayed call with a *different*
+/// terminal value is a conflict, never a silent overwrite.
+pub fn resolve_shard_terminal(
+    existing_status: Option<ShardTerminalStatus>,
+    incoming: ShardTerminalStatus,
+) -> Result<ShardTerminalDecision, ConflictingShardStatus> {
+    match existing_status {
+        None => Ok(ShardTerminalDecision::Recorded),
+        Some(existing) if existing == incoming => Ok(ShardTerminalDecision::AlreadyRecorded),
+        Some(_) => Err(ConflictingShardStatus),
+    }
+}
+
+/// One shard's terminal row, as input to [`latest_attempt_per_shard`]/
+/// [`evaluate_barrier`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShardStateRow {
+    pub idx: u32,
+    pub attempt: u32,
+    pub status: ShardTerminalStatus,
+}
+
+/// Collapses every terminal `(idx, attempt)` row down to only its
+/// highest-`attempt` row per `idx` — "Failed-shard retry semantics": "An
+/// OOM retry reuses the exact same `shard_plan` entry for that index ...
+/// only the LATEST attempt's terminal status counts toward
+/// `expected_total`, not both attempts." Order is not meaningful on the
+/// input (every terminal row for every attempt of every shard so far);
+/// the output is sorted by `idx` for deterministic, order-independent
+/// comparison by callers (including these tests).
+pub fn latest_attempt_per_shard(rows: &[ShardStateRow]) -> Vec<ShardStateRow> {
+    let mut by_idx: std::collections::BTreeMap<u32, ShardStateRow> =
+        std::collections::BTreeMap::new();
+    for row in rows {
+        match by_idx.get(&row.idx) {
+            Some(existing) if existing.attempt >= row.attempt => {}
+            _ => {
+                by_idx.insert(row.idx, *row);
+            }
+        }
+    }
+    by_idx.into_values().collect()
+}
+
+/// A shard group's fixed configuration — `job_group`'s row, minus
+/// `merge_job_id` (that column is reserved for the later merge-execution
+/// round that actually dispatches the generated `<id>/merge` node; this
+/// round never sets or reads it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobGroupConfig {
+    pub expected_total: u32,
+    pub fail_fast: bool,
+    pub merge_on_failure: MergeOnFailure,
+}
+
+/// [`evaluate_barrier`]'s full output: this round's scope boundary is
+/// exactly this decision — "the full output of this round's scope" per
+/// the brief — never real cancellation/merge execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BarrierOutcome {
+    /// Fewer than `expected_total` shards (by latest attempt) are
+    /// terminal yet, and no fail-fast trigger fired on this call — the
+    /// group keeps waiting for the rest ("`fail_fast: false` (default)
+    /// lets every shard run to its own terminal state").
+    Waiting,
+    /// `fail_fast = true` and the shard just recorded by this call went
+    /// terminal-`failed` before every shard in the group reached its own
+    /// terminal state: the whole group is immediately `failed`.
+    /// `cancel_idxs` are every shard index (0-based, per
+    /// `shard_plan.idx`) in `0..expected_total` that has not yet reached
+    /// a terminal status — "flag every other `running`/`queued` shard in
+    /// that group for cancellation". Sorted ascending.
+    FailFastTriggered { cancel_idxs: Vec<u32> },
+    /// Every shard (by latest attempt) reached a terminal status: the
+    /// barrier is satisfied. `merge` and `included_idxs` are the
+    /// `merge_on_failure`-dependent decision below. `included_idxs` is
+    /// sorted ascending and empty whenever `merge` is `false` (nothing is
+    /// merged, so there is nothing to include).
+    Satisfied {
+        merge: bool,
+        included_idxs: Vec<u32>,
+    },
+}
+
+/// Evaluates the merge barrier for one shard group, per
+/// parallelization.md's "### Merge barrier (RunCoordinator)" bullets,
+/// after a terminal shard-ingest call has resolved
+/// [`ShardTerminalDecision::Recorded`] (a duplicate/`AlreadyRecorded` call
+/// must never reach this function — that is exactly how "must not ...
+/// re-trigger the barrier logic" is enforced).
+///
+/// `latest_terminal` must already be [`latest_attempt_per_shard`]'s
+/// output (every shard's *latest* attempt only). `just_recorded` is the
+/// status this exact call just recorded (used only to decide whether a
+/// fail-fast trigger fires *now*, not merely because some earlier call
+/// already left a failed shard in `latest_terminal` — fail-fast fires "as
+/// soon as one shard goes terminal-failed", i.e. on the call that causes
+/// it, not retroactively on every later call for the same group).
+pub fn evaluate_barrier(
+    config: JobGroupConfig,
+    latest_terminal: &[ShardStateRow],
+    just_recorded: ShardTerminalStatus,
+) -> BarrierOutcome {
+    if config.fail_fast && just_recorded == ShardTerminalStatus::Failed {
+        let present: std::collections::BTreeSet<u32> =
+            latest_terminal.iter().map(|row| row.idx).collect();
+        let cancel_idxs = (0..config.expected_total)
+            .filter(|idx| !present.contains(idx))
+            .collect();
+        return BarrierOutcome::FailFastTriggered { cancel_idxs };
+    }
+
+    if (latest_terminal.len() as u32) < config.expected_total {
+        return BarrierOutcome::Waiting;
+    }
+
+    let any_passed = latest_terminal
+        .iter()
+        .any(|row| row.status == ShardTerminalStatus::Passed);
+    let merge = match config.merge_on_failure {
+        MergeOnFailure::Always => true,
+        MergeOnFailure::Never => false,
+        MergeOnFailure::IfAnyPassed => any_passed,
+    };
+    let mut included_idxs: Vec<u32> = if !merge {
+        Vec::new()
+    } else {
+        match config.merge_on_failure {
+            // "runs the merge using only the successful shards' reports"
+            // — `if_any_passed` never includes a failed shard's report.
+            MergeOnFailure::IfAnyPassed => latest_terminal
+                .iter()
+                .filter(|row| row.status == ShardTerminalStatus::Passed)
+                .map(|row| row.idx)
+                .collect(),
+            MergeOnFailure::Always | MergeOnFailure::Never => {
+                latest_terminal.iter().map(|row| row.idx).collect()
+            }
+        }
+    };
+    included_idxs.sort_unstable();
+    BarrierOutcome::Satisfied {
+        merge,
+        included_idxs,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1792,5 +2049,216 @@ mod tests {
         assert_eq!(deduped[0].test_id, "a");
         assert_eq!(deduped[0].duration_ms, 10);
         assert_eq!(deduped[1].test_id, "b");
+    }
+
+    fn row(idx: u32, attempt: u32, status: ShardTerminalStatus) -> ShardStateRow {
+        ShardStateRow {
+            idx,
+            attempt,
+            status,
+        }
+    }
+
+    #[test]
+    fn resolve_shard_terminal_records_a_fresh_key() {
+        assert_eq!(
+            resolve_shard_terminal(None, ShardTerminalStatus::Passed),
+            Ok(ShardTerminalDecision::Recorded)
+        );
+    }
+
+    #[test]
+    fn resolve_shard_terminal_is_a_noop_for_an_identical_redelivery() {
+        assert_eq!(
+            resolve_shard_terminal(
+                Some(ShardTerminalStatus::Failed),
+                ShardTerminalStatus::Failed
+            ),
+            Ok(ShardTerminalDecision::AlreadyRecorded)
+        );
+    }
+
+    #[test]
+    fn resolve_shard_terminal_rejects_a_conflicting_redelivery() {
+        assert_eq!(
+            resolve_shard_terminal(
+                Some(ShardTerminalStatus::Passed),
+                ShardTerminalStatus::Failed
+            ),
+            Err(ConflictingShardStatus)
+        );
+    }
+
+    #[test]
+    fn latest_attempt_per_shard_keeps_only_the_highest_attempt() {
+        // idx 0's OOM-retried attempt 2 overrides its own attempt 1;
+        // idx 1 only ever had one attempt.
+        let rows = vec![
+            row(0, 1, ShardTerminalStatus::Failed),
+            row(0, 2, ShardTerminalStatus::Passed),
+            row(1, 1, ShardTerminalStatus::Passed),
+        ];
+        let latest = latest_attempt_per_shard(&rows);
+        // `latest_attempt_per_shard`'s output is sorted by idx (its doc
+        // comment), so the whole vec can be compared directly rather
+        // than searching it.
+        assert_eq!(
+            latest,
+            vec![
+                row(0, 2, ShardTerminalStatus::Passed),
+                row(1, 1, ShardTerminalStatus::Passed),
+            ],
+            "attempt 1 of idx 0 must not double-count"
+        );
+    }
+
+    fn config(
+        expected_total: u32,
+        fail_fast: bool,
+        merge_on_failure: MergeOnFailure,
+    ) -> JobGroupConfig {
+        JobGroupConfig {
+            expected_total,
+            fail_fast,
+            merge_on_failure,
+        }
+    }
+
+    #[test]
+    fn evaluate_barrier_satisfied_merge_yes_when_every_shard_passes() {
+        let latest = vec![
+            row(0, 1, ShardTerminalStatus::Passed),
+            row(1, 1, ShardTerminalStatus::Passed),
+        ];
+        let outcome = evaluate_barrier(
+            config(2, false, MergeOnFailure::IfAnyPassed),
+            &latest,
+            ShardTerminalStatus::Passed,
+        );
+        assert_eq!(
+            outcome,
+            BarrierOutcome::Satisfied {
+                merge: true,
+                included_idxs: vec![0, 1],
+            }
+        );
+    }
+
+    #[test]
+    fn evaluate_barrier_if_any_passed_includes_only_passing_shards() {
+        let latest = vec![
+            row(0, 1, ShardTerminalStatus::Passed),
+            row(1, 1, ShardTerminalStatus::Failed),
+            row(2, 1, ShardTerminalStatus::Passed),
+        ];
+        let outcome = evaluate_barrier(
+            config(3, false, MergeOnFailure::IfAnyPassed),
+            &latest,
+            ShardTerminalStatus::Failed,
+        );
+        assert_eq!(
+            outcome,
+            BarrierOutcome::Satisfied {
+                merge: true,
+                included_idxs: vec![0, 2],
+            }
+        );
+    }
+
+    #[test]
+    fn evaluate_barrier_never_skips_merge_regardless_of_pass_fail_mix() {
+        let latest = vec![
+            row(0, 1, ShardTerminalStatus::Passed),
+            row(1, 1, ShardTerminalStatus::Failed),
+        ];
+        let outcome = evaluate_barrier(
+            config(2, false, MergeOnFailure::Never),
+            &latest,
+            ShardTerminalStatus::Failed,
+        );
+        assert_eq!(
+            outcome,
+            BarrierOutcome::Satisfied {
+                merge: false,
+                included_idxs: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn evaluate_barrier_always_merges_even_if_every_shard_failed() {
+        let latest = vec![
+            row(0, 1, ShardTerminalStatus::Failed),
+            row(1, 1, ShardTerminalStatus::Failed),
+        ];
+        let outcome = evaluate_barrier(
+            config(2, false, MergeOnFailure::Always),
+            &latest,
+            ShardTerminalStatus::Failed,
+        );
+        assert_eq!(
+            outcome,
+            BarrierOutcome::Satisfied {
+                merge: true,
+                included_idxs: vec![0, 1],
+            }
+        );
+    }
+
+    #[test]
+    fn evaluate_barrier_fail_fast_triggers_immediately_and_cancels_the_rest() {
+        // 4-shard group, fail_fast=true, only shard 0 has reported so far
+        // (as a failure) — the barrier must not wait for shards 1..3.
+        let latest = vec![row(0, 1, ShardTerminalStatus::Failed)];
+        let outcome = evaluate_barrier(
+            config(4, true, MergeOnFailure::IfAnyPassed),
+            &latest,
+            ShardTerminalStatus::Failed,
+        );
+        assert_eq!(
+            outcome,
+            BarrierOutcome::FailFastTriggered {
+                cancel_idxs: vec![1, 2, 3],
+            }
+        );
+    }
+
+    #[test]
+    fn evaluate_barrier_fail_fast_false_waits_for_every_remaining_shard() {
+        // Same first-shard failure, but fail_fast=false: the group must
+        // keep waiting rather than short-circuiting.
+        let latest = vec![row(0, 1, ShardTerminalStatus::Failed)];
+        let outcome = evaluate_barrier(
+            config(4, false, MergeOnFailure::IfAnyPassed),
+            &latest,
+            ShardTerminalStatus::Failed,
+        );
+        assert_eq!(outcome, BarrierOutcome::Waiting);
+    }
+
+    #[test]
+    fn evaluate_barrier_oom_retried_attempt_counts_once_toward_expected_total() {
+        // idx 0 OOM-retried to attempt 2 (now passed); idx 1 passed on
+        // its only attempt. `latest_attempt_per_shard` must already have
+        // collapsed attempt 1 of idx 0 away before this call, so
+        // `expected_total = 2` is satisfied by exactly 2 entries, not 3.
+        let all_terminal_rows = vec![
+            row(0, 1, ShardTerminalStatus::Failed),
+            row(0, 2, ShardTerminalStatus::Passed),
+            row(1, 1, ShardTerminalStatus::Passed),
+        ];
+        let latest = latest_attempt_per_shard(&all_terminal_rows);
+        let outcome = evaluate_barrier(
+            config(2, false, MergeOnFailure::IfAnyPassed),
+            &latest,
+            ShardTerminalStatus::Passed,
+        );
+        assert_eq!(
+            outcome,
+            BarrierOutcome::Satisfied {
+                merge: true,
+                included_idxs: vec![0, 1],
+            }
+        );
     }
 }
