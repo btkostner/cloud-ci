@@ -16,6 +16,19 @@
 //! already consumed by the time a row reaches `pending_model_call`; there
 //! is no second message to re-trigger on).
 //!
+//! # The `context_json` this module builds messages from is pre-redacted
+//!
+//! Every `ai_insight.context_json` row this module reads
+//! ([`StoredInsightContext`]) was built by `ai_queue::assemble_failure_context`,
+//! which redacts every failing-test string through
+//! [`crate::ai_redact::redact`] *before* writing anything to D1 (see that
+//! function's own doc comment and `ai_redact`'s module doc comment). This
+//! module therefore never needs its own redaction pass, and never calls
+//! [`crate::ai_redact::redact`] itself: by the time a row reaches
+//! `pending_model_call`, redaction has already happened, unconditionally,
+//! as part of writing the row — there is no "redact later" flag or
+//! second gate here, because there is nothing left to redact.
+//!
 //! # `env.AI.run()`'s real call shape (confirmed against the pinned crate)
 //!
 //! `worker-0.8.7`'s `src/ai.rs` (the crates.io source, not patched by this

@@ -13,13 +13,21 @@
 //! `#[event(queue)]` consumer in `lib.rs`) and gets the consumer as far
 //! as ai.md's pipeline diagram's `B{Budget + settings check}` and
 //! `CTX`/`RED` steps — budget check, context assembly from genuinely
-//! available data, fingerprinting (via [`crate::ai_insight`]'s pure
-//! functions), and token-budget truncation. It deliberately stops
-//! **before** `CACHE`/`AI[env.AI.run via AI Gateway]`: no cache lookup, no
+//! available data, **redaction** of every failing-test string through
+//! [`crate::ai_redact::redact`] (`RED`'s "Redact" half; see that
+//! module's own doc comment for the exact patterns covered and their
+//! residual limitations), fingerprinting (via [`crate::ai_insight`]'s
+//! pure functions, run on the already-redacted strings), and
+//! token-budget truncation. It deliberately stops **before**
+//! `CACHE`/`AI[env.AI.run via AI Gateway]`: no cache lookup, no
 //! `env.AI.run()` call, no `AI_GATEWAY_ID` wiring, no
 //! `PROMPT_SUMMARY_V1` template. A future round picks up from the
 //! `ai_insight` row this round's consumer writes with
-//! `status = 'pending_model_call'` (migration 0016's doc comment).
+//! `status = 'pending_model_call'` (migration 0016's doc comment) — that
+//! row's `context_json` is built exclusively from the redacted copies
+//! (see [`assemble_failure_context`]'s own doc comment), so a future
+//! round's model call never needs to redact again; it only needs to
+//! avoid introducing a second, unredacted input class.
 //!
 //! # Honest gaps this round does not close
 //!
@@ -54,6 +62,17 @@
 //!   `runs` table itself carries no PR/branch linkage this round — see
 //!   `coordinator::mod`'s own module docs on what's deferred). The diff
 //!   input class is always empty/zero, same treatment as the log tail.
+//! - **`ai.exclude_paths`.** The path-based exclusion glob list
+//!   (ai.md's `.cloud-ci/settings.yml` example: `"infra/secrets/**"`,
+//!   `"**/*.pem"`) is not applied here — it needs the same not-yet-built
+//!   settings-fetch path the "Settings integration" bullet above names,
+//!   and this round has no diff/log-tail input for it to apply to yet
+//!   regardless. This is a distinct mechanism from
+//!   [`crate::ai_redact`]'s *content*-based redaction (see that module's
+//!   own doc comment's "Relationship to `ai.exclude_paths`" section) —
+//!   closing this gap does not close that one and vice versa. Redaction
+//!   itself (content-based masking within whatever text *is* included)
+//!   is real this round and is not part of this list.
 //!
 //! Only the **failing test cases** row of ai.md's inputs table is real
 //! this round: [`crate::coordinator`]'s D1 `reports`/`jobs` projection
@@ -79,6 +98,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::ai_insight;
+use crate::ai_redact;
 
 /// The one message `RunCoordinator::handle_close_run` enqueues onto
 /// `cloud-ci-analysis` per ai.md's "### Pipeline": "When a run reaches a
@@ -263,22 +283,40 @@ fn tail_bytes(s: &str, max_bytes: usize) -> String {
 const PER_TEST_OUTPUT_CAP_BYTES: usize = 2 * 1024;
 
 /// Builds this round's full, honest context from already-parsed failing
-/// tests: fingerprints each one ([`ai_insight::failure_fingerprint`]),
-/// classifies systemic-vs-per-fingerprint
-/// ([`ai_insight::plan_summarization`], with no `failing_jobs` data —
-/// see module docs), selects up to 5 distinct fingerprints' first
-/// occurrence, sizes and reallocates the token budget for
-/// `model_context_window` ([`ai_insight::scale_budget_for_model`],
+/// tests. The **first** thing this function does is redact every
+/// `message`/`stack_trace` line/`system_out`/`system_err` field through
+/// [`ai_redact::redact`] — `docs/design/ai.md`'s pipeline diagram's
+/// `RED[Redact + exclude_paths + fingerprint]` step, run strictly before
+/// fingerprinting so that two failures differing only in an embedded
+/// secret's value still fingerprint identically once redacted (see
+/// `ai_redact`'s own module docs' "dedup" note). Everything downstream —
+/// fingerprinting ([`ai_insight::failure_fingerprint`]), classifying
+/// systemic-vs-per-fingerprint ([`ai_insight::plan_summarization`], with
+/// no `failing_jobs` data — see module docs), selecting up to 5 distinct
+/// fingerprints' first occurrence, sizing/reallocating the token budget
+/// for `model_context_window` ([`ai_insight::scale_budget_for_model`],
 /// [`ai_insight::allot_budget`]) with `log_tail`/`diff` actual sizes
 /// fixed at zero (neither input exists this round), and structurally
-/// truncates each selected entry's frames to an even share of the
+/// truncating each selected entry's frames to an even share of the
 /// resulting failing-tests allotment
-/// ([`ai_insight::truncate_stack_trace`]).
+/// ([`ai_insight::truncate_stack_trace`]) — operates exclusively on the
+/// already-redacted copies, never on `failing_tests` itself.
 pub fn assemble_failure_context(
     failing_tests: &[FailingTestInput],
     model_context_window: u32,
 ) -> AssembledFailureContext {
-    let fingerprints: Vec<String> = failing_tests
+    let redacted_tests: Vec<FailingTestInput> = failing_tests
+        .iter()
+        .map(|t| FailingTestInput {
+            test_id: t.test_id.clone(),
+            message: ai_redact::redact(&t.message),
+            stack_trace: t.stack_trace.iter().map(|l| ai_redact::redact(l)).collect(),
+            system_out: ai_redact::redact(&t.system_out),
+            system_err: ai_redact::redact(&t.system_err),
+        })
+        .collect();
+
+    let fingerprints: Vec<String> = redacted_tests
         .iter()
         .map(|t| {
             let frames: Vec<&str> = t.stack_trace.iter().map(String::as_str).collect();
@@ -309,7 +347,7 @@ pub fn assemble_failure_context(
             fingerprints
                 .iter()
                 .position(|f| f == fp)
-                .map(|idx| (&failing_tests[idx], fp.clone()))
+                .map(|idx| (&redacted_tests[idx], fp.clone()))
         })
         .collect();
 
@@ -479,6 +517,62 @@ mod tests {
         assert!(ctx.selected_fingerprints.is_empty());
         assert!(!ctx.systemic);
         assert_eq!(ctx.failing_tests_token_allotment, 0);
+    }
+
+    #[test]
+    fn assemble_failure_context_never_leaks_a_planted_secret() {
+        // A planted GitHub-token-shaped string in the assertion message,
+        // an AWS-key-shaped string in a stack frame, an Authorization
+        // header line and a `*_SECRET=value` line in captured output —
+        // none of this raw material (module docs' `ai_redact`
+        // integration) should survive into `assemble_failure_context`'s
+        // output anywhere: not in `normalized_message`, not in `frames`,
+        // not in `output_tail`, not in `selected_fingerprints`.
+        let github_token = "ghp_abcdEFGH0123456789abcdEFGH0123456789";
+        let aws_key = "AKIAABCDEFGHIJKLMNOP";
+        let mut t = sample_test(
+            "pkg/test.ts::leaks secret",
+            &format!("request failed with token {github_token}"),
+            &[&format!("at auth.ts:1: key={aws_key}")],
+        );
+        t.system_out = "Authorization: Bearer sk_live_abcdefghijklmnopqrstuvwxyz0123456789\n\
+                         RELEASE_SECRET=hunter2correcthorsebatterystaple\n"
+            .to_string();
+
+        let ctx = assemble_failure_context(&[t], ai_insight::DEFAULT_CONTEXT_WINDOW);
+
+        let serialized = serde_json::to_string(&ctx).unwrap_or_default();
+        assert!(!serialized.contains(github_token));
+        assert!(!serialized.contains(aws_key));
+        assert!(!serialized.contains("sk_live_abcdefghijklmnopqrstuvwxyz0123456789"));
+        assert!(!serialized.contains("hunter2correcthorsebatterystaple"));
+    }
+
+    #[test]
+    fn assemble_failure_context_fingerprint_is_computed_on_redacted_content() {
+        // Two reports whose only difference is an embedded secret value
+        // must fingerprint identically after redaction — the dedup
+        // -correctness proof: `RED` runs before fingerprinting, not
+        // after (module docs).
+        let a = sample_test(
+            "pkg/test.ts::same shape",
+            "Authorization: Bearer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &[],
+        );
+        let b = sample_test(
+            "pkg/test.ts::same shape",
+            "Authorization: Bearer bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            &[],
+        );
+
+        let ctx_a = assemble_failure_context(&[a], ai_insight::DEFAULT_CONTEXT_WINDOW);
+        let ctx_b = assemble_failure_context(&[b], ai_insight::DEFAULT_CONTEXT_WINDOW);
+
+        assert_eq!(ctx_a.selected_fingerprints, ctx_b.selected_fingerprints);
+        assert_eq!(
+            ctx_a.entries[0].normalized_message,
+            ctx_b.entries[0].normalized_message
+        );
     }
 
     const SAMPLE_JUNIT: &str = r#"<?xml version="1.0" encoding="UTF-8"?>

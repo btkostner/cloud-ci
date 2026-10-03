@@ -1,6 +1,7 @@
 pub mod ai_insight;
 pub mod ai_model_call;
 pub mod ai_queue;
+pub mod ai_redact;
 pub mod api_tokens;
 pub mod connect;
 pub mod container_probe;

@@ -52,10 +52,17 @@
 //!   GitHub PR-diff fetch (`GET /repos/{owner}/{repo}/pulls/{n}` with the
 //!   diff media type) that would supply this module's functions with real
 //!   failing-test/log-tail/diff bytes.
-//! - Redaction / `exclude_paths` filtering, applied before fingerprinting
-//!   per the pipeline diagram's `RED[Redact + exclude_paths + fingerprint]`
-//!   step — this module's `failure_fingerprint` takes already-redacted
-//!   strings; nothing here redacts them.
+//! - `exclude_paths` filtering (the pipeline diagram's `RED[Redact +
+//!   exclude_paths + fingerprint]` step's path-exclusion half) is still
+//!   not applied anywhere in this crate — see `ai_queue.rs`'s module doc
+//!   comment's "Honest gaps" list. Content-based **redaction** (`RED`'s
+//!   other half) is no longer an open gap: [`crate::ai_redact::redact`]
+//!   now runs in [`crate::ai_queue::assemble_failure_context`], strictly
+//!   before this module's [`failure_fingerprint`] is ever called — this
+//!   module's own functions still take plain, already-redacted strings
+//!   and still do no redaction themselves (that responsibility belongs
+//!   to the caller, not to this crate's pure-math layer), but the
+//!   caller that was missing is now real.
 //! - The `env.AI.run()` Workers AI binding call, `AI_GATEWAY_ID` wiring, or
 //!   the `ai_usage_daily`/`ai_insight` D1 tables (budget-cap checks,
 //!   fingerprint cache, stored prompt/response) — no migration for either
