@@ -52,6 +52,25 @@ package, the same way any other script dependency would be.
   `ci.container`/`ci.shard` call in the same execution; attaches every id
   to `check` (throwing if that check is already sealed) before the step
   runs.
+- **`ci.limit(n, thunks)`** — a replay-safe concurrency limiter
+  (`src/limit.ts`): runs at most `n` of `thunks` concurrently, always
+  claiming the next pending thunk by its array index when a slot frees,
+  never by which in-flight thunk happens to settle first. See "`ci.limit`,
+  `graph`, and the `turbo`/`mise` entry points" below for the full
+  "ordering is by call, not completion" reasoning.
+- **`graph.fromJson(nodes)` / `graph.fromGraph(rawNodes, mapFn)`**
+  (`src/graph.ts`) — the shared, tool-agnostic dependency-graph foundation
+  `turbo.plan`/`mise.plan` both build on; part of the core package (not
+  the `turbo`/`mise` entry points), since a script using only a custom
+  tool integration via `graph.fromGraph` should not have to bundle
+  turbo-specific code.
+- **`@cloud-ci/pipeline-sdk/turbo`** (`src/turbo.ts`, a separate package
+  entry point) — `turbo.plan`, `turbo.execute`, `turbo.checkPerTask`. See
+  "`ci.limit`, `graph`, and the `turbo`/`mise` entry points" below.
+- **`@cloud-ci/pipeline-sdk/mise`** (`src/mise.ts`, a separate package
+  entry point) — `mise.plan`, implemented only as a caller-supplied-
+  `source` escape hatch; no built-in mise CLI invocation. See that
+  section below for the full, dated investigation of why.
 
 ## The step-durability contract, and what is and isn't proven this round
 
@@ -244,6 +263,193 @@ makes its own single `step.do("group:" + ids.join(","), ...)` call,
 after running the same duplicate-id and check-attach checks
 `runContainer` makes, against every id in `ids`.
 
+## `ci.limit`, `graph`, and the `turbo`/`mise` entry points
+
+### `ci.limit(n, thunks)`: the one doc sentence, and the signature it pins
+
+Like `ci.group`, `ci.limit`'s entire specification in
+`docs/design/dynamic-pipelines.md` is one "Graph helpers" table row
+(`:380`): "Concurrency limiter that is replay-safe (ordering is by call,
+not completion); the per-call half of concurrency control — repo-wide
+caps come from settings.yml." Unlike `ci.group`, there IS one real call
+site elsewhere in the doc fixing the signature: `turbo.execute`'s own
+sketch (`:157`) calls `` await ci.limit(opts.concurrency,
+graph.ids().map((id) => () => runNode(id))) ``. That pins `n` (a
+concurrency count) and `thunks` (an array of zero-arg functions each
+returning a promise) exactly; this package implements that signature and
+nothing wider.
+
+**"Ordering is by call, not completion" — the one claim this round tests
+directly, per this round's testing brief.** A concurrency limiter could
+leak completion-ordering in two places: which pending thunk a freed slot
+claims next, and the order of the returned results array. `src/limit.ts`
+pins both to `thunks`' own array order: a freed slot always claims the
+lowest-index thunk that has not yet *started* — a single shared counter
+incremented synchronously, never a `Promise.race` over in-flight work
+deciding "what's ready" — and each result is written to its own call-index
+slot in the returned array, regardless of which thunk's promise actually
+settled first. `test/limit.test.ts`'s first test proves this directly: a
+slow thunk 0 and fast thunks 1/2 under concurrency 2 — thunk 1 settles
+before thunk 0, freeing a slot, and that slot is proven (via a manually
+controlled `Promise.withResolvers` gate, not a timing guess) to claim
+thunk 2 next, never reordering around thunk 0's still-pending state; the
+returned array still comes back `[zero, one, two]`, call order, not
+settlement order.
+
+**Why this matters beyond the literal doc sentence:** `docs/design/
+dynamic-pipelines.md`'s "Determinism" section requires every `step.do` call
+a script makes to happen in the same order on replay. A completion-raced
+limiter could let a replay whose containers happen to finish in a
+different wall-clock order start a different *set* of thunks before
+hitting its concurrency cap than the original run did — a real path to the
+"replayed start for an id it has never seen" divergence the coordinator
+rejects. Index-order claiming closes that off entirely: `src/limit.ts`'s
+doc comment has the full reasoning.
+
+`CiContext.limit` (`src/context.ts`) is a thin pass-through to this
+function — no additional bookkeeping, since `ci.limit` does not itself
+touch `step.do`, check attachment, or id uniqueness; each thunk is
+expected to make its own durable calls, the same way bare `Promise.all`
+fan-out already would.
+
+### `graph.fromJson`/`graph.fromGraph`: the shared foundation
+
+`src/graph.ts` builds cloud-ci's generic, walkable `Graph` (`ids()`/
+`node(id)`/`deps(id)`, matching the design doc's own `execute` sketch's
+call sites exactly) from an array of `GraphNode`s
+(`{ id, package, task, hash, dependencies, outputs }`, the exact shape the
+"Graph helpers" table names at `:377`). `graph.fromJson` validates as it
+builds: a duplicate `id` throws `DuplicateGraphNodeIdError` (same "ids are
+a lookup key" posture `DuplicateContainerIdError` already takes for
+container ids), and a `dependencies` entry naming an id outside the array
+throws `UnknownGraphDependencyError` (a graph that can't be walked is
+worse than one that fails loudly at construction). `graph.fromGraph`
+(`:378`) is the documented escape hatch for any other tool: it `mapFn`s
+each raw node into `GraphNode` shape, then delegates to `fromJson` — not a
+second, parallel validation path.
+
+This stays part of the **core** package, not `turbo`/`mise` — per the
+design doc: "A script that only needs `graph.fromJson`/`graph.fromGraph`
+and the generic `ci` API imports just `@cloud-ci/pipeline-sdk` and does
+not bundle turbo- or mise-specific code" (`:385-386`).
+
+### `@cloud-ci/pipeline-sdk/turbo` and `@cloud-ci/pipeline-sdk/mise`: separate entry points
+
+The design doc is explicit that `turbo`/`mise` are "separate entry points
+..., not exports of the core package" (`:383-384`). This package's
+`package.json` now has an `exports` map with three entries — `.`,
+`./turbo`, `./mise` — each pointing straight at its own `src/*.ts` file.
+This package has no build step for anyone to wire a second target into:
+`main`/`types` already pointed directly at `./src/index.ts`
+pre-existing-round, and `cloud-ci-dynamic-workflows-host` (the one real
+consumer, `file:../cloud-ci-pipeline-sdk` in its `package.json`) already
+consumes this package's TypeScript source directly through its own
+`esbuild` bundling step — there was never a `tsc`/bundler output directory
+for this package itself to extend. Adding `./turbo`/`./mise` subpaths to
+the existing `exports` map was the entire change; no new build target,
+`tsconfig` project reference, or bundler config was needed.
+
+**Verified, not assumed:** a throwaway entry file placed inside
+`cloud-ci-dynamic-workflows-host` (the real consumer, so its real
+`node_modules/@cloud-ci/pipeline-sdk` symlink and its own `esbuild`
+devDependency are both genuinely in play) imported all three specifiers —
+`` import { graph, limit } from "@cloud-ci/pipeline-sdk" ``, `` import {
+turbo } from "@cloud-ci/pipeline-sdk/turbo" ``, `` import { mise } from
+"@cloud-ci/pipeline-sdk/mise" `` — and was bundled with that package's own
+`npx esbuild ... --bundle --platform=node --format=esm`. The bundle built
+clean and, run under `node`, printed real values confirming every export
+actually resolved and is callable: `graph.fromJson` built a real one-node
+graph, `limit` is a function, `turbo`'s namespace has exactly `plan`/
+`execute`/`checkPerTask`, `mise`'s has exactly `plan`. The throwaway file
+and its bundle output were deleted after the check; nothing from it is
+committed.
+
+#### `turbo.plan`/`turbo.execute`/`turbo.checkPerTask`
+
+`turbo.plan(ci, opts)` runs `` turbo run <tasks> --dry=json `` (plus
+`--affected` when `opts.affected`) via one `ci.container` call, then
+parses the result's `stdout` as turbo's real dry-run JSON and maps it into
+`GraphNode`s via `graph.fromGraph` — field names (`taskId`, `package`,
+`task`, `hash`, `dependencies`, `outputs`) per turborepo.dev/docs/
+reference/run's `--dry / --dry-run` section (checked 2026-10-02; its own
+field table is explicitly "non-exhaustive" — this package only declares
+the subset it reads). `ContainerResult` gained an optional `stdout` field
+this round specifically so `turbo.plan` has something to parse —
+`undefined` for every other caller (`ci.container`/`ci.shard`/`ci.group`
+never populate it); omitting it entirely throws
+`TurboPlanOutputMissingError` rather than silently returning an empty
+graph.
+
+`turbo.execute(ci, graph, opts)` is structurally the same memoized-
+recursion fan-out as the design doc's own sketch (`:139-158`): a
+`Map<string, Promise<...>>` keyed by node id so dependents share one
+promise per dependency rather than re-running it, dependencies awaited via
+`Promise.all` before a node's own work starts, bounded by `ci.limit`. It
+differs from the sketch only where this round's `CiContext` genuinely
+lacks the member the sketch calls: there is no `ci.skip`/`ci.cached`/
+`ci.turboCache.has` this round (see "Explicitly out of scope" below), so
+dependency-failure/skip propagation is inlined directly (same `"skipped"`
+outcome the sketch's `ci.skip` call would produce) and cache-hit skipping
+is driven by an optional, injectable `cacheHit(node)` predicate instead of
+a real `ci.turboCache` binding — omitted means every node actually runs.
+
+`turbo.checkPerTask(ci, graph, opts)` matches the design doc's "One check
+per package" worked example (`:169-189`) field-for-field (`task`, `name`,
+`required`), plus an optional `key` for the "default `package`" grouping
+behavior the Graph helpers table describes (`:375`). **One documented
+capability this round does not implement:** that section also says
+`checkPerTask` "can call `check.seal()` on each check after it attaches
+that package's nodes." This package does not call `seal()` from
+`checkPerTask` — at the point `checkPerTask` runs (synchronously, before
+`turbo.execute` has dispatched anything), none of a check's nodes have
+been attached yet; sealing here would make every later `ci.container` call
+for that package throw `CheckSealedError` the instant it tried to attach.
+Sealing only after the *last* node of a group is actually attached would
+need a second, parallel completion-tracking mechanism this package does
+not build — the same "narrowest reading an ambiguous doc sentence
+supports, not an invented mechanism" precedent `ci.group`'s own section
+above already sets. The capability is already available without it:
+`CheckRegistry.sealRemaining()` (exercised by `workflow()`) already seals
+every still-open check once the script's `run` function finishes
+scheduling — exactly the "automatic" rule the design doc's own "Check
+sealing" section (`:482-484`) names as the default for "a check sized once
+a full plan is known, e.g. `turbo.execute`'s `check` mapping over an
+already-resolved `graph`." See `src/turbo.ts`'s `checkPerTask` doc comment
+for the full reasoning.
+
+#### `mise.plan`: investigated and left honestly blocked, not guessed
+
+The design doc tags `mise.plan` `` `[unverified: mise's machine-readable
+graph command and format]` `` (`:376`). This round investigated that tag
+for real rather than either implementing a guessed command or leaving the
+investigation undone — and the tag stays unverified, because no mise
+command clears the bar turbo's `--dry=json` does (a documented field list,
+confirmed against real output). Checked 2026-10-02, mise `2026.9.14
+macos-arm64`:
+
+- `mise tasks deps [TASKS]...` (mise.jdx.dev/cli/tasks/deps.html) — its own
+  `--help` lists exactly `--compact`, `--dot`, `--hidden`, `--help`. **No
+  `--json`/`-J` flag exists at all.**
+- `mise tasks graph [FLAGS]` (mise.jdx.dev/cli/tasks/graph.html) — real
+  `-J`/`--json` flag exists. Run for real against this repo (`mise tasks
+  graph --json`): `` {"projects": []} ``. That confirms the command and
+  flag are real, but its JSON is mise's monorepo "projects" concept
+  (mise.jdx.dev/tasks/monorepo.html), not a `tasks` array of per-task
+  nodes — and this repo's empty result means the per-task field shape
+  inside a populated project (does it carry `hash`/`outputs`-equivalent
+  fields at all?) could not be confirmed either way.
+
+`src/mise.ts` does not invoke any mise command. `mise.plan(ci, opts)`
+throws `MisePlanNotImplementedError` unless the caller supplies
+`opts.source` — a `{ rawNodes, mapFn }` pair identical in shape to
+`graph.fromGraph`'s own parameters — in which case `mise.plan` uses it
+exactly the way `turbo.plan` uses `graph.fromGraph` internally, never
+touching `ci.container`. See `src/mise.ts`'s doc comment for the full
+investigation, including the exact open question for whoever revisits
+this: whether `mise tasks graph --json`'s nested shape (once mise's
+"projects" feature is actually populated somewhere) carries a per-task
+content hash suitable for cache-hit skipping at all.
+
 ## `workflow()`'s adapter shape, and the host-side load path (confirmed 2026-10-02)
 
 `workflow({ on, run })` returns a single object meant to be a script's
@@ -340,9 +546,12 @@ Each of these is a real, named gap — not a silent omission:
   no `snapshot` field.
 - **`turbo`/`mise` integration modules** (`@cloud-ci/pipeline-sdk/turbo`,
   `@cloud-ci/pipeline-sdk/mise`) — `turbo.plan`/`turbo.execute`/
-  `turbo.checkPerTask`/`mise.plan` and the generic `graph.fromJson`/
-  `graph.fromGraph` helpers. Not implemented; this package has no `turbo`
-  or `mise` export at all.
+  `turbo.checkPerTask` and the generic `graph.fromJson`/`graph.fromGraph`
+  helpers ARE implemented this round; see "`ci.limit`, `graph`, and the
+  `turbo`/`mise` entry points" below. `mise.plan` is the one exception —
+  implemented only as a caller-supplied-`source` escape hatch, with no
+  built-in mise CLI invocation (see `src/mise.ts`'s doc comment for the
+  full, dated investigation of why).
 - **Sidecars** — `ContainerOptions` has no `sidecars` field; a container
   spec in this round is a single process, no sidecar lifecycle.
 - **Multi-step containers** — `ContainerOptions` has no `steps` field; a
@@ -362,10 +571,11 @@ Each of these is a real, named gap — not a silent omission:
   DO exist as of this round (`packages/cloud-ci-worker/src/shard_plan.rs`);
   what doesn't exist yet is the TypeScript-side network call reaching it —
   no `wrangler.toml` changes were made anywhere in this round.
-- **`ci.limit`, `ci.skip`, `ci.cached`, `ci.turboCache`, `ci.readFile`** —
-  none of the design doc's other `ci` surface members exist on `CiContext`
-  yet; only `ci.event`, `ci.changedFiles`, `ci.branch`, `ci.labels`,
-  `ci.check`, `ci.container`, `ci.shard`, `ci.group`.
+- **`ci.skip`, `ci.cached`, `ci.turboCache`, `ci.readFile`** — none of
+  these exist on `CiContext`. `ci.limit` IS implemented this round (see
+  below); `turbo.execute`'s own use of the other three missing members is
+  worked around with an injectable `cacheHit` predicate instead (see
+  `src/turbo.ts`'s `TurboExecuteOptions` doc comment).
 
 ## Testing
 
@@ -402,6 +612,36 @@ Each of these is a real, named gap — not a silent omission:
   building a `CiContext` and auto-sealing checks, and an end-to-end replay
   proof through the public `workflow()` surface (not just `runContainer`
   directly).
+- `test/limit.test.ts` — `ci.limit`'s "ordering is by call, not
+  completion" contract, proven directly via manually controlled
+  `Promise.withResolvers` gates (no wall-clock timers): a freed slot
+  claims the next pending thunk by array index even when an earlier,
+  still-in-flight thunk settles later; results come back in call order;
+  the `n`-concurrent bound itself; `n = 1` fully serializes; empty-input
+  and invalid-`n` edge cases.
+- `test/graph.test.ts` — `graph.fromJson`/`graph.fromGraph`: `ids()`/
+  `node(id)`/`deps(id)` against a real small graph, input-order
+  preservation, duplicate-id and unknown-dependency rejection,
+  unknown-id lookups, `fromGraph`'s `mapFn` delegation to `fromJson`
+  (including that `fromJson`'s own validation errors still surface
+  through it).
+- `test/turbo.test.ts` — `turbo.plan`'s dry-run JSON parsing against a
+  fixture shaped like real `turbo run --dry=json` output (field names per
+  turborepo.dev/docs/reference/run, checked 2026-10-02), `--affected`/
+  custom-id forwarding, and the no-stdout error; `turbo.execute`'s
+  dependency ordering (a dependent's container never starts before its
+  dependency's resolves — proven via start-order tracking, not timing),
+  transitive skip-on-failure without dispatching a container for skipped
+  nodes, `cacheHit`-driven skipping, and the `ci.limit`-bounded
+  concurrency cap (proven via controlled gates, not real time);
+  `turbo.checkPerTask`'s per-group memoization (two nodes sharing a
+  package get the same check instance), task-mismatch returning `null`,
+  and a custom grouping `key`.
+- `test/mise.test.ts` — `mise.plan`'s actually-implemented surface only:
+  `MisePlanNotImplementedError` when no `source` is supplied (and that
+  `ci.container` is never touched), the `graph.fromGraph`-delegating path
+  when a caller does supply `source`. Does not pin any mise CLI
+  invocation or JSON shape as verified — see `src/mise.ts`'s doc comment.
 
 No integration test against a real `wrangler dev` Workflows engine runs as
 part of this package's own `vitest run` — that proof instead lives in
