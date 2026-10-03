@@ -116,6 +116,32 @@ max_batch_size = 1
 max_retries = 3
 dead_letter_queue = "cloud-ci-analysis-dlq"
 
+# `cloud-ci-merge` Queue (docs/design/parallelization.md § "### Merge strategies per report
+# type": junit/coverage merge in a "Worker / `post-run-analysis` Queue consumer (no
+# container)"). This deployment names that queue `cloud-ci-merge`, following the same
+# `cloud-ci-<purpose>` convention `cloud-ci-analysis` above already established — the doc itself
+# never pins a literal queue name for this consumer, only the generic "`post-run-analysis` Queue
+# consumer" phrasing, so this is this round's own naming choice. Binding name matches
+# `env.queue("MERGE_QUEUE")` in `src/coordinator/mod.rs`'s `handle_shard_terminal` and the
+# shared `#[event(queue)]` consumer in `src/lib.rs` (routed by `batch.queue()`, same pattern
+# `src/lib.rs`'s single `#[event(scheduled)]` handler already uses to tell its three cron
+# schedules apart by `event.cron()`).
+[[queues.producers]]
+queue = "cloud-ci-merge"
+binding = "MERGE_QUEUE"
+
+# Consumer settings copied from `cloud-ci-analysis`'s own above: `max_batch_size = 1` (each
+# message does real R2 reads across every included shard plus a merged-document R2 write — not
+# as latency-bound as a model call, but still real I/O this round keeps serialized per message
+# rather than batched, matching this deployment's one established Queue-consumer precedent
+# rather than inventing a second convention). `max_retries = 3`, failures to
+# `cloud-ci-merge-dlq`.
+[[queues.consumers]]
+queue = "cloud-ci-merge"
+max_batch_size = 1
+max_retries = 3
+dead_letter_queue = "cloud-ci-merge-dlq"
+
 # One SQLite-backed Durable Object per run (ADR 0004, docs/design/byo-ci.md).
 # Addressed by `(repo_id, sha, run_key, attempt)`, never by the run's own
 # ULID, so a redelivered or reordered BeginRun always lands on the same

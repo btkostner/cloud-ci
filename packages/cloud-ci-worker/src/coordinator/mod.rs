@@ -136,16 +136,26 @@
 //! calls evaluate. This round builds the **state machine only** —
 //! [`RunCoordinator::handle_register_shard_group`] and
 //! [`RunCoordinator::handle_shard_terminal`] (pure decisions in
-//! [`logic`]'s "Shard groups / merge barrier" section) — never real merge
-//! execution or real container cancellation:
+//! [`logic`]'s "Shard groups / merge barrier" section) plus, this round,
+//! real dispatch of the `Satisfied` merge decision for the two natively
+//! mergeable report kinds — still never real container cancellation:
 //!
-//! - **No merge execution.** No JUnit/coverage parsing
-//!   (`cloud-ci-reports`), no generated `<id>/merge` container node, no
-//!   `post-run-analysis` Queue consumer. `handle_shard_terminal` returns
-//!   [`ShardBarrierDecision::Satisfied`] (`merge`/`included_idxs`) as a
-//!   pure decision; nothing dispatches it. That is a separate, later
-//!   round, same "foundation ahead of its full caller" pattern as the
-//!   Nodes section above.
+//! - **Merge execution is real for `junit`/`lcov`, nothing else.**
+//!   [`ShardBarrierDecision::Satisfied`] with `merge: true`:
+//!   [`RunCoordinator::enqueue_shard_merge`] enqueues a
+//!   `crate::shard_merge::ShardMergeRequested` onto the `cloud-ci-merge`
+//!   Queue, whose consumer (`src/lib.rs`'s `handle_shard_merge_requested`,
+//!   routed out of the shared `#[event(queue)]` handler by
+//!   `batch.queue()`) reads the included shards' canonical `junit`/`lcov`
+//!   reports from D1/R2, merges them via `cloud_ci_reports::merge`, and
+//!   writes the result to R2 plus a `shard_merges` row (migration 0018).
+//!   `merge: false` (`merge_on_failure = never`, or `if_any_passed` with
+//!   zero passed shards) is a real, documented no-op and never enqueues
+//!   anything — see `src/shard_merge.rs`'s own module doc comment for
+//!   this round's full scope boundary, including why the
+//!   `playwright-blob`/`vitest-blob` generated `<id>/merge` container-node
+//!   path is still **not** built (it depends on `cloud-ci-pipeline-sdk`'s
+//!   `ci.shard`, which does not exist yet).
 //! - **No real cancellation wiring.** `fail_fast`'s
 //!   [`ShardBarrierDecision::FailFastTriggered`] only returns the *set*
 //!   of shard indices that should be cancelled
@@ -1760,6 +1770,50 @@ impl RunCoordinator {
         }
     }
 
+    /// `cloud-ci-merge` (parallelization.md § "### Merge barrier (RunCoordinator)": "On
+    /// satisfaction, `RunCoordinator` ... enqueues the merge step"). Only called for
+    /// [`ShardBarrierDecision::Satisfied`] with `merge: true` — `merge: false` (a real,
+    /// documented `merge_on_failure` no-op, parallelization.md: "`never`", or `if_any_passed`
+    /// with zero passed shards) never reaches this call, so it is never treated as an error
+    /// path. A send failure (the `MERGE_QUEUE` binding unreachable, a transient Queues API
+    /// error) is logged and swallowed, not propagated — same degrade-and-log posture as
+    /// [`RunCoordinator::enqueue_analysis_requested`] above: losing one shard group's merge
+    /// dispatch must not fail the `shardTerminal` response this function already committed
+    /// (`shard_state`/`job_group` rows) by the time this call happens. `job_id` is resolved by
+    /// the caller (a D1-projected, authoritative-DO `job` row lookup by `job_name`) rather than
+    /// re-read here, since this function has no `SqlStorage` access of its own — same split as
+    /// every other `enqueue_*` helper in this file.
+    async fn enqueue_shard_merge(
+        &self,
+        run_row: &RunRow,
+        job_id: &str,
+        job_name: &str,
+        included_idxs: Vec<u32>,
+    ) {
+        let message = crate::shard_merge::ShardMergeRequested {
+            run_id: run_row.id.clone(),
+            job_id: job_id.to_string(),
+            job_name: job_name.to_string(),
+            included_idxs,
+        };
+        let queue = match self.env.queue("MERGE_QUEUE") {
+            Ok(q) => q,
+            Err(e) => {
+                worker::console_log!(
+                    "shard merge: MERGE_QUEUE binding unavailable, skipping enqueue for run {} job {job_name}: {e}",
+                    run_row.id
+                );
+                return;
+            }
+        };
+        if let Err(e) = queue.send(message).await {
+            worker::console_log!(
+                "shard merge: enqueue ShardMergeRequested failed for run {} job {job_name}: {e}",
+                run_row.id
+            );
+        }
+    }
+
     /// Applies every canonical, parsed report's test outcomes to
     /// `test_stats`, exactly once per run (analytics.md's "D1 rollup
     /// tables" § "Once per run" and "Idempotency"). `handle_close_run`'s
@@ -2681,6 +2735,40 @@ impl RunCoordinator {
                 }
             }
         };
+
+        // parallelization.md's "### Merge barrier (RunCoordinator)": "On satisfaction,
+        // `RunCoordinator` ... enqueues the merge step." Only dispatched when the barrier
+        // actually decided to merge — `merge: false` (`merge_on_failure = never`, or
+        // `if_any_passed` with zero passed shards) is a real, documented no-op per that same
+        // section, not an error, so it deliberately never reaches this call. `read_job` here is
+        // a second lookup beyond `read_job_group` above (different DO table: `job`, not
+        // `job_group`) — needed only for its `id`, which `ShardMergeRequested` carries so the
+        // Queue consumer can join against D1's `reports` projection by `job_id` without a second
+        // `job_name` round trip.
+        if let ShardBarrierDecision::Satisfied {
+            merge: true,
+            ref included_idxs,
+        } = decision
+        {
+            match read_job(sql, &req.job_name)? {
+                Some(job) => {
+                    self.enqueue_shard_merge(
+                        &run_row,
+                        &job.id,
+                        &req.job_name,
+                        included_idxs.clone(),
+                    )
+                    .await;
+                }
+                None => {
+                    worker::console_log!(
+                        "shard merge: job {} not found for run {}, skipping merge dispatch",
+                        req.job_name,
+                        run_row.id
+                    );
+                }
+            }
+        }
 
         Response::from_json(&ShardTerminalOutcome {
             job_name: req.job_name,

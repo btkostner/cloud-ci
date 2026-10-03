@@ -23,6 +23,7 @@ pub mod repo_state;
 pub mod roles;
 pub mod rollup;
 pub mod session;
+pub mod shard_merge;
 pub mod template_spike;
 pub mod test_stats;
 pub mod token_issuance;
@@ -168,36 +169,72 @@ async fn scheduled(event: worker::ScheduledEvent, env: Env, _ctx: worker::Schedu
     }
 }
 
-/// `[[queues.consumers]]`: `max_batch_size = 1` per ai.md's "###
-/// Pipeline" "Consumer settings" paragraph, so `batch` always holds
-/// exactly one message). Implements the pipeline diagram's
-/// `B{Budget + settings check}` and `CTX`/`RED` steps; deliberately stops
-/// before `CACHE`/`AI[env.AI.run via AI Gateway]` — see
-/// `src/ai_queue.rs`'s module doc comment for the full scope boundary and
-/// the honest gaps (settings integration, log tail, PR diff) this round
+/// Single `#[event(queue)]` export shared by every Queue this Worker consumes from
+/// (`cloud-ci-analysis` and, this round, `cloud-ci-merge`) — `worker`'s queue macro always
+/// generates one fixed-name `queue` export (confirmed against worker-macros-0.8.7's `event.rs`:
+/// the `Queue` branch hardcodes `wrapper_fn_ident = Ident::new("queue", ...)`), so a second
+/// queue cannot get its own `#[event(queue)]` function — it must be routed out of this one, the
+/// same pattern [`scheduled`] above already uses to tell its three cron schedules apart by
+/// `event.cron()`. [`worker::MessageBatch::queue`] returns the source queue's name; each branch
+/// deserializes `message.body()` (held here as `serde_json::Value` so one batch type can carry
+/// either message shape) into its own concrete type before dispatching.
+///
+/// `cloud-ci-analysis`: `max_batch_size = 1` per ai.md's "### Pipeline" "Consumer settings"
+/// paragraph, so `batch` always holds exactly one message. Implements the pipeline diagram's
+/// `B{Budget + settings check}` and `CTX`/`RED` steps; deliberately stops before
+/// `CACHE`/`AI[env.AI.run via AI Gateway]` — see `src/ai_queue.rs`'s module doc comment for the
+/// full scope boundary and the honest gaps (settings integration, log tail, PR diff) this round
 /// does not close.
 ///
-/// `worker`'s `#[event(queue)]` macro requires this exact
-/// `(MessageBatch<T>, Env, Context)` signature returning
-/// `worker::Result<()>` (confirmed against worker-macros-0.8.7's
+/// `cloud-ci-merge`: also `max_batch_size = 1` (`wrangler.toml`'s own comment on that consumer
+/// explains why); see `src/shard_merge.rs`'s module doc comment for its own scope boundary
+/// (native `junit`/`lcov` merge only).
+///
+/// `worker`'s `#[event(queue)]` macro requires this exact `(MessageBatch<T>, Env, Context)`
+/// signature returning `worker::Result<()>` (confirmed against worker-macros-0.8.7's
 /// `event.rs`: the `Queue` branch's generated glue calls
-/// `#input_fn_ident(MessageBatch::from(event), env, ctx).await` and
-/// `panic!`s on `Err`, which the Workers runtime treats as a failed
-/// invocation — triggering a retry under this consumer's own
-/// `max_retries = 3`, and `cloud-ci-analysis-dlq` once those are
-/// exhausted). A genuine processing error (a D1/R2 read failure)
-/// therefore propagates with `?` rather than being swallowed; an
-/// expected "over budget" or "nothing to summarize" skip is not an
-/// error and acks the message directly instead.
+/// `#input_fn_ident(MessageBatch::from(event), env, ctx).await` and `panic!`s on `Err`, which
+/// the Workers runtime treats as a failed invocation — triggering a retry under that queue's own
+/// `max_retries = 3`, and its dead-letter queue once those are exhausted). A genuine processing
+/// error (a D1/R2 read failure, or a message body that fails to decode into its expected type)
+/// therefore propagates with `?`/early-`return Err` rather than being swallowed; an expected
+/// "over budget"/"nothing to summarize"/"no natively mergeable reports" skip is not an error and
+/// acks the message directly instead. An unrecognized queue name (should never happen — it would
+/// mean a `wrangler.toml` consumer entry with no matching arm here) acks without processing
+/// rather than retrying forever against a message this code has no handler for.
 #[event(queue)]
 async fn queue(
-    batch: worker::MessageBatch<ai_queue::AnalysisRequested>,
+    batch: worker::MessageBatch<serde_json::Value>,
     env: Env,
     _ctx: Context,
 ) -> Result<()> {
-    for message in batch.messages()? {
-        handle_analysis_requested(&env, message.body()).await?;
-        message.ack();
+    match batch.queue().as_str() {
+        "cloud-ci-analysis" => {
+            for message in batch.messages()? {
+                let body: ai_queue::AnalysisRequested =
+                    serde_json::from_value(message.body().clone()).map_err(|e| {
+                        worker::Error::RustError(format!("decoding AnalysisRequested: {e}"))
+                    })?;
+                handle_analysis_requested(&env, &body).await?;
+                message.ack();
+            }
+        }
+        "cloud-ci-merge" => {
+            for message in batch.messages()? {
+                let body: shard_merge::ShardMergeRequested =
+                    serde_json::from_value(message.body().clone()).map_err(|e| {
+                        worker::Error::RustError(format!("decoding ShardMergeRequested: {e}"))
+                    })?;
+                handle_shard_merge_requested(&env, &body).await?;
+                message.ack();
+            }
+        }
+        other => {
+            worker::console_log!(
+                "queue: unrecognized queue name {other:?}, acking batch without processing"
+            );
+            batch.ack_all();
+        }
     }
     Ok(())
 }
@@ -319,6 +356,242 @@ async fn handle_analysis_requested(env: &Env, message: &ai_queue::AnalysisReques
             message.run_id,
             entry.fingerprint,
             assembled.systemic,
+        );
+    }
+
+    Ok(())
+}
+
+/// D1 row shape for `handle_shard_merge_requested`'s `reports` query — the raw D1 projection
+/// read, before narrowing `shard_index` down to `u32` for [`shard_merge::MergeCandidateReport`]
+/// (D1 integers decode through `serde` as `i64`/`f64`-compatible, matching every other D1 row
+/// struct in this crate, e.g. `coordinator::mod::JobShardRow::shard_index: i64`).
+#[derive(serde::Deserialize)]
+struct MergeCandidateReportRow {
+    kind: String,
+    name: String,
+    shard_index: i64,
+    r2_key: String,
+}
+
+/// One `ShardMergeRequested` message's processing — reads the included shards' canonical
+/// `junit`/`lcov` reports from D1/R2, merges each `(kind, name)` group via
+/// [`cloud_ci_reports::merge`], writes the merged document to R2, and records the outcome in
+/// `shard_merges` (migration 0018). See [`queue`]'s doc comment for the retry/ack posture and
+/// `src/shard_merge.rs`'s module doc comment for the full native-merge scope boundary (only
+/// `junit`/`lcov`; `playwright-blob`/`vitest-blob`/`cobertura`/anything else is logged and
+/// skipped per group, never force-merged).
+async fn handle_shard_merge_requested(
+    env: &Env,
+    message: &shard_merge::ShardMergeRequested,
+) -> Result<()> {
+    if message.included_idxs.is_empty() {
+        worker::console_log!(
+            "shard merge: run {} job {} has no included shard indices, skipping",
+            message.run_id,
+            message.job_name
+        );
+        return Ok(());
+    }
+
+    let db = env.d1("DB")?;
+
+    // Dynamic `IN (...)` placeholder list, one `?N` per included shard index after `?1`
+    // (`job_id`) — D1's `bind` has no array/`IN`-list helper, so the placeholder count must
+    // match `included_idxs`' own length exactly.
+    let placeholders: Vec<String> = (0..message.included_idxs.len())
+        .map(|i| format!("?{}", i + 2))
+        .collect();
+    let query = format!(
+        "SELECT kind, name, shard_index, r2_key FROM reports \
+         WHERE job_id = ?1 AND is_canonical = 1 AND shard_index IN ({}) \
+         ORDER BY shard_index ASC",
+        placeholders.join(",")
+    );
+    let mut binds: Vec<JsValue> = Vec::with_capacity(message.included_idxs.len() + 1);
+    binds.push(JsValue::from_str(&message.job_id));
+    for idx in &message.included_idxs {
+        binds.push(JsValue::from_f64(*idx as f64));
+    }
+    let rows: Vec<MergeCandidateReportRow> =
+        db.prepare(&query).bind(&binds)?.all().await?.results()?;
+
+    if rows.is_empty() {
+        worker::console_log!(
+            "shard merge: run {} job {} has no canonical reports for its included shards, skipping",
+            message.run_id,
+            message.job_name
+        );
+        return Ok(());
+    }
+
+    let candidates: Vec<shard_merge::MergeCandidateReport> = rows
+        .into_iter()
+        .map(|r| shard_merge::MergeCandidateReport {
+            kind: r.kind,
+            name: r.name,
+            shard_index: r.shard_index as u32,
+            r2_key: r.r2_key,
+        })
+        .collect();
+
+    let bucket = env.bucket("ASSETS")?;
+    let now_ms = Date::now().as_millis();
+
+    for ((kind, name), group_rows) in shard_merge::group_by_kind_and_name(candidates) {
+        let merge_kind = shard_merge::mergeable_kind(&kind);
+        if merge_kind == shard_merge::MergeableKind::Unsupported {
+            worker::console_log!(
+                "shard merge: run {} job {} report {kind}/{name} is not a natively mergeable \
+                 kind this round (only junit/lcov — see shard_merge.rs module docs), skipping",
+                message.run_id,
+                message.job_name
+            );
+            continue;
+        }
+
+        let mut bodies: Vec<Vec<u8>> = Vec::with_capacity(group_rows.len());
+        let mut incomplete = false;
+        for row in &group_rows {
+            match bucket.get(&row.r2_key).execute().await? {
+                Some(object) => match object.body() {
+                    Some(body) => bodies.push(body.bytes().await?),
+                    None => {
+                        worker::console_log!(
+                            "shard merge: R2 object {} has no body, skipping merge for \
+                             run {} job {} report {kind}/{name}",
+                            row.r2_key,
+                            message.run_id,
+                            message.job_name
+                        );
+                        incomplete = true;
+                        break;
+                    }
+                },
+                None => {
+                    worker::console_log!(
+                        "shard merge: R2 object {} missing, skipping merge for run {} job {} \
+                         report {kind}/{name}",
+                        row.r2_key,
+                        message.run_id,
+                        message.job_name
+                    );
+                    incomplete = true;
+                    break;
+                }
+            }
+        }
+        if incomplete {
+            continue;
+        }
+
+        let merged_bytes: Vec<u8> = match merge_kind {
+            shard_merge::MergeableKind::Junit => {
+                let mut docs = Vec::with_capacity(bodies.len());
+                let mut parse_failed = false;
+                for bytes in &bodies {
+                    match cloud_ci_reports::junit::parse(bytes) {
+                        Ok(doc) => docs.push(doc),
+                        Err(e) => {
+                            worker::console_log!(
+                                "shard merge: junit parse failed for run {} job {} report \
+                                 {name}: {e}",
+                                message.run_id,
+                                message.job_name
+                            );
+                            parse_failed = true;
+                            break;
+                        }
+                    }
+                }
+                if parse_failed {
+                    continue;
+                }
+                match cloud_ci_reports::merge::merge_junit(&docs) {
+                    Ok(xml) => xml.into_bytes(),
+                    Err(e) => {
+                        worker::console_log!(
+                            "shard merge: merge_junit write failed for run {} job {}: {e}",
+                            message.run_id,
+                            message.job_name
+                        );
+                        continue;
+                    }
+                }
+            }
+            shard_merge::MergeableKind::Lcov => {
+                let mut reports = Vec::with_capacity(bodies.len());
+                let mut parse_failed = false;
+                for bytes in &bodies {
+                    match cloud_ci_reports::lcov::parse(bytes) {
+                        Ok(report) => reports.push(report),
+                        Err(e) => {
+                            worker::console_log!(
+                                "shard merge: lcov parse failed for run {} job {} report \
+                                 {name}: {e}",
+                                message.run_id,
+                                message.job_name
+                            );
+                            parse_failed = true;
+                            break;
+                        }
+                    }
+                }
+                if parse_failed {
+                    continue;
+                }
+                let merged = cloud_ci_reports::merge::merge_lcov(&reports);
+                cloud_ci_reports::merge::write_lcov(&merged).into_bytes()
+            }
+            // Already handled by the `continue` above — [`mergeable_kind`] only returns
+            // `Unsupported` for a kind that reaches that branch, and this `match` only runs
+            // once that branch has already `continue`d past.
+            shard_merge::MergeableKind::Unsupported => continue,
+        };
+
+        let content_sha256 = shard_merge::hex_sha256(&merged_bytes);
+        let r2_key = shard_merge::merged_report_r2_key(
+            &message.run_id,
+            &message.job_name,
+            merge_kind,
+            &kind,
+            &content_sha256,
+        );
+        bucket.put(&r2_key, merged_bytes).execute().await?;
+
+        let id = ulid::generate(now_ms)
+            .map_err(|e| worker::Error::RustError(format!("ulid generation failed: {e}")))?;
+        let included_json =
+            serde_json::to_string(&group_rows.iter().map(|r| r.shard_index).collect::<Vec<_>>())
+                .map_err(|e| worker::Error::RustError(format!("encoding included_idxs: {e}")))?;
+
+        db.prepare(
+            "INSERT INTO shard_merges \
+             (id, run_id, job_id, job_name, report_kind, report_name, included_idxs, \
+              content_sha256, r2_key, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+             ON CONFLICT (run_id, job_name, report_kind, report_name, content_sha256) DO NOTHING",
+        )
+        .bind(&[
+            JsValue::from_str(&id),
+            JsValue::from_str(&message.run_id),
+            JsValue::from_str(&message.job_id),
+            JsValue::from_str(&message.job_name),
+            JsValue::from_str(&kind),
+            JsValue::from_str(&name),
+            JsValue::from_str(&included_json),
+            JsValue::from_str(&content_sha256),
+            JsValue::from_str(&r2_key),
+            JsValue::from_f64(now_ms as f64),
+        ])?
+        .run()
+        .await?;
+
+        worker::console_log!(
+            "shard merge: run {} job {} merged {kind}/{name} ({} shards) to {r2_key}",
+            message.run_id,
+            message.job_name,
+            group_rows.len()
         );
     }
 
