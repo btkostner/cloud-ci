@@ -24,15 +24,14 @@
 //!
 //! # Addressing and idempotency
 //!
-//! Bound by `node_id` alone (`env.durable_object("NODE_CONTAINER")?.id_from_name(node_id)`),
-//! the same one-DO-instance-per-logical-container pattern `ContainerProbe`'s `?probe_id=`
-//! already uses. `RunCoordinator::handle_start_node` only ever calls `/start` once per
-//! `node_id` — its own `StartNodeDecision::AlreadyStarted` guard stops a redelivered
-//! `startNode` from reaching this module at all — but `/start` also checks
+//! Bound by `physical_address` (`coordinator::node_physical_address(run_do_name, node_id)`),
+//! not raw `node_id` alone — two different runs that happen to share a `node_id` must never
+//! alias the same physical container. `RunCoordinator::handle_start_node` only ever calls
+//! `/start` once per `node_id` — its own `StartNodeDecision::AlreadyStarted` guard stops a
+//! redelivered `startNode` from reaching this module at all — but `/start` also checks
 //! `Container::running()` itself before calling `Container::start()` (same guard
 //! `container_probe.rs`'s `handle_exec` already uses), so a second `/start` for the same
-//! `node_id` — however it might arrive — is still a no-op here too, never a second
-//! container.
+//! address — however it might arrive — is still a no-op here too, never a second container.
 //!
 //! # Synchronous start, asynchronous `exec()` (the two-phase contract)
 //!
@@ -208,11 +207,13 @@ impl NodeContainer {
 // ---------------------------------------------------------------------------
 
 /// Starts `node_id`'s real container via a DO-to-DO call into this module's own `NodeContainer`
-/// DO's `/start`. `Err` means the container itself failed to *start* (bad image, Docker/runtime
-/// error) — callers map that straight to the node's own `failed` status, never an unhandled 500
-/// (`coordinator`'s own doc comment on this call covers why).
+/// DO's `/start`, addressed by `physical_address` (`coordinator::node_physical_address`), not
+/// the raw `node_id` — scopes the real container to the run that started it. `Err` means the
+/// container itself failed to *start* (bad image, Docker/runtime error) — callers map that
+/// straight to the node's own `failed` status, never an unhandled 500.
 pub async fn start_container(
     env: &Env,
+    physical_address: &str,
     run_do_name: &str,
     node_id: &str,
     image: &str,
@@ -222,7 +223,7 @@ pub async fn start_container(
         .durable_object(NODE_CONTAINER_BINDING)
         .map_err(|e| format!("node container namespace unavailable: {e}"))?;
     let id = namespace
-        .id_from_name(node_id)
+        .id_from_name(physical_address)
         .map_err(|e| format!("node container id error: {e}"))?;
     let stub = id
         .get_stub()
@@ -253,28 +254,40 @@ pub async fn start_container(
     }
 }
 
-/// Stops `node_id`'s real container via a DO-to-DO call into `/stop`. Best-effort is the
-/// caller's posture, not this function's: it returns the real `worker::Result`, and
-/// `RunCoordinator::stop_node_container` is the one that logs-and-swallows a failure.
-pub async fn stop_container(env: &Env, node_id: &str) -> worker::Result<()> {
+/// Stops the container at `physical_address` via a DO-to-DO call into `/stop`. Returns the
+/// real outcome, including a non-2xx response — not only a transport failure — as a genuine
+/// stop failure; swallowing a non-2xx response as success here would make every caller that
+/// relies on this `Result` wrongly treat a container that never actually stopped as done.
+/// `RunCoordinator::stop_node_container` is still the one that degrades this to best-effort
+/// logging where that posture is correct (`handle_cancel_run`'s own loop); shard-terminal
+/// recovery instead treats a returned `Err` as "still pending, retry later."
+pub async fn stop_container(env: &Env, physical_address: &str) -> worker::Result<()> {
     let namespace = env.durable_object(NODE_CONTAINER_BINDING)?;
-    let id = namespace.id_from_name(node_id)?;
+    let id = namespace.id_from_name(physical_address)?;
     let stub = id.get_stub()?;
     let mut init = RequestInit::new();
     init.with_method(Method::Post);
     let request = Request::new_with_init("https://node-container.cloud-ci.internal/stop", &init)?;
-    stub.fetch_with_request(request).await?;
-    Ok(())
+    let mut response = stub.fetch_with_request(request).await?;
+    match response.status_code() {
+        200..=299 => Ok(()),
+        status => {
+            let detail = response.text().await.unwrap_or_default();
+            Err(worker::Error::RustError(format!(
+                "node container rejected stop: {status} {detail}"
+            )))
+        }
+    }
 }
 
-/// Reads `node_id`'s container running/not state via `/status` —
+/// Reads the container at `physical_address`'s running/not state via `/status` —
 /// `crate::executor::ContainersExecutor::status`'s only caller.
-pub async fn container_status(env: &Env, node_id: &str) -> Result<bool, String> {
+pub async fn container_status(env: &Env, physical_address: &str) -> Result<bool, String> {
     let namespace = env
         .durable_object(NODE_CONTAINER_BINDING)
         .map_err(|e| format!("node container namespace unavailable: {e}"))?;
     let id = namespace
-        .id_from_name(node_id)
+        .id_from_name(physical_address)
         .map_err(|e| format!("node container id error: {e}"))?;
     let stub = id
         .get_stub()

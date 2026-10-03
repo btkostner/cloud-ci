@@ -262,23 +262,28 @@ impl Executor for ContainersExecutor<'_> {
         }
     }
 
-    /// Delegates to [`crate::node_container::start_container`] — see module docs for why
-    /// `bootstrap` is accepted (trait conformance) but not yet threaded through to the real
-    /// container start call.
+    /// Delegates to [`crate::node_container::start_container`], addressed by
+    /// [`crate::coordinator::node_physical_address`] — see module docs for why `bootstrap` is
+    /// accepted (trait conformance) but not yet threaded through to the real container start
+    /// call. The returned [`ExecutorHandle`] carries this same physical address, not the raw
+    /// `node_id` — `stop`/`status` forward it unchanged, never recomputing or guessing it.
     async fn start(
         &self,
         job: &JobSpec,
         _bootstrap: &Bootstrap,
     ) -> Result<ExecutorHandle, Self::Error> {
+        let physical_address =
+            crate::coordinator::node_physical_address(&job.run_do_name, &job.node_id);
         crate::node_container::start_container(
             self.env,
+            &physical_address,
             &job.run_do_name,
             &job.node_id,
             &job.image,
             &job.command,
         )
         .await?;
-        Ok(ExecutorHandle(job.node_id.clone()))
+        Ok(ExecutorHandle(physical_address))
     }
 
     async fn stop(&self, handle: &ExecutorHandle) -> Result<(), Self::Error> {

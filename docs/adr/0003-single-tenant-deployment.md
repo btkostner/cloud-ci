@@ -27,7 +27,12 @@ installing that App on each org.
 - Source code, logs, secrets, and AI prompts never leave the deployer's account.
 - Upgrades are the deployer's responsibility: D1 migrations must be forward-only and safe to
   run against a live deployment, and the proto contract must stay backward compatible with
-  older CLIs.
+  older CLIs. A version that changes how `NodeContainer` addresses a node's real container
+  (`coordinator::node_physical_address`, introduced 2026-10-03) requires draining every
+  `NodeContainer` actor from the previous deployment first — not just non-terminal nodes: a
+  node already marked terminal can still have a running physical container (`run_and_report`
+  reports an exit code, it never calls `destroy()` itself), so the old actor can be left
+  running and unreachable by the new addressing scheme either way.
 - Container and Workers AI usage bill to the deployer.
 
 ## What would reverse this

@@ -698,8 +698,8 @@ pub struct NondeterministicReplay;
 /// real Dynamic Workflow caller yet (see `coordinator` module docs'
 /// scope boundary) to have asked for that, and guessing at the shape of
 /// "the run is now failed" (does the workflow instance get terminated?
-/// do other in-flight nodes get cancelled too, same as
-/// [`nodes_to_cancel`]?) without that caller would be exactly the kind
+/// do other in-flight nodes get cancelled too, same as whole-run
+/// cancellation?) without that caller would be exactly the kind
 /// of speculative API this round must not build. The future
 /// Workflow-integration round's caller owns turning this error into an
 /// actual run failure, once it exists to decide how.
@@ -777,16 +777,31 @@ pub fn resolve_ack_node(current_acked: bool) -> bool {
     !current_acked
 }
 
-/// Which of `nodes`' ids a run cancellation should mark `Cancelled` —
-/// "Coordinator stops containers, marks nodes `cancelled`...". Only
-/// non-terminal nodes are affected: a node that already reached
-/// `Succeeded`/`Failed`/`Skipped`/`TimedOut` keeps that real outcome,
-/// never gets relabeled `Cancelled` after the fact. Order-preserving.
-pub fn nodes_to_cancel(nodes: &[(String, NodeState)]) -> Vec<String> {
+/// Which of `nodes`' ids a run cancellation should mark `Cancelled` and attempt to *stop* —
+/// "Coordinator stops containers, marks nodes `cancelled`...". A non-terminal node is always
+/// included: it needs both the status write and the stop. An already-`Cancelled` node with a
+/// real `physical_address` is included too, even though its status write already happened on an
+/// earlier call: [`crate::coordinator::RunCoordinator::ensure_sibling_cancelled`] writes
+/// `Cancelled` *before* attempting the real stop (so a destroy-induced completion racing in
+/// behind it lands on an already-terminal node and is dropped, not recorded over), which means a
+/// node whose stop genuinely failed is already `Cancelled` by the time a redelivered
+/// `cancel-run` call runs again — excluding it here would leak its container forever. Retrying
+/// it is safe: `NodeContainer`'s `/stop` is idempotent on an already-exited/-destroyed container
+/// (always 200, `stopped: false`), so retrying a node whose container really was already
+/// destroyed is a harmless no-op, while a node whose stop genuinely failed gets the retry it
+/// would otherwise never receive. A `None` address is excluded even when `Cancelled`:
+/// [`resolve_stop_outcome`] already treats a missing address as permanently unresolvable, so
+/// retrying it here would only repeat the same unresolvable warning forever for no benefit. A
+/// node that reached a genuinely different terminal outcome
+/// (`Succeeded`/`Failed`/`Skipped`/`TimedOut`) keeps that real outcome, never relabeled
+/// `Cancelled` after the fact regardless of `physical_address`. Order-preserving.
+pub fn nodes_to_retry_cancel(nodes: &[(String, NodeState, bool)]) -> Vec<String> {
     nodes
         .iter()
-        .filter(|(_, status)| !status.is_terminal())
-        .map(|(id, _)| id.clone())
+        .filter(|(_, status, has_physical_address)| {
+            !status.is_terminal() || (*status == NodeState::Cancelled && *has_physical_address)
+        })
+        .map(|(id, _, _)| id.clone())
         .collect()
 }
 
@@ -1214,6 +1229,30 @@ pub fn allocate_shared_overflow_budget(
     (first, second)
 }
 
+/// Whether `candidate_ms` (an epoch-ms deadline a caller wants this DO's one alarm slot armed
+/// for) should overwrite `current_ms` (the alarm presently armed, if any) — `coordinator::mod`'s
+/// `schedule_overflow_flush_alarm`'s only decision, factored out pure so the "never push an
+/// earlier alarm later" guarantee is independently testable: a pending `shard_terminal_effect`
+/// retry or overflow flush must win against a later run timeout deadline, and a run timeout
+/// deadline that is already earlier than a proposed retry must never be pushed later by it.
+/// `current_ms = None` (no alarm armed yet) always advances. Equal deadlines never advance
+/// (nothing to gain from re-arming an identical epoch).
+pub fn should_advance_alarm(current_ms: Option<i64>, candidate_ms: i64) -> bool {
+    current_ms.is_none_or(|c| candidate_ms < c)
+}
+
+/// Clamps a flat retry delay (`alarm()`'s own pending-effects branch) to the run's deadline: a
+/// flat 5s retry must never outlive a deadline that is already closer than that, or a run whose
+/// deadline falls inside this retry window would close up to 5s late. The very next alarm fire
+/// still re-checks `now >= deadline` before anything else (`alarm()`'s own deadline-wins fix),
+/// so this only bounds *how late* that fire can be, never reintroduces the starvation it fixed.
+/// `deadline_ms - now_ms` is clamped to `0` defensively — in practice `alarm()` only reaches
+/// this branch after its own `now_ms >= deadline_ms` check already returned early, so the
+/// subtraction is always positive by construction, but this never assumes a caller upholds that.
+pub fn clamp_retry_delay_to_deadline(flat_delay_ms: i64, deadline_ms: i64, now_ms: i64) -> i64 {
+    flat_delay_ms.min((deadline_ms - now_ms).max(0))
+}
+
 /// Partitions a drained `test_event_overflow` batch's own `seq`s by
 /// whether their paired write attempt succeeded, so the deferred-flush
 /// caller (`coordinator::mod`'s `flush_test_event_overflow`) deletes
@@ -1322,8 +1361,8 @@ pub fn dedupe_test_outcomes(rows: Vec<TestOutcomeRow>) -> Vec<TestOutcomeRow> {
 // `node` table dependency, same as every other function in this file —
 // but [`shard_node_id`]/[`shard_nodes_to_cancel`] (below) now give
 // `coordinator::mod`'s `handle_shard_terminal` a real id to look each
-// cancelled index up by and stop, via the same `stop_node_container`/
-// `mark_node_cancelled` calls `handle_cancel_run` already uses. See
+// cancelled index up by and stop, via `cancel_shard_nodes`/`ensure_sibling_cancelled` — the
+// same mark-`Cancelled`-then-stop-with-retry discipline `handle_cancel_run` already uses. See
 // those two functions' own doc comments for the id scheme and the
 // "register a shard" story (reusing the existing `startNode` RPC, not a
 // new parallel one).
@@ -1495,6 +1534,20 @@ pub enum BarrierOutcome {
     },
 }
 
+/// Every idx in `0..expected_total` with no row in `latest_terminal` — the immutable-row-derived
+/// fail-fast cancellation set shared by [`evaluate_barrier`]'s live `FailFastTriggered` branch
+/// and `coordinator::mod`'s `legacy_decision_for` reconstructed `"failed"` branch, so a shard
+/// that already reached its own terminal state (by latest attempt) is never included in either's
+/// cancel set, regardless of which caller is asking. `latest_terminal` must already be
+/// [`latest_attempt_per_shard`]'s output.
+pub fn not_yet_terminal_idxs(expected_total: u32, latest_terminal: &[ShardStateRow]) -> Vec<u32> {
+    let present: std::collections::BTreeSet<u32> =
+        latest_terminal.iter().map(|row| row.idx).collect();
+    (0..expected_total)
+        .filter(|idx| !present.contains(idx))
+        .collect()
+}
+
 /// Evaluates the merge barrier for one shard group, per
 /// parallelization.md's "### Merge barrier (RunCoordinator)" bullets,
 /// after a terminal shard-ingest call has resolved
@@ -1515,11 +1568,7 @@ pub fn evaluate_barrier(
     just_recorded: ShardTerminalStatus,
 ) -> BarrierOutcome {
     if config.fail_fast && just_recorded == ShardTerminalStatus::Failed {
-        let present: std::collections::BTreeSet<u32> =
-            latest_terminal.iter().map(|row| row.idx).collect();
-        let cancel_idxs = (0..config.expected_total)
-            .filter(|idx| !present.contains(idx))
-            .collect();
+        let cancel_idxs = not_yet_terminal_idxs(config.expected_total, latest_terminal);
         return BarrierOutcome::FailFastTriggered { cancel_idxs };
     }
 
@@ -1608,7 +1657,7 @@ fn shard_node_matches(node_id: &str, prefix: &str) -> bool {
 /// cancellation wiring maps each cancelled index back to a node id via
 /// [`shard_node_id`]'s own id scheme. Only non-terminal nodes are
 /// returned — the same "already concluded, never relabel" skip
-/// [`nodes_to_cancel`] applies to whole-run cancellation — so a shard
+/// [`nodes_to_retry_cancel`] applies to whole-run cancellation — so a shard
 /// that already finished (successfully or not) on its own before the
 /// fail-fast decision landed is never touched, and a `cancel_idxs` entry
 /// for a shard that was never dispatched as a real node at all simply
@@ -1644,26 +1693,12 @@ pub fn shard_terminal_node_state(status: ShardTerminalStatus) -> NodeState {
 
 /// Whether a shard's own terminal ingest call should bring its own
 /// registered node ([`shard_node_id`]) to a real terminal state —
-/// `handle_shard_terminal`'s self-completion gap: a shard was
-/// dispatched as a real running node via `startNode`, but its own
-/// `completeNode` call either hasn't landed yet or never will (this
-/// report-ingest path is itself the only completion signal this shard
-/// gets). `current` is that node's current state, if a node was ever
-/// registered for this `(job_name, idx, attempt)` at all.
-///
-/// Returns `Some(target)` — the real terminal state to record, via
-/// [`shard_terminal_node_state`] — only when `current` is
-/// `Some(non-terminal)`: a node row exists and is still
-/// `Pending`/`Running`. Returns `None`, a documented no-op, in both
-/// other cases: no node was ever registered for this shard (never
-/// dispatched as a real node — this file's module docs' "still not
-/// built: any real caller that dispatches ordinary shards" gap), or the
-/// node already reached a terminal state of its own (it legitimately
-/// called `completeNode` itself already, or an unrelated cancellation
-/// already settled it) — never re-stop an already-stopped container or
-/// overwrite an already-recorded status, same "already concluded, never
-/// relabel" discipline [`shard_nodes_to_cancel`]/[`nodes_to_cancel`]
-/// already apply to sibling-cancellation.
+/// `handle_shard_terminal`'s self-completion gap. `current` is that
+/// node's current state, if a node was ever registered. Returns
+/// `Some(target)` only when `current` is `Some(non-terminal)`. Returns
+/// `None`, a no-op write (the caller still always attempts the real
+/// stop separately), when no node was ever registered or it already
+/// reached a terminal state of its own.
 pub fn shard_self_completion_target(
     current: Option<NodeState>,
     outcome: ShardTerminalStatus,
@@ -1671,6 +1706,34 @@ pub fn shard_self_completion_target(
     match current {
         Some(state) if !state.is_terminal() => Some(shard_terminal_node_state(outcome)),
         _ => None,
+    }
+}
+
+/// What a stop attempt against a node's own `physical_address` should resolve to, once the
+/// real `stop_container` call's own success/failure is known — `coordinator::mod`'s
+/// `stop_node_container` callers' decision, factored out pure. A `None` address (a node row
+/// from before `node_physical_address`'s addressing scheme existed) can never be resolved by
+/// retrying — there is no way to know this node's real container address, so no future attempt
+/// differs from this one — unlike a `Some` address's genuine stop failure (a container-runtime
+/// fault, a dropped DO-to-DO fetch), which may well succeed on a later retry and must not be
+/// silently treated as done. Mirrors `legacy_decision_for`'s own `"legacy_unknowable"` case:
+/// both mean "nothing further this code can do, stop retrying forever" rather than leaving a
+/// `shard_terminal_effect` permanently pending and starving the run's own timeout close
+/// (`coordinator::mod::alarm`'s deadline-still-wins fix).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopOutcome {
+    /// The real stop succeeded, or there was never a real address to attempt it against —
+    /// nothing further for a caller to retry.
+    Resolved,
+    /// A real stop was attempted against a known address and failed — worth retrying later.
+    Pending,
+}
+
+pub fn resolve_stop_outcome(physical_address: Option<&str>, stop_succeeded: bool) -> StopOutcome {
+    if physical_address.is_none() || stop_succeeded {
+        StopOutcome::Resolved
+    } else {
+        StopOutcome::Pending
     }
 }
 
@@ -1949,6 +2012,55 @@ mod tests {
         assert_eq!(allocate_shared_overflow_budget(250, 100, 300), (100, 150));
         assert_eq!(allocate_shared_overflow_budget(250, 0, 300), (0, 250));
         assert_eq!(allocate_shared_overflow_budget(250, 10, 5), (10, 5));
+    }
+
+    #[test]
+    fn should_advance_alarm_arms_when_nothing_is_currently_scheduled() {
+        assert!(should_advance_alarm(None, 1_000));
+    }
+
+    #[test]
+    fn should_advance_alarm_prefers_an_earlier_pending_retry_over_a_later_run_deadline() {
+        // The run's own far-future timeout deadline is already armed; a shard-terminal-effect
+        // retry 5s out must win and overwrite it.
+        let run_deadline_ms = 10_000_000;
+        let retry_candidate_ms = 5_000;
+        assert!(should_advance_alarm(
+            Some(run_deadline_ms),
+            retry_candidate_ms
+        ));
+    }
+
+    #[test]
+    fn should_advance_alarm_never_pushes_an_earlier_alarm_later() {
+        // A pending retry (or the run's own closer deadline) is already armed sooner than this
+        // candidate -- must not be pushed out to the later candidate.
+        let earlier_pending_retry_ms = 5_000;
+        let later_run_deadline_ms = 10_000_000;
+        assert!(!should_advance_alarm(
+            Some(earlier_pending_retry_ms),
+            later_run_deadline_ms
+        ));
+    }
+
+    #[test]
+    fn should_advance_alarm_does_not_advance_for_an_identical_deadline() {
+        assert!(!should_advance_alarm(Some(5_000), 5_000));
+    }
+
+    #[test]
+    fn clamp_retry_delay_to_deadline_uses_the_flat_delay_when_the_deadline_is_far_away() {
+        assert_eq!(clamp_retry_delay_to_deadline(5_000, 1_000_000, 0), 5_000);
+    }
+
+    #[test]
+    fn clamp_retry_delay_to_deadline_shortens_to_a_sooner_deadline() {
+        assert_eq!(clamp_retry_delay_to_deadline(5_000, 2_000, 0), 2_000);
+    }
+
+    #[test]
+    fn clamp_retry_delay_to_deadline_never_goes_negative() {
+        assert_eq!(clamp_retry_delay_to_deadline(5_000, 0, 1_000), 0);
     }
 
     #[test]
@@ -2678,18 +2790,43 @@ mod tests {
     }
 
     #[test]
-    fn nodes_to_cancel_only_affects_non_terminal_nodes() {
+    fn nodes_to_retry_cancel_includes_non_terminal_nodes_regardless_of_address() {
         let nodes = vec![
-            ("pending-node".to_string(), NodeState::Pending),
-            ("running-node".to_string(), NodeState::Running),
-            ("done-node".to_string(), NodeState::Succeeded),
-            ("failed-node".to_string(), NodeState::Failed),
-            ("already-cancelled".to_string(), NodeState::Cancelled),
+            ("pending-node".to_string(), NodeState::Pending, false),
+            ("running-node".to_string(), NodeState::Running, true),
         ];
         assert_eq!(
-            nodes_to_cancel(&nodes),
+            nodes_to_retry_cancel(&nodes),
             vec!["pending-node".to_string(), "running-node".to_string()]
         );
+    }
+
+    #[test]
+    fn nodes_to_retry_cancel_retries_an_already_cancelled_node_with_a_real_address() {
+        // The exact redelivery regression: this node's stop already failed once, which still
+        // marked it `Cancelled` before the container was actually destroyed -- it must be
+        // retried, not silently dropped just because it is already terminal.
+        let nodes = vec![("stuck-node".to_string(), NodeState::Cancelled, true)];
+        assert_eq!(
+            nodes_to_retry_cancel(&nodes),
+            vec!["stuck-node".to_string()]
+        );
+    }
+
+    #[test]
+    fn nodes_to_retry_cancel_skips_an_already_cancelled_node_with_no_address() {
+        // Unresolvable regardless of how many times it is retried -- `resolve_stop_outcome`
+        // already treats this as resolved, so repeating it here would only generate noise.
+        let nodes = vec![("legacy-node".to_string(), NodeState::Cancelled, false)];
+        assert_eq!(nodes_to_retry_cancel(&nodes), Vec::<String>::new());
+    }
+
+    #[test]
+    fn nodes_to_retry_cancel_skips_a_genuinely_different_terminal_outcome() {
+        // Succeeded/Failed/Skipped/TimedOut are real outcomes, never a stop-retry candidate
+        // regardless of `physical_address` -- only `Cancelled`-but-unconfirmed is retried.
+        let nodes = vec![("done-node".to_string(), NodeState::Succeeded, true)];
+        assert_eq!(nodes_to_retry_cancel(&nodes), Vec::<String>::new());
     }
 
     #[test]
@@ -3005,6 +3142,26 @@ mod tests {
     }
 
     #[test]
+    fn not_yet_terminal_idxs_excludes_every_idx_already_present() {
+        let latest = vec![
+            row(0, 1, ShardTerminalStatus::Failed),
+            row(2, 1, ShardTerminalStatus::Passed),
+        ];
+        assert_eq!(not_yet_terminal_idxs(4, &latest), vec![1, 3]);
+    }
+
+    #[test]
+    fn not_yet_terminal_idxs_matches_evaluate_barrier_fail_fast_cancel_set() {
+        // `legacy_decision_for`'s reconstructed `"failed"` branch (coordinator/mod.rs) calls
+        // this same helper the live `FailFastTriggered` path above does -- this proves the
+        // reconstruction can never diverge from the live barrier's own cancel-set semantics,
+        // and in particular never re-targets an idx that already has an immutable terminal row
+        // (unlike a blind `0..expected_total` which would include it).
+        let latest = vec![row(0, 1, ShardTerminalStatus::Failed)];
+        assert_eq!(not_yet_terminal_idxs(4, &latest), vec![1, 2, 3]);
+    }
+
+    #[test]
     fn evaluate_barrier_fail_fast_false_waits_for_every_remaining_shard() {
         // Same first-shard failure, but fail_fast=false: the group must
         // keep waiting rather than short-circuiting.
@@ -3184,6 +3341,32 @@ mod tests {
         assert_eq!(
             shard_self_completion_target(Some(NodeState::Cancelled), ShardTerminalStatus::Passed),
             None
+        );
+    }
+
+    #[test]
+    fn resolve_stop_outcome_is_resolved_for_a_missing_physical_address_regardless_of_result() {
+        // No address was ever recorded -- no retry could ever do better, so this resolves even
+        // though `stop_succeeded` is false, unlike a real address's own failure below.
+        assert_eq!(resolve_stop_outcome(None, false), StopOutcome::Resolved);
+        assert_eq!(resolve_stop_outcome(None, true), StopOutcome::Resolved);
+    }
+
+    #[test]
+    fn resolve_stop_outcome_is_resolved_when_a_real_stop_succeeds() {
+        assert_eq!(
+            resolve_stop_outcome(Some("addr"), true),
+            StopOutcome::Resolved
+        );
+    }
+
+    #[test]
+    fn resolve_stop_outcome_is_pending_when_a_real_stop_fails() {
+        // A genuine address exists and the stop failed -- this may succeed on a later retry,
+        // unlike the `None`-address case above, so it must not be silently treated as resolved.
+        assert_eq!(
+            resolve_stop_outcome(Some("addr"), false),
+            StopOutcome::Pending
         );
     }
 }

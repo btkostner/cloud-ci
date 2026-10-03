@@ -117,15 +117,13 @@
 //! `(run_id, node_id)` since D1 is shared across runs, same
 //! authoritative-DO/projected-D1 split as every other table here.
 //!
-//! **Run cancellation.** No RPC in this DO set a run to `RunState::Cancelled`
-//! before this round — only the enum variant existed. `handle_cancel_run`
-//! is the minimal hook this round adds: it moves the run to `Cancelled`
-//! and marks every non-terminal node `Cancelled`
-//! ([`logic::nodes_to_cancel`]). A `completeNode` call for an already-
-//! `Cancelled` node afterward is a documented no-op
-//! ([`logic::resolve_complete_node`]'s `DroppedCancelled` arm) — "late
-//! completion events for cancelled nodes are dropped" — rather than an
-//! error or a relabel.
+//! **Run cancellation.** `handle_cancel_run` moves the run to `Cancelled` and marks every
+//! non-terminal node `Cancelled` too, via [`logic::nodes_to_retry_cancel`] — which also
+//! includes any already-`Cancelled` node whose stop is still unconfirmed, so a redelivered
+//! call retries it instead of leaking its container. A `completeNode` call for an already-
+//! `Cancelled` node afterward is a documented no-op ([`logic::resolve_complete_node`]'s
+//! `DroppedCancelled` arm) — "late completion events for cancelled nodes are dropped" —
+//! rather than an error or a relabel.
 
 //! ## Shard groups / merge barrier
 //!
@@ -172,10 +170,12 @@
 //!   `FailFastTriggered { cancel_idxs }` branch resolves each cancelled
 //!   index back to its node id(s) via
 //!   [`logic::shard_nodes_to_cancel`], then stops each one for real via
-//!   [`RunCoordinator::cancel_shards`] — the exact same
-//!   `stop_node_container`/`mark_node_cancelled` pair
-//!   [`RunCoordinator::handle_cancel_run`] already uses for whole-run
-//!   cancellation, just scoped to one shard group's cancelled indices.
+//!   [`RunCoordinator::cancel_shard_nodes`], which calls
+//!   [`RunCoordinator::ensure_sibling_cancelled`] per node — the same
+//!   per-node helper [`RunCoordinator::handle_cancel_run`] uses for whole-run
+//!   cancellation: it marks each node `Cancelled` before stopping its real
+//!   container, and a failed stop is retried (the effect row stays pending),
+//!   not swallowed — just scoped to one shard group's cancelled indices.
 //!   A cancelled index that was never dispatched as a real node (or
 //!   already finished on its own) matches no node and is silently
 //!   skipped — see [`logic::shard_nodes_to_cancel`]'s own doc comment.
@@ -255,6 +255,20 @@ pub fn do_name(repo_id: u64, sha: &str, run_key: &str, attempt: u32) -> String {
         hasher.update(field.as_bytes());
     }
     hasher.update(attempt.to_be_bytes());
+    hex_encode(&hasher.finalize())
+}
+
+/// Scopes a node's real `NodeContainer` address to the run that started it: two different
+/// runs that happen to share a raw `node_id` (same job_name/idx/attempt) must never alias the
+/// same physical container. Length-prefixed hashing, same technique as [`do_name`], so the
+/// result is injective regardless of either field's length or contents.
+pub fn node_physical_address(run_do_name: &str, node_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for field in [run_do_name, node_id] {
+        hasher.update((field.len() as u64).to_be_bytes());
+        hasher.update(field.as_bytes());
+    }
     hex_encode(&hasher.finalize())
 }
 
@@ -407,6 +421,11 @@ pub struct AckNodeOutcome {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CancelRunOutcome {
     pub run_id: String,
+    /// Every node this specific call confirmed stopped (or confirmed already stopped) —
+    /// `logic::nodes_to_retry_cancel`'s output, not just the subset whose status this call
+    /// newly wrote `Cancelled`. A redelivered call that retries an already-`Cancelled` node
+    /// whose earlier stop failed includes that node here again, since this call is the one
+    /// that actually confirmed its container stopped.
     pub cancelled_nodes: Vec<String>,
 }
 
@@ -566,6 +585,9 @@ struct NodeRow {
     /// JSON-encoded `Vec<String>` (`StartNodeRequest.command`'s on-disk
     /// form, matching `check_names`' existing JSON-column convention).
     command: String,
+    /// `None` for a node row written before this column existed (`ensure_schema`'s own
+    /// `ALTER TABLE` doc comment) -- never addressable, never guessed.
+    physical_address: Option<String>,
 }
 
 /// One shard group's `job_group` row, keyed by `job_name` alone — this DO
@@ -607,6 +629,47 @@ struct ShardStateDbRow {
     idx: i64,
     attempt: i64,
     status: String,
+}
+
+/// `shard_state`'s full row, for replaying a terminal decision's effects from the exact
+/// payload that was durably accepted — [`drain_shard_terminal_effects`]'s only source for
+/// `report_key`/`duration_ms`/`finished_at`, never a later redelivery's own request fields
+/// (an identical-status duplicate's `report_key`/`duration_ms` are not guaranteed identical
+/// to the first accepted call's, so a replay must project the stored payload, not the
+/// duplicate's).
+#[derive(Debug, Clone, Deserialize)]
+struct ShardStateFullRow {
+    status: String,
+    report_key: Option<String>,
+    duration_ms: Option<i64>,
+    finished_at: i64,
+}
+
+/// One terminal decision's durable, not-yet-confirmed effect set — committed atomically with
+/// its `shard_state` row, replayed by [`RunCoordinator::drain_shard_terminal_effects`] until
+/// `completed_at` is set. `cancel_node_ids` is concrete node ids, not `cancel_idxs`: a retry
+/// must hit the exact nodes this decision meant to stop even if that index is later
+/// redispatched under a new attempt. No `merge_job_id`: `job_name -> job.id` never changes
+/// once a job starts, so drain resolves it fresh each pass instead of freezing it — a job not
+/// yet started is retried, not silently dropped.
+#[derive(Debug, Clone, Deserialize)]
+struct ShardTerminalEffectRow {
+    decision_kind: String,
+    cancel_node_ids: Option<String>,
+    merge: Option<i64>,
+    included_idxs: Option<String>,
+    completed_at: Option<i64>,
+}
+
+/// One `Recorded` decision's response plus the [`ShardTerminalEffectRow`] fields to freeze
+/// for it, computed together so both always describe the same decision.
+struct ResolvedShardDecision {
+    response: ShardBarrierDecision,
+    effect_kind: &'static str,
+    cancel_node_ids: Option<Vec<String>>,
+    merge: Option<bool>,
+    included_idxs: Option<Vec<u32>>,
+    group_status_update: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -754,6 +817,12 @@ fn hex_sha256(bytes: &[u8]) -> String {
 // The Durable Object
 // ---------------------------------------------------------------------------
 
+/// The flat short-retry delay `schedule_overflow_flush_alarm` arms for pending
+/// `shard_terminal_effect`/overflow-backlog work. Module-level (not local to that function) so
+/// `alarm()`'s own pending-effects branch can clamp it to the run's deadline via
+/// `logic::clamp_retry_delay_to_deadline` without duplicating the literal.
+const OVERFLOW_FLUSH_DELAY_MS: i64 = 5_000;
+
 #[durable_object(alarm)]
 pub struct RunCoordinator {
     state: State,
@@ -844,15 +913,16 @@ impl DurableObject for RunCoordinator {
     /// tie-break — see that function's own doc comment); if rows remain
     /// in either backlog after this invocation's share, this
     /// re-schedules itself soon and returns *without* evaluating the
-    /// timeout — an overflow-triggered fire must never close the run
-    /// early just because it happened to be the thing that woke the DO
-    /// up. Only once both backlogs are empty does this fall through to
-    /// the run's real deadline (recomputed from `run.created_at +
+    /// timeout. Once both backlogs are drained (or there was nothing to
+    /// drain), the run's real deadline (recomputed from `run.created_at +
     /// run.timeout_s`, not from whatever time this particular alarm
-    /// fired at, since an overflow flush may have pulled it earlier): if
-    /// the deadline has passed, closes the run exactly as before;
-    /// otherwise it re-schedules the alarm for that deadline, restoring
-    /// ordinary timeout behavior.
+    /// fired at, since an overflow flush may have pulled it earlier)
+    /// always wins if it has already passed — even over a still-pending
+    /// `shard_terminal_effect` that can never resolve (for example a node
+    /// row with no recorded `physical_address`): the run's own timeout
+    /// must never be starved forever by one permanently-stuck retry.
+    /// Only when the deadline has *not* yet passed does a pending
+    /// effect/overflow backlog get the short retry alarm instead.
     ///
     /// `handle_close_run`'s own terminal-state no-op guard still makes
     /// this idempotent: if the run already closed via the webhook or
@@ -864,6 +934,25 @@ impl DurableObject for RunCoordinator {
         const SHARED_INVOCATION_BUDGET: i64 = 250;
         let sql = self.state.storage().sql();
         ensure_schema(&sql)?;
+        // Resumes any shard-terminal decision whose effects a crash or transient failure left
+        // stranded (`drain_shard_terminal_effects`'s own doc comment) -- ahead of, and
+        // independent of, the overflow-flush budget below: these rows are rare (only created
+        // by a genuine partial failure, never a normal high-volume path), not subject to
+        // `SHARED_INVOCATION_BUDGET`.
+        let mut shard_effects_pending = false;
+        if let Some(run_row) = read_run(&sql)? {
+            for (job_name, idx, attempt) in read_pending_shard_terminal_effect_keys(&sql)? {
+                if let Err(e) = self
+                    .drain_shard_terminal_effects(&sql, &run_row, &job_name, idx, attempt)
+                    .await
+                {
+                    worker::console_log!(
+                        "shard terminal effect retry failed for {job_name}/{idx}/{attempt}: {e}"
+                    );
+                    shard_effects_pending = true;
+                }
+            }
+        }
         let test_pending = count_test_event_overflow(&sql)?;
         let sample_pending = count_sample_event_overflow(&sql)?;
         let (test_budget, sample_budget) = logic::allocate_shared_overflow_budget(
@@ -877,22 +966,48 @@ impl DurableObject for RunCoordinator {
         let remaining_sample = self
             .flush_sample_event_overflow(&sql, sample_budget as i64)
             .await?;
-        if remaining_test > 0 || remaining_sample > 0 {
-            self.schedule_overflow_flush_alarm().await?;
-            return Response::ok("event overflow flush in progress");
-        }
         let Some(run_row) = read_run(&sql)? else {
             return Response::ok("no run to close");
         };
+        // A run that already went terminal while this fire was in flight (closed via the
+        // webhook/`--expect-jobs`, or cancelled) must never re-arm here — `release_alarm_if_idle`
+        // already drives this DO's alarm slot off whatever background work actually remains,
+        // and falling through to the unconditional `set_alarm` below would undo that release.
+        if run_state_of(&run_row)?.is_terminal() {
+            self.release_alarm_if_idle(&sql).await?;
+            return Response::ok("run already terminal");
+        }
         let deadline_ms = run_row.created_at + run_row.timeout_s.saturating_mul(1000);
         let now_ms = worker::Date::now().as_millis() as i64;
-        if now_ms < deadline_ms {
-            self.state.storage().set_alarm(deadline_ms - now_ms).await?;
-            return Response::ok("rescheduled for the run's own timeout");
+        if now_ms >= deadline_ms {
+            return self.handle_close_run(&sql, true).await;
         }
-        self.handle_close_run(&sql, true).await
+        if shard_effects_pending || remaining_test > 0 || remaining_sample > 0 {
+            // A flat `schedule_overflow_flush_alarm()` call would arm `now + 5s` unconditionally
+            // -- fine most of the time, but a run whose own deadline falls inside that 5s window
+            // would then close up to 5s late. Clamp the retry to whichever is sooner; the next
+            // fire still re-checks `now >= deadline` above before anything else, so this never
+            // reintroduces the starvation the deadline-wins fix closed.
+            let retry_delay_ms =
+                logic::clamp_retry_delay_to_deadline(OVERFLOW_FLUSH_DELAY_MS, deadline_ms, now_ms);
+            self.state.storage().set_alarm(retry_delay_ms).await?;
+            return Response::ok("event overflow flush in progress");
+        }
+        self.state.storage().set_alarm(deadline_ms - now_ms).await?;
+        Response::ok("rescheduled for the run's own timeout")
     }
 }
+
+/// `(decision_kind, cancel_node_ids, merge, included_idxs, group_status_update)` —
+/// [`RunCoordinator::legacy_decision_for`]'s return shape, named only to satisfy
+/// `clippy::type_complexity`.
+type LegacyDecisionParts = (
+    &'static str,
+    Option<Vec<String>>,
+    Option<bool>,
+    Option<Vec<u32>>,
+    Option<&'static str>,
+);
 
 impl RunCoordinator {
     async fn handle_begin_run(
@@ -1493,20 +1608,50 @@ impl RunCoordinator {
     /// `alarm()` restores the run's real timeout deadline once the
     /// backlog is fully drained.
     async fn schedule_overflow_flush_alarm(&self) -> worker::Result<()> {
-        const OVERFLOW_FLUSH_DELAY_MS: i64 = 5_000;
         let desired = worker::Date::now().as_millis() as i64 + OVERFLOW_FLUSH_DELAY_MS;
         let current = self.state.storage().get_alarm().await?;
-        let should_set = match current {
-            None => true,
-            Some(epoch_ms) => epoch_ms > desired,
-        };
-        if should_set {
+        if logic::should_advance_alarm(current, desired) {
             self.state
                 .storage()
                 .set_alarm(OVERFLOW_FLUSH_DELAY_MS)
                 .await?;
         }
         Ok(())
+    }
+
+    /// Whether any background work remains that only this DO's alarm will ever come back
+    /// and retry: undrained `shard_terminal_effect` rows (`read_pending_shard_terminal_effect_keys`
+    /// already excludes the permanently-unresolvable `legacy_unknowable` ones, so this never
+    /// stays true forever over those), or an undrained `test_event_overflow`/
+    /// `sample_event_overflow` backlog. [`Self::release_alarm_if_idle`]'s own gate — see
+    /// that function's doc comment for why a bare `delete_alarm()` call is never correct
+    /// while this is true.
+    fn has_pending_background_work(sql: &SqlStorage) -> worker::Result<bool> {
+        if !read_pending_shard_terminal_effect_keys(sql)?.is_empty() {
+            return Ok(true);
+        }
+        Ok(count_test_event_overflow(sql)? > 0 || count_sample_event_overflow(sql)? > 0)
+    }
+
+    /// The only correct way to give up this DO's alarm slot once a run reaches a terminal
+    /// state (`handle_close_run`/`handle_cancel_run`): this DO has exactly **one** alarm
+    /// slot (`schedule_overflow_flush_alarm`'s own doc comment), shared between the run's
+    /// own timeout deadline, `shard_terminal_effect` retries, and test/sample overflow
+    /// flushing. A bare `delete_alarm()` call right after a run goes terminal silently
+    /// orphans any of that still-pending work forever: the run's own terminal guard
+    /// (`handle_close_run`'s early-return branch, `handle_cancel_run`'s idempotent-no-op
+    /// branch) never again calls [`Self::drain_shard_terminal_effects`] or the overflow
+    /// flushers, so without the alarm nothing would ever retry a stranded stop/enqueue
+    /// failure or finish flushing analytics overflow for this run. When
+    /// [`Self::has_pending_background_work`] is true, this re-arms the short overflow-flush
+    /// retry instead of deleting the alarm, exactly the way `alarm()` itself already defers
+    /// its own deadline reschedule while shard effects or overflow remain pending.
+    async fn release_alarm_if_idle(&self, sql: &SqlStorage) -> worker::Result<()> {
+        if Self::has_pending_background_work(sql)? {
+            self.schedule_overflow_flush_alarm().await
+        } else {
+            self.state.storage().delete_alarm().await
+        }
     }
 
     async fn handle_submit_report(
@@ -2105,12 +2250,14 @@ impl RunCoordinator {
         let run_conclusion = logic::run_conclusion_from_jobs(&job_conclusions);
         let next_state = logic::run_state_for_close(by_timeout, run_conclusion);
         update_run_status(sql, &run_row.id, next_state)?;
-        // Cancels a still-pending timeout alarm once the run closes via
-        // the webhook or `--expect-jobs`, so a completed run never has a
-        // stale alarm fire later and no-op against an already-terminal
-        // run. Harmless when `by_timeout` is true (the alarm that just
-        // fired is already consumed) or when no alarm was ever set.
-        self.state.storage().delete_alarm().await?;
+        // Releases this DO's sole alarm slot once the run closes via the webhook or
+        // `--expect-jobs` -- but only if no stranded shard-terminal-effect retry or
+        // analytics overflow backlog still needs it (`release_alarm_if_idle`'s own doc
+        // comment); otherwise it re-arms the short retry instead of deleting the alarm, so
+        // that pending work is never orphaned by this run going terminal. Harmless when
+        // `by_timeout` is true (the alarm that just fired is already consumed) or when no
+        // alarm was ever set.
+        self.release_alarm_if_idle(sql).await?;
         let run_row = require_run(sql)?;
         self.project_run_to_d1(&run_row).await?;
         self.finalize_check_runs(sql, &run_row).await?;
@@ -2175,21 +2322,22 @@ impl RunCoordinator {
     /// [`ShardBarrierDecision::Satisfied`] with `merge: true` — `merge: false` (a real,
     /// documented `merge_on_failure` no-op, parallelization.md: "`never`", or `if_any_passed`
     /// with zero passed shards) never reaches this call, so it is never treated as an error
-    /// path. A send failure (the `MERGE_QUEUE` binding unreachable, a transient Queues API
-    /// error) is logged and swallowed, not propagated — same degrade-and-log posture as
-    /// [`RunCoordinator::enqueue_analysis_requested`] above: losing one shard group's merge
-    /// dispatch must not fail the `shardTerminal` response this function already committed
-    /// (`shard_state`/`job_group` rows) by the time this call happens. `job_id` is resolved by
-    /// the caller (a D1-projected, authoritative-DO `job` row lookup by `job_name`) rather than
-    /// re-read here, since this function has no `SqlStorage` access of its own — same split as
-    /// every other `enqueue_*` helper in this file.
+    /// path. Returns whether the send actually succeeded: a binding failure or a transient
+    /// Queues API error is still logged here (same degrade-and-log posture as
+    /// [`RunCoordinator::enqueue_analysis_requested`] above), but the caller —
+    /// [`RunCoordinator::drain_shard_terminal_effects`] — must not mark this decision's
+    /// `shard_terminal_effect` row complete on a failed send, or the dispatch would be
+    /// silently lost instead of retried on the next duplicate/alarm pass. `job_id` is resolved
+    /// by the caller (a D1-projected, authoritative-DO `job` row lookup by `job_name`) rather
+    /// than re-read here, since this function has no `SqlStorage` access of its own — same
+    /// split as every other `enqueue_*` helper in this file.
     async fn enqueue_shard_merge(
         &self,
         run_row: &RunRow,
         job_id: &str,
         job_name: &str,
         included_idxs: Vec<u32>,
-    ) {
+    ) -> bool {
         let message = crate::shard_merge::ShardMergeRequested {
             run_id: run_row.id.clone(),
             job_id: job_id.to_string(),
@@ -2203,7 +2351,7 @@ impl RunCoordinator {
                     "shard merge: MERGE_QUEUE binding unavailable, skipping enqueue for run {} job {job_name}: {e}",
                     run_row.id
                 );
-                return;
+                return false;
             }
         };
         if let Err(e) = queue.send(message).await {
@@ -2211,7 +2359,9 @@ impl RunCoordinator {
                 "shard merge: enqueue ShardMergeRequested failed for run {} job {job_name}: {e}",
                 run_row.id
             );
+            return false;
         }
+        true
     }
 
     /// Applies every canonical, parsed report's test outcomes to
@@ -2498,6 +2648,14 @@ impl RunCoordinator {
                 let now_ms = worker::Date::now().as_millis() as i64;
                 let command_json = serde_json::to_string(&req.command)
                     .map_err(|e| worker::Error::RustError(format!("cannot encode command: {e}")))?;
+                let run_row = require_run(sql)?;
+                let run_do_name = do_name(
+                    run_row.repo_id as u64,
+                    &run_row.sha,
+                    &run_row.run_key,
+                    run_row.attempt as u32,
+                );
+                let physical_address = node_physical_address(&run_do_name, &req.node_id);
                 insert_node(
                     sql,
                     &req.node_id,
@@ -2505,9 +2663,9 @@ impl RunCoordinator {
                     req.check_name.as_deref(),
                     &req.image,
                     &command_json,
+                    &physical_address,
                     now_ms,
                 )?;
-                let run_row = require_run(sql)?;
 
                 if let Err(start_err) = self
                     .start_node_container(&run_row, &req.node_id, &req.image, &req.command)
@@ -2617,11 +2775,21 @@ impl RunCoordinator {
     }
 
     /// Minimal run-cancellation hook (module docs' "Run cancellation"):
-    /// moves the run to `RunState::Cancelled`, marks every non-terminal
-    /// node `Cancelled`, and actually stops that node's real container
-    /// via [`Self::stop_node_container`] — "Coordinator stops
-    /// containers, marks nodes `cancelled`...", not just a DB flag flip
-    /// while a real container keeps running unsupervised.
+    /// moves the run to `RunState::Cancelled` and, via
+    /// [`Self::ensure_sibling_cancelled`], marks each non-terminal node
+    /// `Cancelled` *before* stopping its real container — "Coordinator
+    /// stops containers, marks nodes `cancelled`...", not just a DB flag
+    /// flip while a real container keeps running unsupervised. A node
+    /// whose stop genuinely fails leaves the run non-terminal and the
+    /// request errors; a redelivered `cancel-run` retries it because
+    /// [`logic::nodes_to_retry_cancel`] includes any already-`Cancelled`
+    /// node with a real `physical_address` on every call, so an
+    /// unconfirmed stop is never silently dropped just because the
+    /// status write already succeeded. `CancelRunOutcome`'s
+    /// `cancelled_nodes` reports exactly that same set — every node this
+    /// specific call confirmed stopped (or already stopped), including
+    /// a retried already-`Cancelled` sibling, not merely the ones whose
+    /// status this call newly wrote.
     async fn handle_cancel_run(&self, sql: &SqlStorage) -> worker::Result<Response> {
         let Some(run_row) = read_run(sql)? else {
             return error_response(404, "run not found");
@@ -2636,153 +2804,366 @@ impl RunCoordinator {
             });
         }
 
-        let nodes: Vec<(String, logic::NodeState)> = read_all_nodes(sql)?
+        let node_rows = read_all_nodes(sql)?;
+        let nodes_with_address: Vec<(String, logic::NodeState, bool)> = node_rows
             .iter()
-            .map(|row| Ok((row.node_id.clone(), node_state_of(row)?)))
+            .map(|row| {
+                Ok((
+                    row.node_id.clone(),
+                    node_state_of(row)?,
+                    row.physical_address.is_some(),
+                ))
+            })
             .collect::<worker::Result<Vec<_>>>()?;
-        let to_cancel = logic::nodes_to_cancel(&nodes);
+        let to_retry = logic::nodes_to_retry_cancel(&nodes_with_address);
 
-        let now_ms = worker::Date::now().as_millis() as i64;
-        for node_id in &to_cancel {
-            self.stop_node_container(node_id).await;
-            mark_node_cancelled(sql, node_id, now_ms)?;
-            let row = require_node(sql, node_id)?;
-            self.project_node_to_d1(&run_row.id, &row).await?;
+        let mut first_err = None;
+        for node_id in &to_retry {
+            match self
+                .ensure_sibling_cancelled(sql, &run_row.id, node_id)
+                .await
+            {
+                Ok(()) => {}
+                Err(e) if first_err.is_none() => first_err = Some(e),
+                Err(_) => {}
+            }
+        }
+        if let Some(e) = first_err {
+            return Err(e);
         }
 
         update_run_status(sql, &run_row.id, RunState::Cancelled)?;
-        self.state.storage().delete_alarm().await?;
+        // Same posture as `handle_close_run`: never give up the sole alarm slot while an
+        // unrelated stranded shard-terminal-effect retry (e.g. an earlier fail-fast sibling
+        // stop that failed) or analytics overflow backlog still needs it. Every node loop
+        // failure above already returned before reaching here.
+        self.release_alarm_if_idle(sql).await?;
         let run_row = require_run(sql)?;
         self.project_run_to_d1(&run_row).await?;
 
         Response::from_json(&CancelRunOutcome {
             run_id: run_row.id,
-            cancelled_nodes: to_cancel,
+            cancelled_nodes: to_retry,
         })
     }
 
-    /// Starts `node_id`'s real container via a DO-to-DO call into
-    /// `NodeContainer` (`node_container.rs`), addressed by `node_id` so
-    /// a redelivered start naturally lands on the same container-backed
-    /// instance (defense in depth alongside this DO's own
-    /// `StartNodeDecision::AlreadyStarted` guard, which already stops a
-    /// second call from ever reaching this function). `NodeContainer`'s
-    /// own `/start` only *starts* the container and returns; the real
-    /// `exec()` and its exit code are reported back asynchronously to
-    /// `/complete-node` (see that module's doc comment for why this is
-    /// a background task, not a synchronous wait, matching
-    /// dynamic-pipelines.md's "step.do ... returns quickly" contract).
-    /// `Err` here means the container itself failed to *start* (bad
-    /// image, Docker/runtime error) — a real failure
-    /// [`Self::handle_start_node`] maps straight to the node's own
-    /// `failed` status, never an unhandled 500.
-    /// Delegates to [`crate::node_container::start_container`] — the same real DO-to-DO call
-    /// [`crate::executor::ContainersExecutor::start`] makes, extracted here rather than
-    /// duplicated so neither caller reimplements the HTTP request.
+    /// Starts `node_id`'s real container via a DO-to-DO call into `NodeContainer`
+    /// (`node_container.rs`), addressed by [`node_physical_address`], not raw `node_id` alone
+    /// — scopes the real container to this run, so two different runs sharing a `node_id`
+    /// never alias the same physical container. Returns the computed address on success so
+    /// [`Self::handle_start_node`] can store it on the new node row. `Err` here means the
+    /// container itself failed to *start* — a real failure [`Self::handle_start_node`] maps
+    /// straight to the node's own `failed` status, never an unhandled 500.
     async fn start_node_container(
         &self,
         run_row: &RunRow,
         node_id: &str,
         image: &str,
         command: &[String],
-    ) -> Result<(), String> {
+    ) -> Result<String, String> {
         let run_do_name = do_name(
             run_row.repo_id as u64,
             &run_row.sha,
             &run_row.run_key,
             run_row.attempt as u32,
         );
-        crate::node_container::start_container(&self.env, &run_do_name, node_id, image, command)
-            .await
+        let physical_address = node_physical_address(&run_do_name, node_id);
+        crate::node_container::start_container(
+            &self.env,
+            &physical_address,
+            &run_do_name,
+            node_id,
+            image,
+            command,
+        )
+        .await?;
+        Ok(physical_address)
     }
 
-    /// Delegates to [`crate::node_container::stop_container`] —
-    /// [`Self::handle_cancel_run`]'s and [`Self::cancel_shards`]'s shared
-    /// call. Best-effort, degrade-and-log on any failure (unreachable DO, container
-    /// already gone): blocking the whole run's cancellation on one node's container failing to
-    /// stop would leave the run stuck cancelling forever, the same degrade-and-log posture
-    /// `check_run_auth`'s callers already use for GitHub API failures.
-    async fn stop_node_container(&self, node_id: &str) {
-        if let Err(e) = crate::node_container::stop_container(&self.env, node_id).await {
-            worker::console_log!("cancel_run: stop container for node {node_id} failed: {e}");
+    /// Delegates to [`crate::node_container::stop_container`], addressed by the node's own
+    /// stored `physical_address` — never recomputed, never a raw-`node_id` fallback.
+    /// `physical_address: None` (a row written before this column existed) is logged as an
+    /// explicit, distinct failure and never attempted: there is no way to know this node's
+    /// real container address, so this never guesses or resolves to a new, unrelated actor.
+    /// Returns whether the stop actually succeeded, so every caller —
+    /// [`Self::ensure_sibling_cancelled`] (both whole-run cancellation via
+    /// `handle_cancel_run` and fail-fast sibling cancellation) and
+    /// [`Self::complete_own_shard_node`] — can retry a failed stop rather
+    /// than silently mark it done.
+    async fn stop_node_container(&self, node_id: &str, physical_address: Option<&str>) -> bool {
+        let Some(physical_address) = physical_address else {
+            worker::console_log!(
+                "stop container for node {node_id} failed: no physical address recorded \
+                 (started before this version's addressing scheme) -- drain this node's \
+                 container manually, it cannot be addressed by this version"
+            );
+            return false;
+        };
+        match crate::node_container::stop_container(&self.env, physical_address).await {
+            Ok(()) => true,
+            Err(e) => {
+                worker::console_log!("stop container for node {node_id} failed: {e}");
+                false
+            }
         }
     }
 
-    /// Stops the real container for every still-running node that
-    /// shard group `job_name`'s fail-fast decision cancelled —
-    /// [`Self::handle_shard_terminal`]'s `FailFastTriggered { cancel_idxs
-    /// }` branch's real cancellation half (module docs' "Shard groups /
-    /// merge barrier" section). Mirrors [`Self::handle_cancel_run`]'s
-    /// own per-node loop exactly (`stop_node_container` then
-    /// `mark_node_cancelled` then re-project to D1), scoped down to just
-    /// the node(s) [`logic::shard_nodes_to_cancel`] resolves for each
-    /// cancelled index via [`logic::shard_node_id`]'s id scheme. A
-    /// cancelled index with no matching non-terminal node (never
-    /// dispatched as a real node, or it already finished on its own) is
-    /// a documented no-op for that index — see
-    /// [`logic::shard_nodes_to_cancel`]'s own doc comment.
-    async fn cancel_shards(
-        &self,
+    /// Resolves shard group `job_name`'s fail-fast cancellation set to concrete node ids —
+    /// a pure, DO-local-read-only snapshot taken once at decision time, before any `await`,
+    /// so the frozen `cancel_node_ids` [`RunCoordinator::handle_shard_terminal`] stores in
+    /// `shard_terminal_effect` names the exact nodes this decision meant to cancel. A retry
+    /// must replay this same frozen list via [`Self::cancel_shard_nodes`], never call this
+    /// function again: if a cancelled index were later redispatched under a new attempt (an
+    /// OOM retry), re-resolving at retry time would pick that unrelated new node instead of
+    /// the one this decision actually meant to stop.
+    fn resolve_shard_cancel_node_ids(
         sql: &SqlStorage,
-        run_row: &RunRow,
         job_name: &str,
         cancel_idxs: &[u32],
-    ) -> worker::Result<()> {
+    ) -> worker::Result<Vec<String>> {
         let nodes: Vec<(String, logic::NodeState)> = read_all_nodes(sql)?
             .iter()
             .map(|row| Ok((row.node_id.clone(), node_state_of(row)?)))
             .collect::<worker::Result<Vec<_>>>()?;
-        let now_ms = worker::Date::now().as_millis() as i64;
-        for &idx in cancel_idxs {
-            for node_id in logic::shard_nodes_to_cancel(job_name, idx, &nodes) {
-                self.stop_node_container(&node_id).await;
-                mark_node_cancelled(sql, &node_id, now_ms)?;
-                let row = require_node(sql, &node_id)?;
-                self.project_node_to_d1(&run_row.id, &row).await?;
-            }
-        }
-        Ok(())
+        Ok(cancel_idxs
+            .iter()
+            .flat_map(|&idx| logic::shard_nodes_to_cancel(job_name, idx, &nodes))
+            .collect())
     }
 
-    /// Brings the *reporting* shard's own registered node to a real
-    /// terminal state consistent with its own terminal report —
-    /// [`Self::handle_shard_terminal`]'s self-completion gap (that
-    /// function's own doc comment): a shard reports terminal via this
-    /// call, but if it was ever dispatched as a real node via
-    /// `startNode` ([`logic::shard_node_id`]), nothing before this round
-    /// ever touched *that* node — only `FailFastTriggered`'s *sibling*
-    /// nodes got stopped/marked via [`Self::cancel_shards`]. Unlike
-    /// `cancel_shards`, this never records `Cancelled`: the reporting
-    /// shard was not cancelled, it genuinely concluded with
-    /// `outcome` ([`logic::shard_terminal_node_state`]). A no-op,
-    /// decided entirely by [`logic::shard_self_completion_target`], when
-    /// no node was ever registered for this `(job_name, idx, attempt)`,
-    /// or it already reached a terminal state of its own (it already
-    /// called `completeNode` for real, or was already cancelled by some
-    /// other mechanism) — never re-stops an already-stopped container or
-    /// overwrites an already-recorded status.
+    /// Computes the effect parameters a legacy `shard_state` row (no `shard_terminal_effect`
+    /// row) should freeze. Two distinct cases, never conflated:
+    /// - `group.status == "running"`: no decision was ever persisted for this row — the
+    ///   original crash happened before the old code ever reached barrier evaluation. Safe
+    ///   and necessary to decide now, from current state, exactly like a normal `Recorded`
+    ///   call: `read_all_shard_terminal_rows` already includes this row (it is a real,
+    ///   already-persisted `shard_state` row, unlike the live-accept path's not-yet-inserted
+    ///   one), so no synthetic row needs folding in.
+    /// - `group.status != "running"`: a decision *was* already made historically. Only
+    ///   `"failed"` (never reverts, so cancelling every currently non-terminal node is exactly
+    ///   today's version of the original "cancel everything not yet terminal" fact) and
+    ///   `merge_on_failure` values independent of per-shard status (`Always`/`Never`) are
+    ///   reconstructed; `IfAnyPassed`, and `Always` with a `shard_state` idx set that is not
+    ///   *exactly* `0..expected_total` (a redelivered `GroupAlreadyTerminal` call can still
+    ///   insert an out-of-range idx — nothing validates `idx < expected_total`), are
+    ///   ambiguous and freeze as `"legacy_unknowable"` instead of guessing.
+    fn legacy_decision_for(
+        sql: &SqlStorage,
+        job_name: &str,
+        outcome: logic::ShardTerminalStatus,
+        group: &ShardGroupRow,
+    ) -> worker::Result<LegacyDecisionParts> {
+        let Some(merge_on_failure) = logic::MergeOnFailure::from_db_str(&group.merge_on_failure)
+        else {
+            return Ok(("legacy_unknowable", None, None, None, None));
+        };
+        let expected_total = group.expected_total as u32;
+
+        if group.status == "running" {
+            let config = logic::JobGroupConfig {
+                expected_total,
+                fail_fast: group.fail_fast != 0,
+                merge_on_failure,
+            };
+            let latest_terminal =
+                logic::latest_attempt_per_shard(&read_all_shard_terminal_rows(sql, job_name)?);
+            return Ok(
+                match logic::evaluate_barrier(config, &latest_terminal, outcome) {
+                    logic::BarrierOutcome::Waiting => ("waiting", None, None, None, None),
+                    logic::BarrierOutcome::FailFastTriggered { cancel_idxs } => {
+                        let node_ids =
+                            Self::resolve_shard_cancel_node_ids(sql, job_name, &cancel_idxs)?;
+                        (
+                            "fail_fast_triggered",
+                            Some(node_ids),
+                            None,
+                            None,
+                            Some("failed"),
+                        )
+                    }
+                    logic::BarrierOutcome::Satisfied {
+                        merge,
+                        included_idxs,
+                    } => (
+                        "satisfied",
+                        None,
+                        Some(merge),
+                        Some(included_idxs),
+                        Some("satisfied"),
+                    ),
+                },
+            );
+        }
+
+        if group.status == "failed" {
+            // Mirrors `evaluate_barrier`'s own `FailFastTriggered` cancel-set computation
+            // exactly, via the same shared helper: immutable `shard_state` rows decide which
+            // idxs are already terminal, never a blind `0..expected_total` that would needlessly
+            // re-target already-finished siblings.
+            let latest_terminal =
+                logic::latest_attempt_per_shard(&read_all_shard_terminal_rows(sql, job_name)?);
+            let cancel_idxs = logic::not_yet_terminal_idxs(expected_total, &latest_terminal);
+            let node_ids = Self::resolve_shard_cancel_node_ids(sql, job_name, &cancel_idxs)?;
+            return Ok(("fail_fast_triggered", Some(node_ids), None, None, None));
+        }
+
+        if group.status == "satisfied" {
+            return Ok(match merge_on_failure {
+                logic::MergeOnFailure::Never => {
+                    ("satisfied", None, Some(false), Some(Vec::new()), None)
+                }
+                logic::MergeOnFailure::Always => {
+                    let present: std::collections::BTreeSet<u32> = logic::latest_attempt_per_shard(
+                        &read_all_shard_terminal_rows(sql, job_name)?,
+                    )
+                    .iter()
+                    .map(|r| r.idx)
+                    .collect();
+                    let expected: std::collections::BTreeSet<u32> = (0..expected_total).collect();
+                    if present == expected {
+                        (
+                            "satisfied",
+                            None,
+                            Some(true),
+                            Some(expected.into_iter().collect()),
+                            None,
+                        )
+                    } else {
+                        ("legacy_unknowable", None, None, None, None)
+                    }
+                }
+                logic::MergeOnFailure::IfAnyPassed => {
+                    // `insert_shard_state` is append-only (plain `INSERT`, no `UPDATE`/`DELETE`
+                    // anywhere in this module, and `resolve_shard_terminal`'s `AlreadyRecorded`
+                    // guard means it is never called twice for the same key) -- so if every
+                    // idx `0..expected_total` has *exactly one* row and no other idx is
+                    // present, no late/retried attempt could possibly have landed after the
+                    // original decision: this is still that exact same row set, not a
+                    // recomputation against possibly-changed state.
+                    let all_rows = read_all_shard_terminal_rows(sql, job_name)?;
+                    let mut counts: std::collections::BTreeMap<u32, u32> =
+                        std::collections::BTreeMap::new();
+                    for row in &all_rows {
+                        *counts.entry(row.idx).or_insert(0) += 1;
+                    }
+                    let present: std::collections::BTreeSet<u32> = counts.keys().copied().collect();
+                    let expected: std::collections::BTreeSet<u32> = (0..expected_total).collect();
+                    if present == expected && counts.values().all(|&c| c == 1) {
+                        let any_passed = all_rows
+                            .iter()
+                            .any(|r| r.status == logic::ShardTerminalStatus::Passed);
+                        if any_passed {
+                            let mut included_idxs: Vec<u32> = all_rows
+                                .iter()
+                                .filter(|r| r.status == logic::ShardTerminalStatus::Passed)
+                                .map(|r| r.idx)
+                                .collect();
+                            included_idxs.sort_unstable();
+                            ("satisfied", None, Some(true), Some(included_idxs), None)
+                        } else {
+                            ("satisfied", None, Some(false), Some(Vec::new()), None)
+                        }
+                    } else {
+                        ("legacy_unknowable", None, None, None, None)
+                    }
+                }
+            });
+        }
+
+        Ok(("legacy_unknowable", None, None, None, None))
+    }
+
+    /// Stops and marks `Cancelled` every node in `node_ids` — the frozen list
+    /// [`Self::resolve_shard_cancel_node_ids`] resolved at decision time. Safe to call
+    /// repeatedly: each node's own [`Self::ensure_sibling_cancelled`] call is independently
+    /// idempotent. One node's stop failure must never skip the rest of this frozen list: a
+    /// `?`-short-circuiting loop would leave later siblings un-attempted this pass even though
+    /// a retry restarts from the first node again, potentially starving them forever behind a
+    /// persistently-failing earlier one. Every id is attempted; the first failure (if any) is
+    /// returned only after the full list has been tried, which still keeps the effect row
+    /// incomplete and retryable.
+    async fn cancel_shard_nodes(
+        &self,
+        sql: &SqlStorage,
+        run_id: &str,
+        node_ids: &[String],
+    ) -> worker::Result<()> {
+        let mut first_err = None;
+        for node_id in node_ids {
+            match self.ensure_sibling_cancelled(sql, run_id, node_id).await {
+                Ok(()) => {}
+                Err(e) if first_err.is_none() => first_err = Some(e),
+                Err(_) => {}
+            }
+        }
+        first_err.map_or(Ok(()), Err)
+    }
+
+    /// Stops `node_id`'s real container and marks it `Cancelled` if still non-terminal, then
+    /// re-confirms its D1 projection. Writes `Cancelled` *before* calling stop (not after) so
+    /// a destroy-induced completion racing in behind the stop lands on an already-terminal
+    /// node and is dropped, not recorded over it. The stop itself always runs when a node row
+    /// exists, regardless of status: no local status is proof the physical container was ever
+    /// actually destroyed (`run_and_report` only reports an exit code, never calls destroy).
+    async fn ensure_sibling_cancelled(
+        &self,
+        sql: &SqlStorage,
+        run_id: &str,
+        node_id: &str,
+    ) -> worker::Result<()> {
+        let Some(before) = read_node(sql, node_id)? else {
+            return Ok(());
+        };
+        if !node_state_of(&before)?.is_terminal() {
+            let now_ms = worker::Date::now().as_millis() as i64;
+            mark_node_cancelled(sql, node_id, now_ms)?;
+        }
+        let physical_address = before.physical_address.as_deref();
+        let stop_succeeded = self.stop_node_container(node_id, physical_address).await;
+        if logic::resolve_stop_outcome(physical_address, stop_succeeded)
+            == logic::StopOutcome::Pending
+        {
+            return Err(worker::Error::RustError(format!(
+                "stop container failed for cancelled node {node_id}"
+            )));
+        }
+        let row = require_node(sql, node_id)?;
+        self.project_node_to_d1(run_id, &row).await
+    }
+
+    /// Brings the reporting shard's own registered node to a real terminal state consistent
+    /// with `outcome`, never `Cancelled` — the reporting shard was not cancelled. Writes the
+    /// outcome *before* calling stop (not after) only when still non-terminal, so a
+    /// destroy-induced completion racing in behind the stop either matches or is rejected by
+    /// `resolve_complete_node`'s `ConflictingStatus` check, never silently clobbering it. The
+    /// stop itself always runs when a node row exists, regardless of status: no local status
+    /// is proof the physical container was ever actually destroyed.
     async fn complete_own_shard_node(
         &self,
         sql: &SqlStorage,
-        run_row: &RunRow,
         job_name: &str,
         idx: u32,
         attempt: u32,
         outcome: logic::ShardTerminalStatus,
     ) -> worker::Result<()> {
         let node_id = logic::shard_node_id(job_name, idx, attempt);
-        let current = match read_node(sql, &node_id)? {
-            Some(row) => Some(node_state_of(&row)?),
-            None => None,
-        };
-        let Some(target) = logic::shard_self_completion_target(current, outcome) else {
+        let Some(row) = read_node(sql, &node_id)? else {
             return Ok(());
         };
-        self.stop_node_container(&node_id).await;
-        let now_ms = worker::Date::now().as_millis() as i64;
-        update_node_status(sql, &node_id, target.as_db_str(), None, now_ms)?;
-        let row = require_node(sql, &node_id)?;
-        self.project_node_to_d1(&run_row.id, &row).await?;
+        let current = node_state_of(&row)?;
+        if let Some(target) = logic::shard_self_completion_target(Some(current), outcome) {
+            let now_ms = worker::Date::now().as_millis() as i64;
+            update_node_status(sql, &node_id, target.as_db_str(), None, now_ms)?;
+        }
+        let physical_address = row.physical_address.as_deref();
+        let stop_succeeded = self.stop_node_container(&node_id, physical_address).await;
+        if logic::resolve_stop_outcome(physical_address, stop_succeeded)
+            == logic::StopOutcome::Pending
+        {
+            return Err(worker::Error::RustError(format!(
+                "stop container failed for reporting shard node {node_id}"
+            )));
+        }
         Ok(())
     }
 
@@ -3108,6 +3489,185 @@ impl RunCoordinator {
         })
     }
 
+    /// Replays `(job_name, idx, attempt)`'s terminal decision until every effect it owes is
+    /// confirmed — called from the initial accept, from an `AlreadyRecorded` duplicate, and
+    /// from `alarm()`'s sweep, so a crash partway through never gets stranded by
+    /// `resolve_shard_terminal`'s short-circuit. Always replays from the durable
+    /// `shard_state`/`shard_terminal_effect` rows, never a later caller's request fields.
+    /// `completed_at` already set is a true no-op. A missing effect row (predates this
+    /// mechanism) is frozen via [`legacy_decision_for`] before executing — either a never-made
+    /// decision for a still-`running` group (safe and necessary to decide now) or the
+    /// provably-safe subset of an already-terminal group's historical decision — so repeated
+    /// duplicate/alarm contact checkpoints exactly like any other decision, instead of
+    /// redoing the repair forever. The reporting shard's own node is always projected to D1
+    /// immediately after `complete_own_shard_node`, even when its stop fails — D1 must reflect
+    /// a terminal DO-local status right away, not stay stuck showing "running" while a stop
+    /// retries — and that stop failure is deferred (`own_stop_result`) rather than aborting the
+    /// whole function, so a fail-fast sibling cancel or merge enqueue still gets attempted
+    /// independently; whichever failed first is the error this returns.
+    async fn drain_shard_terminal_effects(
+        &self,
+        sql: &SqlStorage,
+        run_row: &RunRow,
+        job_name: &str,
+        idx: u32,
+        attempt: u32,
+    ) -> worker::Result<()> {
+        let Some(state) = read_shard_state_row(sql, job_name, idx, attempt)? else {
+            return Ok(());
+        };
+        let effect = read_shard_terminal_effect(sql, job_name, idx, attempt)?;
+        if effect.as_ref().is_some_and(|e| e.completed_at.is_some()) {
+            return Ok(());
+        }
+        let outcome = logic::ShardTerminalStatus::from_db_str(&state.status).ok_or_else(|| {
+            worker::Error::RustError(format!(
+                "unknown shard_state status already stored: {}",
+                state.status
+            ))
+        })?;
+
+        self.project_shard_state_to_d1(
+            &run_row.id,
+            job_name,
+            &ShardStateDbRow {
+                idx: idx as i64,
+                attempt: attempt as i64,
+                status: state.status.clone(),
+            },
+            state.report_key.as_deref(),
+            state.duration_ms,
+            state.finished_at,
+        )
+        .await?;
+
+        let own_stop_result = self
+            .complete_own_shard_node(sql, job_name, idx, attempt, outcome)
+            .await;
+        let node_id = logic::shard_node_id(job_name, idx, attempt);
+        if let Some(row) = read_node(sql, &node_id)? {
+            self.project_node_to_d1(&run_row.id, &row).await?;
+        }
+
+        let effect = match effect {
+            Some(e) => e,
+            None => {
+                let Some(group) = read_job_group(sql, job_name)? else {
+                    return own_stop_result;
+                };
+                let (decision_kind, cancel_node_ids, merge, included_idxs, group_status_update) =
+                    Self::legacy_decision_for(sql, job_name, outcome, &group)?;
+                if decision_kind == "legacy_unknowable" {
+                    worker::console_log!(
+                        "shard terminal effect: {job_name}/{idx}/{attempt}'s original decision \
+                         cannot be safely reconstructed from current state; recorded as \
+                         unresolved, not retried"
+                    );
+                }
+                let cancel_node_ids_json = cancel_node_ids
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|e| {
+                        worker::Error::RustError(format!("cannot encode cancel_node_ids: {e}"))
+                    })?;
+                let included_idxs_json = included_idxs
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|e| {
+                        worker::Error::RustError(format!("cannot encode included_idxs: {e}"))
+                    })?;
+                let sql_for_txn = sql.clone();
+                let job_name_owned = job_name.to_string();
+                self.state
+                    .storage()
+                    .transaction(move |_txn| async move {
+                        insert_shard_terminal_effect(
+                            &sql_for_txn,
+                            &job_name_owned,
+                            idx,
+                            attempt,
+                            decision_kind,
+                            cancel_node_ids_json.as_deref(),
+                            merge,
+                            included_idxs_json.as_deref(),
+                        )?;
+                        if let Some(new_status) = group_status_update {
+                            update_job_group_status(&sql_for_txn, &job_name_owned, new_status)?;
+                        }
+                        Ok(())
+                    })
+                    .await?;
+                read_shard_terminal_effect(sql, job_name, idx, attempt)?.ok_or_else(|| {
+                    worker::Error::RustError(
+                        "shard_terminal_effect row missing after insert".into(),
+                    )
+                })?
+            }
+        };
+        match effect.decision_kind.as_str() {
+            "fail_fast_triggered" => {
+                let node_ids: Vec<String> = match &effect.cancel_node_ids {
+                    Some(json) => serde_json::from_str(json).map_err(|e| {
+                        worker::Error::RustError(format!("cannot decode cancel_node_ids: {e}"))
+                    })?,
+                    None => Vec::new(),
+                };
+                // The reporting shard's own stop and the fail-fast sibling cancel are
+                // independent effects -- one stuck container must never block the other.
+                // Attempt both, then surface the first failure.
+                let sibling_result = self.cancel_shard_nodes(sql, &run_row.id, &node_ids).await;
+                own_stop_result?;
+                sibling_result?;
+            }
+            // No frozen `merge_job_id`: `job_name -> job.id` is immutable once a job starts,
+            // so resolving it fresh here (instead of at accept time) makes a not-yet-started
+            // job retried on the next pass instead of a permanently stranded `None`.
+            "satisfied" if effect.merge == Some(1) => {
+                let Some(job) = read_job(sql, job_name)? else {
+                    own_stop_result?;
+                    return Err(worker::Error::RustError(format!(
+                        "shard merge pending: job {job_name} not started yet"
+                    )));
+                };
+                let included_idxs: Vec<u32> = match &effect.included_idxs {
+                    Some(json) => serde_json::from_str(json).map_err(|e| {
+                        worker::Error::RustError(format!("cannot decode included_idxs: {e}"))
+                    })?,
+                    None => Vec::new(),
+                };
+                let merge_enqueued = self
+                    .enqueue_shard_merge(run_row, &job.id, job_name, included_idxs)
+                    .await;
+                own_stop_result?;
+                if !merge_enqueued {
+                    return Err(worker::Error::RustError(format!(
+                        "shard merge enqueue still pending for {job_name}"
+                    )));
+                }
+            }
+            // Durable, terminal, non-retriable: the original decision is unknowable from
+            // current state (see `legacy_decision_for`). Never marked complete (that would lie
+            // about success) and excluded from `alarm()`'s sweep (it can never resolve by
+            // retrying), but a live duplicate contact still surfaces this as a real error
+            // rather than a clean 200.
+            "legacy_unknowable" => {
+                own_stop_result?;
+                return Err(worker::Error::RustError(format!(
+                    "shard terminal effect: {job_name}/{idx}/{attempt}'s original decision is \
+                     permanently unrecoverable from current state"
+                )));
+            }
+            _ => {
+                own_stop_result?;
+            }
+        }
+
+        let now_ms = worker::Date::now().as_millis() as i64;
+        mark_shard_terminal_effect_completed(sql, job_name, idx, attempt, now_ms)
+    }
+
     /// One shard's terminal ingest call — module docs' "Shard groups /
     /// merge barrier" section, parallelization.md bullets 2-4. Produces
     /// [`ShardBarrierDecision`], and dispatches two of its variants for
@@ -3115,11 +3675,22 @@ impl RunCoordinator {
     /// [`RunCoordinator::enqueue_shard_merge`] (see this module's doc
     /// comment's "Merge execution is real for `junit`/`lcov`, nothing
     /// else" bullet), and `FailFastTriggered { cancel_idxs }` via
-    /// [`Self::cancel_shards`], which stops the real container for each
+    /// [`Self::cancel_shard_nodes`], which stops the real container for each
     /// cancelled index that was ever registered as a running node
     /// (caller registers one by calling the existing `startNode` RPC
     /// with [`logic::shard_node_id`]'s id — see that function's doc
     /// comment for why there is no separate "register a shard" RPC).
+    ///
+    /// **Durability.** A `Recorded` decision's `shard_state` row and its frozen
+    /// [`ShardTerminalEffectRow`] (plus any `job_group` status transition) commit together in
+    /// one `storage().transaction()` call before any of the decision's own side effects (D1
+    /// projection, node completion/cancellation, merge dispatch) are attempted — the exact
+    /// `storage().transaction()` pattern `accept_resource_sample_batch_and_queue_all`
+    /// established, reused directly rather than a second atomicity mechanism. Those side
+    /// effects then run via [`Self::drain_shard_terminal_effects`], the same function a later
+    /// identical redelivery (`AlreadyRecorded`) and `alarm()`'s background sweep both call to
+    /// resume whatever a crash or transient failure left stranded — see that function's own
+    /// doc comment.
     async fn handle_shard_terminal(
         &self,
         sql: &SqlStorage,
@@ -3128,21 +3699,14 @@ impl RunCoordinator {
         let Some(run_row) = read_run(sql)? else {
             return error_response(404, "run not found");
         };
-        let Some(group) = read_job_group(sql, &req.job_name)? else {
+        if read_job_group(sql, &req.job_name)?.is_none() {
             return error_response(404, "shard group not registered");
-        };
+        }
         let Some(incoming_status) = logic::ShardTerminalStatus::from_db_str(&req.status) else {
             return error_response(400, "unknown shard terminal status");
         };
 
-        let existing_status =
-            match read_shard_state_status(sql, &req.job_name, req.idx, req.attempt)? {
-                None => None,
-                Some(s) => Some(logic::ShardTerminalStatus::from_db_str(&s).ok_or_else(|| {
-                    worker::Error::RustError("unknown shard_state status already stored".into())
-                })?),
-            };
-
+        let existing_status = read_existing_shard_status(sql, &req.job_name, req.idx, req.attempt)?;
         let decision = match logic::resolve_shard_terminal(existing_status, incoming_status) {
             Err(logic::ConflictingShardStatus) => {
                 return error_response(
@@ -3150,48 +3714,76 @@ impl RunCoordinator {
                     "shard already concluded with a different terminal status",
                 );
             }
-            Ok(logic::ShardTerminalDecision::AlreadyRecorded) => ShardBarrierDecision::Duplicate,
-            Ok(logic::ShardTerminalDecision::Recorded) => {
-                let now_ms = worker::Date::now().as_millis() as i64;
-                insert_shard_state(
-                    sql,
-                    &req.job_name,
-                    req.idx,
-                    req.attempt,
-                    incoming_status.as_db_str(),
-                    req.report_key.as_deref(),
-                    req.duration_ms,
-                    now_ms,
-                )?;
-                self.project_shard_state_to_d1(
-                    &run_row.id,
-                    &req.job_name,
-                    &ShardStateDbRow {
-                        idx: req.idx as i64,
-                        attempt: req.attempt as i64,
-                        status: incoming_status.as_db_str().to_string(),
-                    },
-                    req.report_key.as_deref(),
-                    req.duration_ms,
-                    now_ms,
-                )
-                .await?;
-                self.complete_own_shard_node(
+            Ok(logic::ShardTerminalDecision::AlreadyRecorded) => {
+                // Resume whatever the *first* accepted call for this exact
+                // `(job_name, idx, attempt)` left stranded — always from the already-durable
+                // `shard_state`/`shard_terminal_effect` rows, never from this redelivery's own
+                // request fields (a replay's `report_key`/`duration_ms` are not guaranteed
+                // identical to the original accepted call's).
+                self.drain_shard_terminal_effects(
                     sql,
                     &run_row,
                     &req.job_name,
                     req.idx,
                     req.attempt,
-                    incoming_status,
                 )
                 .await?;
+                ShardBarrierDecision::Duplicate
+            }
+            Ok(logic::ShardTerminalDecision::Recorded) => {
+                // Arm the short retry wake *before* reading anything this decision will act
+                // on, not merely before the commit: this call is itself an `await`, so a
+                // concurrent redelivery for this same `(job_name, idx, attempt)` could land
+                // and commit while it's in flight. Re-validate immediately after — the one
+                // await above is the only point between here and the commit where that can
+                // happen, and everything from the re-validated read onward stays synchronous.
+                self.schedule_overflow_flush_alarm().await?;
+                let existing_status_after_arm =
+                    read_existing_shard_status(sql, &req.job_name, req.idx, req.attempt)?;
+                match logic::resolve_shard_terminal(existing_status_after_arm, incoming_status) {
+                    Err(logic::ConflictingShardStatus) => {
+                        return error_response(
+                            409,
+                            "shard already concluded with a different terminal status",
+                        );
+                    }
+                    Ok(logic::ShardTerminalDecision::AlreadyRecorded) => {
+                        self.drain_shard_terminal_effects(
+                            sql,
+                            &run_row,
+                            &req.job_name,
+                            req.idx,
+                            req.attempt,
+                        )
+                        .await?;
+                        return Response::from_json(&ShardTerminalOutcome {
+                            job_name: req.job_name,
+                            idx: req.idx,
+                            attempt: req.attempt,
+                            decision: ShardBarrierDecision::Duplicate,
+                        });
+                    }
+                    Ok(logic::ShardTerminalDecision::Recorded) => {}
+                }
 
-                if group.status != "running" {
+                let Some(group) = read_job_group(sql, &req.job_name)? else {
+                    return error_response(404, "shard group not registered");
+                };
+                let now_ms = worker::Date::now().as_millis() as i64;
+
+                let resolved = if group.status != "running" {
                     // Module docs' "Shard groups / merge barrier"
                     // section: a late-finishing shard after the group
                     // already decided (fail-fast or satisfied) is
                     // recorded but does not re-run the barrier.
-                    ShardBarrierDecision::GroupAlreadyTerminal
+                    ResolvedShardDecision {
+                        response: ShardBarrierDecision::GroupAlreadyTerminal,
+                        effect_kind: "group_already_terminal",
+                        cancel_node_ids: None,
+                        merge: None,
+                        included_idxs: None,
+                        group_status_update: None,
+                    }
                 } else {
                     let Some(merge_on_failure) =
                         logic::MergeOnFailure::from_db_str(&group.merge_on_failure)
@@ -3206,65 +3798,119 @@ impl RunCoordinator {
                         fail_fast: group.fail_fast != 0,
                         merge_on_failure,
                     };
-                    let latest_terminal = logic::latest_attempt_per_shard(
-                        &read_all_shard_terminal_rows(sql, &req.job_name)?,
-                    );
+                    // `read_all_shard_terminal_rows` does not yet include this call's own row
+                    // — the real `insert_shard_state` write happens later, atomically with
+                    // this decision's frozen effect row, not before this point — so this
+                    // shard's own just-decided outcome is folded in here, matching exactly
+                    // what re-reading after an insert would have produced.
+                    let mut all_terminal_rows = read_all_shard_terminal_rows(sql, &req.job_name)?;
+                    all_terminal_rows.push(logic::ShardStateRow {
+                        idx: req.idx,
+                        attempt: req.attempt,
+                        status: incoming_status,
+                    });
+                    let latest_terminal = logic::latest_attempt_per_shard(&all_terminal_rows);
                     match logic::evaluate_barrier(config, &latest_terminal, incoming_status) {
-                        logic::BarrierOutcome::Waiting => ShardBarrierDecision::Waiting,
+                        logic::BarrierOutcome::Waiting => ResolvedShardDecision {
+                            response: ShardBarrierDecision::Waiting,
+                            effect_kind: "waiting",
+                            cancel_node_ids: None,
+                            merge: None,
+                            included_idxs: None,
+                            group_status_update: None,
+                        },
                         logic::BarrierOutcome::FailFastTriggered { cancel_idxs } => {
-                            update_job_group_status(sql, &req.job_name, "failed")?;
-                            self.cancel_shards(sql, &run_row, &req.job_name, &cancel_idxs)
-                                .await?;
-                            ShardBarrierDecision::FailFastTriggered { cancel_idxs }
+                            let cancel_node_ids = Self::resolve_shard_cancel_node_ids(
+                                sql,
+                                &req.job_name,
+                                &cancel_idxs,
+                            )?;
+                            ResolvedShardDecision {
+                                response: ShardBarrierDecision::FailFastTriggered { cancel_idxs },
+                                effect_kind: "fail_fast_triggered",
+                                cancel_node_ids: Some(cancel_node_ids),
+                                merge: None,
+                                included_idxs: None,
+                                group_status_update: Some("failed"),
+                            }
                         }
                         logic::BarrierOutcome::Satisfied {
                             merge,
                             included_idxs,
-                        } => {
-                            update_job_group_status(sql, &req.job_name, "satisfied")?;
-                            ShardBarrierDecision::Satisfied {
+                        } => ResolvedShardDecision {
+                            response: ShardBarrierDecision::Satisfied {
                                 merge,
-                                included_idxs,
-                            }
-                        }
+                                included_idxs: included_idxs.clone(),
+                            },
+                            effect_kind: "satisfied",
+                            cancel_node_ids: None,
+                            merge: Some(merge),
+                            included_idxs: Some(included_idxs),
+                            group_status_update: Some("satisfied"),
+                        },
                     }
-                }
+                };
+
+                let cancel_node_ids_json = resolved
+                    .cancel_node_ids
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|e| {
+                        worker::Error::RustError(format!("cannot encode cancel_node_ids: {e}"))
+                    })?;
+                let included_idxs_json = resolved
+                    .included_idxs
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|e| {
+                        worker::Error::RustError(format!("cannot encode included_idxs: {e}"))
+                    })?;
+
+                let sql_for_txn = sql.clone();
+                let job_name_for_txn = req.job_name.clone();
+                let idx = req.idx;
+                let attempt = req.attempt;
+                let status_db = incoming_status.as_db_str().to_string();
+                let report_key = req.report_key.clone();
+                let duration_ms = req.duration_ms;
+                let effect_kind = resolved.effect_kind;
+                let merge = resolved.merge;
+                let group_status_update = resolved.group_status_update;
+                self.state
+                    .storage()
+                    .transaction(move |_txn| async move {
+                        accept_shard_terminal_and_queue_effects(
+                            &sql_for_txn,
+                            &job_name_for_txn,
+                            idx,
+                            attempt,
+                            &status_db,
+                            report_key.as_deref(),
+                            duration_ms,
+                            now_ms,
+                            effect_kind,
+                            cancel_node_ids_json.as_deref(),
+                            merge,
+                            included_idxs_json.as_deref(),
+                            group_status_update,
+                        )
+                    })
+                    .await?;
+
+                self.drain_shard_terminal_effects(
+                    sql,
+                    &run_row,
+                    &req.job_name,
+                    req.idx,
+                    req.attempt,
+                )
+                .await?;
+
+                resolved.response
             }
         };
-
-        // parallelization.md's "### Merge barrier (RunCoordinator)": "On satisfaction,
-        // `RunCoordinator` ... enqueues the merge step." Only dispatched when the barrier
-        // actually decided to merge — `merge: false` (`merge_on_failure = never`, or
-        // `if_any_passed` with zero passed shards) is a real, documented no-op per that same
-        // section, not an error, so it deliberately never reaches this call. `read_job` here is
-        // a second lookup beyond `read_job_group` above (different DO table: `job`, not
-        // `job_group`) — needed only for its `id`, which `ShardMergeRequested` carries so the
-        // Queue consumer can join against D1's `reports` projection by `job_id` without a second
-        // `job_name` round trip.
-        if let ShardBarrierDecision::Satisfied {
-            merge: true,
-            ref included_idxs,
-        } = decision
-        {
-            match read_job(sql, &req.job_name)? {
-                Some(job) => {
-                    self.enqueue_shard_merge(
-                        &run_row,
-                        &job.id,
-                        &req.job_name,
-                        included_idxs.clone(),
-                    )
-                    .await;
-                }
-                None => {
-                    worker::console_log!(
-                        "shard merge: job {} not found for run {}, skipping merge dispatch",
-                        req.job_name,
-                        run_row.id
-                    );
-                }
-            }
-        }
 
         Response::from_json(&ShardTerminalOutcome {
             job_name: req.job_name,
@@ -3661,10 +4307,35 @@ fn ensure_schema(sql: &SqlStorage) -> worker::Result<()> {
             completed_at INTEGER, \
             acked INTEGER NOT NULL DEFAULT 0, \
             image TEXT NOT NULL DEFAULT '', \
-            command TEXT NOT NULL DEFAULT '[]' \
+            command TEXT NOT NULL DEFAULT '[]', \
+            physical_address TEXT \
         )",
         None,
     )?;
+    // Retrofits `physical_address` onto a `node` table created by a version of this DO before
+    // the column existed (`CREATE TABLE IF NOT EXISTS` above never alters an already-existing
+    // table). A node row from before this version has no way to know its real container's
+    // address, so it stays `NULL`, not a guess -- callers must treat `NULL` as "cannot address
+    // this node's physical container", never fall back to resolving it some other way. Checked
+    // via `pragma_table_info` rather than discarding every `ALTER` error as "probably just the
+    // duplicate-column case": that would also silently swallow a genuine ALTER failure (disk
+    // full, corrupted schema), which would otherwise surface later as a confusing "no such
+    // column" on an unrelated `SELECT`.
+    #[derive(Deserialize)]
+    struct ColumnPresent {
+        #[allow(dead_code)]
+        present: i64,
+    }
+    let has_physical_address = !sql
+        .exec(
+            "SELECT 1 AS present FROM pragma_table_info('node') WHERE name = 'physical_address'",
+            None,
+        )?
+        .to_array::<ColumnPresent>()?
+        .is_empty();
+    if !has_physical_address {
+        sql.exec("ALTER TABLE node ADD COLUMN physical_address TEXT", None)?;
+    }
     sql.exec(
         "CREATE TABLE IF NOT EXISTS job_group ( \
             job_name TEXT PRIMARY KEY, \
@@ -3685,6 +4356,22 @@ fn ensure_schema(sql: &SqlStorage) -> worker::Result<()> {
             report_key TEXT, \
             duration_ms INTEGER, \
             finished_at INTEGER, \
+            PRIMARY KEY (job_name, idx, attempt) \
+        )",
+        None,
+    )?;
+    // `Recorded` shard-terminal decisions' not-yet-confirmed effect set
+    // (`ShardTerminalEffectRow`'s doc comment); DO-local only.
+    sql.exec(
+        "CREATE TABLE IF NOT EXISTS shard_terminal_effect ( \
+            job_name TEXT NOT NULL, \
+            idx INTEGER NOT NULL, \
+            attempt INTEGER NOT NULL, \
+            decision_kind TEXT NOT NULL, \
+            cancel_node_ids TEXT, \
+            merge INTEGER, \
+            included_idxs TEXT, \
+            completed_at INTEGER, \
             PRIMARY KEY (job_name, idx, attempt) \
         )",
         None,
@@ -4383,7 +5070,7 @@ fn update_check_run_state(
 // Nodes (`startNode`/completion/`ack`, module docs' Nodes section)
 // ---------------------------------------------------------------------------
 
-const NODE_COLUMNS: &str = "node_id, spec_hash, status, check_name, result, started_at, completed_at, acked, image, command";
+const NODE_COLUMNS: &str = "node_id, spec_hash, status, check_name, result, started_at, completed_at, acked, image, command, physical_address";
 
 fn read_node(sql: &SqlStorage, node_id: &str) -> worker::Result<Option<NodeRow>> {
     let rows: Vec<NodeRow> = sql
@@ -4400,7 +5087,7 @@ fn require_node(sql: &SqlStorage, node_id: &str) -> worker::Result<NodeRow> {
         .ok_or_else(|| worker::Error::RustError("node row missing after write".into()))
 }
 
-/// Every node this run has ever started, for [`logic::nodes_to_cancel`]'s
+/// Every node this run has ever started, for [`logic::nodes_to_retry_cancel`]'s
 /// input — `handle_cancel_run`'s only caller.
 fn read_all_nodes(sql: &SqlStorage) -> worker::Result<Vec<NodeRow>> {
     sql.exec(&format!("SELECT {NODE_COLUMNS} FROM node"), None)?
@@ -4415,11 +5102,12 @@ fn insert_node(
     check_name: Option<&str>,
     image: &str,
     command_json: &str,
+    physical_address: &str,
     started_at_ms: i64,
 ) -> worker::Result<()> {
     sql.exec(
-        "INSERT INTO node (node_id, spec_hash, status, check_name, started_at, image, command) \
-         VALUES (?1, ?2, 'running', ?3, ?4, ?5, ?6)",
+        "INSERT INTO node (node_id, spec_hash, status, check_name, started_at, image, command, physical_address) \
+         VALUES (?1, ?2, 'running', ?3, ?4, ?5, ?6, ?7)",
         vec![
             SqlStorageValue::from(node_id),
             SqlStorageValue::from(spec_hash),
@@ -4427,6 +5115,7 @@ fn insert_node(
             SqlStorageValue::try_from_i64(started_at_ms)?,
             SqlStorageValue::from(image),
             SqlStorageValue::from(command_json),
+            SqlStorageValue::from(physical_address),
         ],
     )?;
     Ok(())
@@ -4463,10 +5152,9 @@ fn update_node_ack(sql: &SqlStorage, node_id: &str) -> worker::Result<()> {
     Ok(())
 }
 
-/// Marks `node_id` `Cancelled` — `handle_cancel_run`'s per-node write,
-/// for each id [`logic::nodes_to_cancel`] returned. Unlike
-/// `update_node_status`, this never touches `result`: a cancelled node
-/// never produced one.
+/// Marks `node_id` `Cancelled` — [`RunCoordinator::ensure_sibling_cancelled`]'s write for a
+/// still-non-terminal node, before it attempts the real stop. Unlike `update_node_status`, this
+/// never touches `result`: a cancelled node never produced one.
 fn mark_node_cancelled(
     sql: &SqlStorage,
     node_id: &str,
@@ -4557,6 +5245,25 @@ fn read_shard_state_status(
     Ok(rows.into_iter().next().map(|r| r.status))
 }
 
+/// [`read_shard_state_status`] parsed to [`logic::ShardTerminalStatus`] — shared by
+/// [`RunCoordinator::handle_shard_terminal`]'s first check and its post-arm re-check, so a
+/// concurrent redelivery landing during the alarm-arm `await` between them is still caught.
+fn read_existing_shard_status(
+    sql: &SqlStorage,
+    job_name: &str,
+    idx: u32,
+    attempt: u32,
+) -> worker::Result<Option<logic::ShardTerminalStatus>> {
+    match read_shard_state_status(sql, job_name, idx, attempt)? {
+        None => Ok(None),
+        Some(s) => logic::ShardTerminalStatus::from_db_str(&s)
+            .map(Some)
+            .ok_or_else(|| {
+                worker::Error::RustError("unknown shard_state status already stored".into())
+            }),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn insert_shard_state(
     sql: &SqlStorage,
@@ -4611,6 +5318,184 @@ fn read_all_shard_terminal_rows(
             })
         })
         .collect()
+}
+
+/// The exact `(job_name, idx, attempt)` row's full accepted payload —
+/// [`RunCoordinator::drain_shard_terminal_effects`]'s only source for replaying a projection,
+/// never a later redelivery's own request fields.
+fn read_shard_state_row(
+    sql: &SqlStorage,
+    job_name: &str,
+    idx: u32,
+    attempt: u32,
+) -> worker::Result<Option<ShardStateFullRow>> {
+    let rows: Vec<ShardStateFullRow> = sql
+        .exec(
+            "SELECT status, report_key, duration_ms, finished_at FROM shard_state \
+             WHERE job_name = ?1 AND idx = ?2 AND attempt = ?3",
+            vec![
+                SqlStorageValue::from(job_name),
+                SqlStorageValue::try_from_i64(i64::from(idx))?,
+                SqlStorageValue::try_from_i64(i64::from(attempt))?,
+            ],
+        )?
+        .to_array()?;
+    Ok(rows.into_iter().next())
+}
+
+const SHARD_TERMINAL_EFFECT_COLUMNS: &str =
+    "decision_kind, cancel_node_ids, merge, included_idxs, completed_at";
+
+/// The exact `(job_name, idx, attempt)` decision's frozen, not-yet-confirmed-applied effect
+/// set, if this round's recovery mechanism ever recorded one — absent for any `shard_state`
+/// row written before this mechanism existed (`ShardTerminalEffectRow`'s own doc comment
+/// covers how [`RunCoordinator::drain_shard_terminal_effects`] treats that case).
+fn read_shard_terminal_effect(
+    sql: &SqlStorage,
+    job_name: &str,
+    idx: u32,
+    attempt: u32,
+) -> worker::Result<Option<ShardTerminalEffectRow>> {
+    let rows: Vec<ShardTerminalEffectRow> = sql
+        .exec(
+            &format!(
+                "SELECT {SHARD_TERMINAL_EFFECT_COLUMNS} FROM shard_terminal_effect \
+                 WHERE job_name = ?1 AND idx = ?2 AND attempt = ?3"
+            ),
+            vec![
+                SqlStorageValue::from(job_name),
+                SqlStorageValue::try_from_i64(i64::from(idx))?,
+                SqlStorageValue::try_from_i64(i64::from(attempt))?,
+            ],
+        )?
+        .to_array()?;
+    Ok(rows.into_iter().next())
+}
+
+/// Every `(job_name, idx, attempt)` key whose decision still has a *retriable* unconfirmed
+/// effect — `alarm()`'s background sweep input. A `shard_state` row with no matching
+/// `shard_terminal_effect` row at all (never yet drained) is invisible to this scan by
+/// construction; it is frozen lazily on its own next duplicate redelivery (`legacy_decision_for`).
+/// `decision_kind = "legacy_unknowable"` is excluded even though `completed_at` stays `NULL`:
+/// it can never resolve by retrying, so including it would only generate permanent alarm noise.
+fn read_pending_shard_terminal_effect_keys(
+    sql: &SqlStorage,
+) -> worker::Result<Vec<(String, u32, u32)>> {
+    #[derive(Debug, Clone, Deserialize)]
+    struct Key {
+        job_name: String,
+        idx: i64,
+        attempt: i64,
+    }
+    let rows: Vec<Key> = sql
+        .exec(
+            "SELECT job_name, idx, attempt FROM shard_terminal_effect \
+             WHERE completed_at IS NULL AND decision_kind != 'legacy_unknowable'",
+            None,
+        )?
+        .to_array()?;
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.job_name, r.idx as u32, r.attempt as u32))
+        .collect())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_shard_terminal_effect(
+    sql: &SqlStorage,
+    job_name: &str,
+    idx: u32,
+    attempt: u32,
+    decision_kind: &str,
+    cancel_node_ids_json: Option<&str>,
+    merge: Option<bool>,
+    included_idxs_json: Option<&str>,
+) -> worker::Result<()> {
+    sql.exec(
+        "INSERT INTO shard_terminal_effect \
+         (job_name, idx, attempt, decision_kind, cancel_node_ids, merge, included_idxs) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        vec![
+            SqlStorageValue::from(job_name),
+            SqlStorageValue::try_from_i64(i64::from(idx))?,
+            SqlStorageValue::try_from_i64(i64::from(attempt))?,
+            SqlStorageValue::from(decision_kind),
+            SqlStorageValue::from(cancel_node_ids_json.map(str::to_string)),
+            SqlStorageValue::from(merge.map(i64::from)),
+            SqlStorageValue::from(included_idxs_json.map(str::to_string)),
+        ],
+    )?;
+    Ok(())
+}
+
+fn mark_shard_terminal_effect_completed(
+    sql: &SqlStorage,
+    job_name: &str,
+    idx: u32,
+    attempt: u32,
+    completed_at_ms: i64,
+) -> worker::Result<()> {
+    sql.exec(
+        "UPDATE shard_terminal_effect SET completed_at = ?1 \
+         WHERE job_name = ?2 AND idx = ?3 AND attempt = ?4",
+        vec![
+            SqlStorageValue::try_from_i64(completed_at_ms)?,
+            SqlStorageValue::from(job_name),
+            SqlStorageValue::try_from_i64(i64::from(idx))?,
+            SqlStorageValue::try_from_i64(i64::from(attempt))?,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Caller MUST run this inside `ctx.storage.transaction(callback)`: for SQLite-backed
+/// storage the typed `txn` param is obsolete and every `sql.exec()` called on `ctx.storage`
+/// during the callback joins the one real transaction (developers.cloudflare.com/
+/// durable-objects/api/sqlite-storage-api/, "transaction" entry, verified 2026-10-03) — only
+/// `transaction` is bound in this pinned fork, not `transactionSync`. Commits the shard's row,
+/// its frozen effect set, and the group-status transition together: a crash between separate
+/// `exec()` calls with no such wrapper would let a later shard's call see a stale `running`
+/// `job_group.status` and wrongly re-evaluate an already-decided barrier.
+#[allow(clippy::too_many_arguments)]
+fn accept_shard_terminal_and_queue_effects(
+    sql: &SqlStorage,
+    job_name: &str,
+    idx: u32,
+    attempt: u32,
+    status: &str,
+    report_key: Option<&str>,
+    duration_ms: Option<i64>,
+    finished_at_ms: i64,
+    decision_kind: &str,
+    cancel_node_ids_json: Option<&str>,
+    merge: Option<bool>,
+    included_idxs_json: Option<&str>,
+    group_status_update: Option<&str>,
+) -> worker::Result<()> {
+    insert_shard_state(
+        sql,
+        job_name,
+        idx,
+        attempt,
+        status,
+        report_key,
+        duration_ms,
+        finished_at_ms,
+    )?;
+    insert_shard_terminal_effect(
+        sql,
+        job_name,
+        idx,
+        attempt,
+        decision_kind,
+        cancel_node_ids_json,
+        merge,
+        included_idxs_json,
+    )?;
+    if let Some(new_status) = group_status_update {
+        update_job_group_status(sql, job_name, new_status)?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -5346,5 +6231,41 @@ mod tests {
         assert_ne!(base, do_name(1, "other-sha", "run-key", 1));
         assert_ne!(base, do_name(1, "sha", "other-run-key", 1));
         assert_ne!(base, do_name(1, "sha", "run-key", 2));
+    }
+
+    #[test]
+    fn node_physical_address_is_deterministic_for_the_same_identity() {
+        let a = node_physical_address("run-do-1", "shard:job:0:1");
+        let b = node_physical_address("run-do-1", "shard:job:0:1");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn node_physical_address_does_not_collide_across_a_field_boundary_shift() {
+        let a = node_physical_address("a", "b:node");
+        let b = node_physical_address("a:b", "node");
+        assert_ne!(
+            a, b,
+            "different (run, node) identities must not share a physical address"
+        );
+    }
+
+    #[test]
+    fn node_physical_address_does_not_collide_on_a_naive_concatenation_boundary() {
+        // Without length-prefixing, naive concatenation of ("a", "bc") and ("ab", "c") would
+        // both yield "abc" -- the canonical field-boundary collision this hashing scheme
+        // exists to prevent, distinct from the colon-containing pair covered above.
+        let a = node_physical_address("a", "bc");
+        let b = node_physical_address("ab", "c");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn node_physical_address_differs_across_runs_for_the_same_node_id() {
+        // The exact collision this migration exists to prevent: two different runs sharing a
+        // raw node_id must never resolve to the same physical container.
+        let a = node_physical_address("run-do-a", "shard:job:0:1");
+        let b = node_physical_address("run-do-b", "shard:job:0:1");
+        assert_ne!(a, b);
     }
 }
