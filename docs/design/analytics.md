@@ -163,7 +163,12 @@ Engine via `writeDataPoint`, because D1 is not suited to write volumes of that s
 Analytics Engine's 3-month retention and sampling-at-scale are a better fit for raw time series
 (verified 2026-09-30, developers.cloudflare.com/analytics/analytics-engine/limits/: 3-month
 retention, up to 20 blobs/20 doubles/1 index per data point, 16 KB blob budget per data point, 250
-`writeDataPoint` calls per Worker invocation). The same ingest path also writes a per-upload
+`writeDataPoint` calls per Worker invocation). A single `SubmitReport` call whose report has more
+than 250 individual test-case outcomes cannot write all of them in that call's own invocation;
+`RunCoordinator` persists the overflow in its own DO-local `test_event_overflow` table (never
+drops it) and drains it across one or more later alarm-triggered invocations, each with its own
+fresh 250-write budget — see `coordinator/mod.rs`'s `write_test_events`/`flush_test_event_overflow`
+doc comments for the exact mechanism. The same ingest path also writes a per-upload
 summary row and that upload's full parsed report to R2 immediately on ingest, and separately
 applies the touched tests' rolling aggregates exactly once per finalized run — see D1 rollup
 tables and R2, below.

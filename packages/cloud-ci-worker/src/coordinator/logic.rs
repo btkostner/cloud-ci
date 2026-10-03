@@ -893,6 +893,19 @@ impl TestOutcomeKind {
             TestOutcomeKind::Skipped => "skip",
         }
     }
+
+    /// Inverse of [`Self::as_char`] — `coordinator::mod`'s
+    /// `test_event_overflow` table round-trips a persisted
+    /// [`TestEventPoint`] through this exact char, so a later
+    /// alarm-triggered flush reconstructs the same outcome it stored.
+    pub fn from_char(c: char) -> Option<Self> {
+        match c {
+            'P' => Some(TestOutcomeKind::Passed),
+            'F' => Some(TestOutcomeKind::Failed),
+            'S' => Some(TestOutcomeKind::Skipped),
+            _ => None,
+        }
+    }
 }
 
 /// One test case's outcome, reduced to exactly what `finalize_test_stats`
@@ -959,6 +972,20 @@ pub fn build_test_events(
             repo_id,
         })
         .collect()
+}
+
+/// Splits `events` into the slice one Worker invocation writes
+/// immediately and the slice that must be deferred — persisted to
+/// overflow storage for a later invocation to drain
+/// (`coordinator::mod`'s `write_test_events`/`test_event_overflow`).
+/// Pure arithmetic, no `worker`-crate dependency: the two returned
+/// slices always partition `events` exactly (same total length, same
+/// order, no element dropped or duplicated) — the property that makes
+/// the overflow path loss-free is provable here without a Durable
+/// Object.
+pub fn split_for_invocation_budget<T>(events: &[T], budget: usize) -> (&[T], &[T]) {
+    let split = events.len().min(budget);
+    events.split_at(split)
 }
 
 /// `duration_ewma_ms = alpha * new + (1 - alpha) * old` (analytics.md).
@@ -1303,6 +1330,18 @@ mod tests {
     }
 
     #[test]
+    fn test_outcome_kind_round_trips_through_char() {
+        for kind in [
+            TestOutcomeKind::Passed,
+            TestOutcomeKind::Failed,
+            TestOutcomeKind::Skipped,
+        ] {
+            assert_eq!(TestOutcomeKind::from_char(kind.as_char()), Some(kind));
+        }
+        assert_eq!(TestOutcomeKind::from_char('?'), None);
+    }
+
+    #[test]
     fn build_test_events_maps_every_row_in_order_with_shared_ids() {
         let rows = vec![
             TestOutcomeRow {
@@ -1349,6 +1388,40 @@ mod tests {
     #[test]
     fn build_test_events_on_empty_rows_is_empty() {
         assert!(build_test_events("run-1", "job-1", 99, &[]).is_empty());
+    }
+
+    #[test]
+    fn split_for_invocation_budget_partitions_without_loss_or_duplication() {
+        // A regression test for the real defect this splits off from
+        // `write_test_events`: a report with more test outcomes than one
+        // Worker invocation's `writeDataPoint` budget used to silently
+        // truncate everything past the cap. This proves the split is a
+        // true partition — every input index appears exactly once,
+        // across the two halves, in original order — so the only thing
+        // left for `coordinator::mod` to get right is persisting (not
+        // dropping) the second half.
+        let events: Vec<i32> = (0..300).collect();
+        let (immediate, overflow) = split_for_invocation_budget(&events, 250);
+        assert_eq!(immediate.len(), 250);
+        assert_eq!(overflow.len(), 50);
+        let recombined: Vec<i32> = immediate.iter().chain(overflow.iter()).copied().collect();
+        assert_eq!(recombined, events);
+    }
+
+    #[test]
+    fn split_for_invocation_budget_under_the_cap_has_no_overflow() {
+        let events: Vec<i32> = (0..10).collect();
+        let (immediate, overflow) = split_for_invocation_budget(&events, 250);
+        assert_eq!(immediate, events.as_slice());
+        assert!(overflow.is_empty());
+    }
+
+    #[test]
+    fn split_for_invocation_budget_at_exactly_the_cap_has_no_overflow() {
+        let events: Vec<i32> = (0..250).collect();
+        let (immediate, overflow) = split_for_invocation_budget(&events, 250);
+        assert_eq!(immediate, events.as_slice());
+        assert!(overflow.is_empty());
     }
 
     #[test]

@@ -623,6 +623,20 @@ struct RecentOutcomesRow {
     recent_outcomes: String,
 }
 
+/// `test_event_overflow`'s per-row read shape — `flush_test_event_overflow`'s
+/// input, reconstructed back into a [`logic::TestEventPoint`] by
+/// [`read_test_event_overflow_batch`].
+#[derive(Debug, Clone, Deserialize)]
+struct TestEventOverflowRow {
+    seq: i64,
+    run_id: String,
+    job_id: String,
+    test_id: String,
+    repo_id: i64,
+    duration_ms: i64,
+    outcome: String,
+}
+
 fn trigger_db_name(trigger: Trigger) -> &'static str {
     trigger.proto_name()
 }
@@ -737,19 +751,48 @@ impl DurableObject for RunCoordinator {
         }
     }
 
-    /// Fires when the DO alarm set by `handle_begin_run` (`now +
-    /// timeout_s`) reaches its scheduled time — byo-ci.md's third
-    /// completion trigger (§ Completion semantics' "Timeout" bullet).
-    /// Reuses `handle_close_run`'s own terminal-state no-op guard for
-    /// idempotency: if the run already closed via the webhook or
-    /// `--expect-jobs` in the meantime (including microseconds before
-    /// this alarm fired), this is a clean no-op, not a race. Passes
-    /// `by_timeout: true`, which forces the run's state to `Abandoned`
-    /// unconditionally rather than computing it from the jobs'
-    /// conclusions (see `logic::run_state_for_close`'s docs).
+    /// Fires for two reasons, both sharing this DO's single alarm slot:
+    /// the run's own `now + timeout_s` deadline set by `handle_begin_run`
+    /// (byo-ci.md's third completion trigger, § Completion semantics'
+    /// "Timeout" bullet), or `write_test_events`'
+    /// [`RunCoordinator::schedule_overflow_flush_alarm`] pulling the
+    /// alarm earlier to drain `test_event_overflow`. Every fire drains the
+    /// overflow backlog first ([`RunCoordinator::flush_test_event_overflow`]):
+    /// if rows remain after one invocation's budget, this re-schedules
+    /// itself soon and returns *without* evaluating the timeout — an
+    /// overflow-triggered fire must never close the run early just
+    /// because it happened to be the thing that woke the DO up. Only once
+    /// the backlog is empty does this fall through to the run's real
+    /// deadline (recomputed from `run.created_at + run.timeout_s`, not
+    /// from whatever time this particular alarm fired at, since an
+    /// overflow flush may have pulled it earlier): if the deadline has
+    /// passed, closes the run exactly as before; otherwise it
+    /// re-schedules the alarm for that deadline, restoring ordinary
+    /// timeout behavior.
+    ///
+    /// `handle_close_run`'s own terminal-state no-op guard still makes
+    /// this idempotent: if the run already closed via the webhook or
+    /// `--expect-jobs` in the meantime, this is a clean no-op, not a
+    /// race. Passes `by_timeout: true`, which forces the run's state to
+    /// `Abandoned` unconditionally rather than computing it from the
+    /// jobs' conclusions (see `logic::run_state_for_close`'s docs).
     async fn alarm(&self) -> worker::Result<Response> {
         let sql = self.state.storage().sql();
         ensure_schema(&sql)?;
+        let remaining = self.flush_test_event_overflow(&sql).await?;
+        if remaining > 0 {
+            self.schedule_overflow_flush_alarm().await?;
+            return Response::ok("test_event_overflow flush in progress");
+        }
+        let Some(run_row) = read_run(&sql)? else {
+            return Response::ok("no run to close");
+        };
+        let deadline_ms = run_row.created_at + run_row.timeout_s.saturating_mul(1000);
+        let now_ms = worker::Date::now().as_millis() as i64;
+        if now_ms < deadline_ms {
+            self.state.storage().set_alarm(deadline_ms - now_ms).await?;
+            return Response::ok("rescheduled for the run's own timeout");
+        }
         self.handle_close_run(&sql, true).await
     }
 }
@@ -1070,12 +1113,54 @@ impl RunCoordinator {
     /// The real Workers Analytics Engine binding only exposes a
     /// single-point `write_data_point` — there is no platform batch call —
     /// so analytics.md's 250-`writeDataPoint`-calls-per-Worker-invocation
-    /// limit is enforced here as a hard cap on this loop, not as a single
-    /// batched wire call. Best-effort: a missing binding or an individual
-    /// write failure is logged and otherwise ignored — `SubmitReport`'s
-    /// own success must never depend on analytics telemetry succeeding.
-    fn write_test_events(&self, events: &[logic::TestEventPoint]) {
+    /// limit is enforced here as a hard cap on how many of `events` this
+    /// call writes immediately. **Unlike an earlier version of this
+    /// method, the remainder is never silently dropped**: every event
+    /// beyond the cap is persisted to the DO's own `test_event_overflow`
+    /// table ([`insert_test_event_overflow`]), and [`alarm`][DurableObject::alarm]
+    /// is scheduled to drain it in one or more later invocations
+    /// ([`Self::flush_test_event_overflow`]), each with its own fresh
+    /// 250-write budget. A missing `METRICS` binding or an individual
+    /// `write_data_point` failure is still only logged, same best-effort
+    /// posture as before — `SubmitReport`'s own success must never depend
+    /// on analytics telemetry succeeding — but every event now gets a
+    /// real write attempt, immediately or on a later flush, never zero.
+    async fn write_test_events(
+        &self,
+        sql: &SqlStorage,
+        events: &[logic::TestEventPoint],
+    ) -> worker::Result<()> {
         const MAX_DATA_POINTS_PER_INVOCATION: usize = 250;
+        let (immediate, overflow) =
+            logic::split_for_invocation_budget(events, MAX_DATA_POINTS_PER_INVOCATION);
+        self.write_test_event_batch(immediate);
+        if !overflow.is_empty() {
+            worker::console_log!(
+                "analytics: report has {} test outcomes, {} beyond the {} \
+                 per-Worker-invocation writeDataPoint limit (analytics.md's \
+                 \"Analytics Engine schema\" section); persisting them to \
+                 test_event_overflow for a later alarm-triggered flush \
+                 instead of dropping them",
+                events.len(),
+                overflow.len(),
+                MAX_DATA_POINTS_PER_INVOCATION
+            );
+            let now_ms = worker::Date::now().as_millis() as i64;
+            insert_test_event_overflow(sql, overflow, now_ms)?;
+            self.schedule_overflow_flush_alarm().await?;
+        }
+        Ok(())
+    }
+
+    /// The actual `write_data_point` loop, shared by
+    /// [`Self::write_test_events`]'s immediate-write path and
+    /// [`Self::flush_test_event_overflow`]'s deferred-write path. Never
+    /// errors: a missing binding or an individual write failure is logged
+    /// and otherwise ignored (see `write_test_events`'s doc comment).
+    fn write_test_event_batch(&self, events: &[logic::TestEventPoint]) {
+        if events.is_empty() {
+            return;
+        }
         let dataset = match self.env.analytics_engine("METRICS") {
             Ok(dataset) => dataset,
             Err(e) => {
@@ -1083,16 +1168,7 @@ impl RunCoordinator {
                 return;
             }
         };
-        if events.len() > MAX_DATA_POINTS_PER_INVOCATION {
-            worker::console_log!(
-                "analytics: report has {} test outcomes, truncating to the {} \
-                 per-Worker-invocation writeDataPoint limit (analytics.md's \
-                 \"Analytics Engine schema\" section)",
-                events.len(),
-                MAX_DATA_POINTS_PER_INVOCATION
-            );
-        }
-        for event in events.iter().take(MAX_DATA_POINTS_PER_INVOCATION) {
+        for event in events {
             let repo_id_str = event.repo_id.to_string();
             let result = AnalyticsEngineDataPointBuilder::new()
                 .indexes([repo_id_str.as_str()])
@@ -1111,6 +1187,52 @@ impl RunCoordinator {
                 );
             }
         }
+    }
+
+    /// Drains up to one invocation's `writeDataPoint` budget from
+    /// `test_event_overflow` — a real write attempt for every drained
+    /// row, then deletes exactly the rows attempted. Returns how many
+    /// rows are still queued afterward, so [`alarm`][DurableObject::alarm]
+    /// knows whether to keep re-scheduling itself before it considers the
+    /// run's own timeout deadline.
+    async fn flush_test_event_overflow(&self, sql: &SqlStorage) -> worker::Result<i64> {
+        const MAX_DATA_POINTS_PER_INVOCATION: i64 = 250;
+        let batch = read_test_event_overflow_batch(sql, MAX_DATA_POINTS_PER_INVOCATION)?;
+        if batch.is_empty() {
+            return Ok(0);
+        }
+        let max_seq = batch.iter().map(|(seq, _)| *seq).max().unwrap_or(0);
+        let events: Vec<logic::TestEventPoint> = batch.into_iter().map(|(_, e)| e).collect();
+        worker::console_log!(
+            "analytics: flushing {} overflowed test outcome(s) from test_event_overflow",
+            events.len()
+        );
+        self.write_test_event_batch(&events);
+        delete_test_event_overflow_through(sql, max_seq)?;
+        count_test_event_overflow(sql)
+    }
+
+    /// Ensures the DO alarm fires soon enough to drain `test_event_overflow`
+    /// without waiting for the run's own (possibly much later) timeout
+    /// deadline — but never pushes an *earlier* alarm (the run's real
+    /// timeout, or an earlier pending overflow flush) further out.
+    /// `alarm()` restores the run's real timeout deadline once the
+    /// backlog is fully drained.
+    async fn schedule_overflow_flush_alarm(&self) -> worker::Result<()> {
+        const OVERFLOW_FLUSH_DELAY_MS: i64 = 5_000;
+        let desired = worker::Date::now().as_millis() as i64 + OVERFLOW_FLUSH_DELAY_MS;
+        let current = self.state.storage().get_alarm().await?;
+        let should_set = match current {
+            None => true,
+            Some(epoch_ms) => epoch_ms > desired,
+        };
+        if should_set {
+            self.state
+                .storage()
+                .set_alarm(OVERFLOW_FLUSH_DELAY_MS)
+                .await?;
+        }
+        Ok(())
     }
 
     async fn handle_submit_report(
@@ -1242,7 +1364,7 @@ impl RunCoordinator {
         if let Some(outcomes) = parse_test_outcomes(&req.report_kind, &bytes) {
             let events =
                 logic::build_test_events(&run_row.id, &req.job_id, run_row.repo_id, &outcomes);
-            self.write_test_events(&events);
+            self.write_test_events(sql, &events).await?;
         }
 
         self.project_report_to_d1(&require_report(sql, &id)?)
@@ -2925,6 +3047,26 @@ fn ensure_schema(sql: &SqlStorage) -> worker::Result<()> {
         )",
         None,
     )?;
+    // `write_test_events`' overflow backlog (`coordinator` module docs'
+    // analytics note): every [`logic::TestEventPoint`] beyond one
+    // Worker invocation's 250-`writeDataPoint` budget is persisted here
+    // instead of being dropped, keyed by an autoincrementing `seq` so a
+    // later alarm-triggered flush can drain rows oldest-first and delete
+    // exactly the ones it already attempted. DO-local only — these rows
+    // never outlive the backlog they describe, so no D1 projection.
+    sql.exec(
+        "CREATE TABLE IF NOT EXISTS test_event_overflow ( \
+            seq INTEGER PRIMARY KEY AUTOINCREMENT, \
+            run_id TEXT NOT NULL, \
+            job_id TEXT NOT NULL, \
+            test_id TEXT NOT NULL, \
+            repo_id INTEGER NOT NULL, \
+            duration_ms INTEGER NOT NULL, \
+            outcome TEXT NOT NULL, \
+            created_at INTEGER NOT NULL \
+        )",
+        None,
+    )?;
     Ok(())
 }
 
@@ -3779,6 +3921,103 @@ fn read_all_shard_terminal_rows(
             })
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// `test_event_overflow` — `write_test_events`' overflow backlog
+// ---------------------------------------------------------------------------
+
+/// Persists every event beyond one invocation's `writeDataPoint` budget
+/// (`write_test_events`'s overflow slice) rather than dropping it. One
+/// `INSERT` per event — this only ever runs for the rare report whose
+/// test-case count exceeds 250, so a per-row round trip (not a single
+/// batched statement) keeps this simple and matches every other
+/// insert-per-row helper in this module.
+fn insert_test_event_overflow(
+    sql: &SqlStorage,
+    events: &[logic::TestEventPoint],
+    now_ms: i64,
+) -> worker::Result<()> {
+    for event in events {
+        sql.exec(
+            "INSERT INTO test_event_overflow \
+             (run_id, job_id, test_id, repo_id, duration_ms, outcome, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            vec![
+                SqlStorageValue::from(event.run_id.as_str()),
+                SqlStorageValue::from(event.job_id.as_str()),
+                SqlStorageValue::from(event.test_id.as_str()),
+                SqlStorageValue::try_from_i64(event.repo_id)?,
+                SqlStorageValue::try_from_i64(event.duration_ms)?,
+                SqlStorageValue::from(event.outcome.as_char().to_string()),
+                SqlStorageValue::try_from_i64(now_ms)?,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn count_test_event_overflow(sql: &SqlStorage) -> worker::Result<i64> {
+    let rows: Vec<MaxSeqRow> = sql
+        .exec("SELECT COUNT(*) as m FROM test_event_overflow", None)?
+        .to_array()?;
+    Ok(rows.first().map(|r| r.m).unwrap_or(0))
+}
+
+/// Up to `limit` oldest-queued overflow rows, paired with their own
+/// `seq` so [`delete_test_event_overflow_through`] can delete exactly
+/// the rows a caller already attempted to write — never more (a row
+/// inserted after this read stays queued) and never less (oldest-first
+/// ensures no row starves behind a stream of newer ones).
+fn read_test_event_overflow_batch(
+    sql: &SqlStorage,
+    limit: i64,
+) -> worker::Result<Vec<(i64, logic::TestEventPoint)>> {
+    let rows: Vec<TestEventOverflowRow> = sql
+        .exec(
+            "SELECT seq, run_id, job_id, test_id, repo_id, duration_ms, outcome \
+             FROM test_event_overflow ORDER BY seq ASC LIMIT ?1",
+            vec![SqlStorageValue::try_from_i64(limit)?],
+        )?
+        .to_array()?;
+    rows.into_iter()
+        .map(|row| {
+            let outcome_char = row.outcome.chars().next().ok_or_else(|| {
+                worker::Error::RustError("test_event_overflow row has an empty outcome".into())
+            })?;
+            let outcome = logic::TestOutcomeKind::from_char(outcome_char).ok_or_else(|| {
+                worker::Error::RustError(format!(
+                    "test_event_overflow row has unknown outcome: {}",
+                    row.outcome
+                ))
+            })?;
+            Ok((
+                row.seq,
+                logic::TestEventPoint {
+                    run_id: row.run_id,
+                    job_id: row.job_id,
+                    test_id: row.test_id,
+                    duration_ms: row.duration_ms,
+                    outcome,
+                    repo_id: row.repo_id,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// Deletes every overflow row up to and including `max_seq` — called
+/// only after [`RunCoordinator::write_test_event_batch`] has already
+/// attempted a real write for each one, matching this module's existing
+/// best-effort analytics posture (an individual `write_data_point`
+/// failure is logged, not retried — see `write_test_events`'s doc
+/// comment) applied to the deferred path too.
+fn delete_test_event_overflow_through(sql: &SqlStorage, max_seq: i64) -> worker::Result<()> {
+    sql.exec(
+        "DELETE FROM test_event_overflow WHERE seq <= ?1",
+        vec![SqlStorageValue::try_from_i64(max_seq)?],
+    )?;
+    Ok(())
 }
 
 /// `RunCoordinator`'s own per-run monotonic counter for `accepted_seq`
