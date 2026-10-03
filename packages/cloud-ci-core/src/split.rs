@@ -74,6 +74,9 @@ pub enum SplitError {
     /// `{ min, max, target }`'s `target_ms` was zero, making
     /// `ceil(total_duration_ms / target_ms)` undefined.
     ZeroTarget,
+    /// `{ min, max, target }` had `min > max`, an empty range. `Ord::clamp` panics on this,
+    /// so it is rejected up front, before the strategy, target or clamp logic runs.
+    InvertedRange { min: u32, max: u32 },
 }
 
 impl std::fmt::Display for SplitError {
@@ -85,6 +88,9 @@ impl std::fmt::Display for SplitError {
                  (file/count have no duration data to size against); use a fixed shard count instead"
             ),
             SplitError::ZeroTarget => write!(f, "shard-count target duration must be nonzero"),
+            SplitError::InvertedRange { min, max } => {
+                write!(f, "shard-count min ({min}) must not exceed max ({max})")
+            }
         }
     }
 }
@@ -171,6 +177,11 @@ pub fn resolve_shard_count(
             max,
             target_ms,
         } => {
+            // First, so an inverted range is reported as such for every strategy and never
+            // reaches `Ord::clamp` (which panics when min > max).
+            if min > max {
+                return Err(SplitError::InvertedRange { min, max });
+            }
             if strategy != Strategy::Timing {
                 return Err(SplitError::AutoSizingNeedsTiming);
             }
@@ -249,6 +260,15 @@ pub fn assign(strategy: Strategy, items: &[Item], shard_count: u32) -> Vec<Vec<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // `packages/cloud-ci-pipeline-sdk/src/rpc-shard-planner.ts`'s exported
+    // `MAX_SHARD_COUNT` is meant to mirror `MAX_SHARDS` exactly; this pins
+    // the Rust side so changing it here is a conscious, cross-language
+    // decision rather than a silent drift between the two copies.
+    #[test]
+    fn max_shards_is_64() {
+        assert_eq!(MAX_SHARDS, 64);
+    }
 
     fn item(name: &str, duration_ms: Option<u64>) -> Item {
         Item {
@@ -488,6 +508,56 @@ mod tests {
         )?;
         assert_eq!(n, 3);
         Ok(())
+    }
+
+    #[test]
+    fn shard_count_auto_rejects_an_inverted_range() {
+        // min > max panics under a bare `Ord::clamp` -- must return an error instead, for
+        // every strategy, before any clamp runs.
+        let items = worked_items();
+        let result = resolve_shard_count(
+            Strategy::Timing,
+            ShardCountSpec::Auto {
+                min: 20,
+                max: 10,
+                target_ms: 60,
+            },
+            &items,
+        );
+        assert_eq!(result, Err(SplitError::InvertedRange { min: 20, max: 10 }));
+    }
+
+    #[test]
+    fn shard_count_auto_allows_min_equal_to_max() -> Result<(), SplitError> {
+        let items = worked_items(); // total 190ms
+        let n = resolve_shard_count(
+            Strategy::Timing,
+            ShardCountSpec::Auto {
+                min: 5,
+                max: 5,
+                target_ms: 60,
+            },
+            &items,
+        )?;
+        assert_eq!(n, 5);
+        Ok(())
+    }
+
+    #[test]
+    fn shard_count_auto_inverted_range_is_reported_even_for_a_non_timing_strategy() {
+        // The inverted-range check runs before the timing-strategy check, so a request that
+        // is wrong in both ways reports the range problem, not `AutoSizingNeedsTiming`.
+        let items = vec![item("a", None)];
+        let result = resolve_shard_count(
+            Strategy::File,
+            ShardCountSpec::Auto {
+                min: 20,
+                max: 10,
+                target_ms: 60,
+            },
+            &items,
+        );
+        assert_eq!(result, Err(SplitError::InvertedRange { min: 20, max: 10 }));
     }
 
     #[test]

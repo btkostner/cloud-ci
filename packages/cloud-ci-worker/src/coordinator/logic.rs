@@ -1756,6 +1756,418 @@ pub fn resolve_stop_outcome(physical_address: Option<&str>, stop_succeeded: bool
     }
 }
 
+// ---------------------------------------------------------------------------
+// OOM recovery (Phase 4: `runner: "auto"` real-time OOM retry) -- PURE, NOT WIRED.
+// ---------------------------------------------------------------------------
+//
+// Builds on `cloud_ci_core::rightsizing::oom_retry`'s per-event math (next size up, or
+// terminal failure at the configured max) with the one piece that module deliberately
+// leaves to its caller: whether *this* OOM event should be acted on at all, given whatever
+// decision (if any) a prior OOM event for the same node already produced. analytics.md's
+// "OOM retry" bullet grants exactly one retry per node ("rather than retrying indefinitely")
+// -- not "retry until the configured max" -- so a node that OOMs again on its retried
+// attempt fails even if the retried size was not itself the configured max.
+//
+// Status (2026-10-03): the pure decision logic below (`decide_oom_recovery`,
+// `resolve_oom_node_id`, `oom_event_admissible`, `resolve_auto_start`, and the
+// `OomEffect`/`OomEffectFlags` state machine) is kept, reviewed, and tested, but the
+// Durable-Object wiring that would call it (`coordinator::mod`'s `maybe_decide_oom_recovery`/
+// `drain_oom_lineage`/`execute_oom_effect`, the `oom_lineage_decision` table, the
+// `node_container.rs`/`executor.rs` size-override plumbing) has been removed. It is not
+// reachable from any real caller. See docs/design/parallelization.md's "`runner: \"auto\"`
+// OOM recovery: pure logic only, not wired" section for the open prerequisites and why the
+// wiring was pulled back out: a review found two concrete bugs in it -- a wrong node could be
+// resolved during a shard-terminal race, and the agent env var the wiring relied on to carry a
+// shard's attempt number does not actually carry one.
+
+use cloud_ci_core::rightsizing::{self, InstanceSize, OomRetryOutcome};
+
+/// One already-persisted OOM-recovery outcome for a node -- `sizing_decision`'s row shape,
+/// once that table exists. `RetryAt`'s `to` and `FailedAtMax`'s `max` are instance-size
+/// *names*, not `InstanceSize`s: the only thing a caller needs to dispatch or report, and
+/// trivially `Clone`/`PartialEq` without dragging a borrowed ladder slice's lifetime along.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OomRecoveryOutcome {
+    /// Retry once more, at `to` -- analytics.md: "retries that node once on the next size up
+    /// ... bypassing hysteresis and the p95 computation". `reason` is
+    /// [`rightsizing::oom_retry`]'s own `"<from> -> <to>: oom-retry"` string, unchanged.
+    RetryAt { to: String, reason: String },
+    /// Terminal: either this OOM happened at the bounded ladder's own top, or a prior OOM for
+    /// this same node already spent the one retry analytics.md grants. `max` always names the
+    /// *configured* max (the bounded ladder's own top), never the size this particular OOM
+    /// happened at -- matching analytics.md's "a message naming the configured max", a
+    /// second-attempt OOM below the configured max still reports that configured max, not its
+    /// own (lower) size, so the message plainly says "the one retry already happened and it
+    /// wasn't enough" rather than naming an arbitrary intermediate rung.
+    FailedAtMax {
+        max: String,
+        measured_peak_bytes: Option<u64>,
+    },
+}
+
+/// A decision already recorded for one shard lineage (`(job_name, idx)`, never a specific
+/// node id -- a retried node's real id does not equal `shard_node_id(job_name, idx,
+/// retried_attempt)` for its own attempt number, so keying this by node id would make a
+/// second OOM on the retried node unfindable). `base_node_id` is the
+/// *original* (never-retried) node's id -- [`resolve_oom_node_id`]'s own input, letting a
+/// caller reconstruct the retry's real id (`RetryAt`) or know which node to clean up
+/// (`FailedAtMax`, where no retry was ever created) without storing a second id. At most one
+/// row per lineage, ever: analytics.md's single-retry rule means a shard has at most one
+/// OOM-recovery decision in its whole lifetime, regardless of how many attempts it goes
+/// through.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OomDecisionRecord {
+    pub attempt: u32,
+    pub base_node_id: String,
+    pub outcome: OomRecoveryOutcome,
+}
+
+/// One `SubmitResourceSamples` delivery's OOM-relevant fields -- [`decide_oom_recovery`]'s
+/// per-event input.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OomObservation {
+    pub attempt: u32,
+    pub current_size: String,
+    pub measured_peak_bytes: Option<u64>,
+}
+
+/// [`decide_oom_recovery`]'s full output.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OomRecoveryDecision {
+    /// `incoming.attempt` already has a recorded decision -- a duplicate delivery of an
+    /// already-accepted batch must still resolve to the exact same OOM-recovery outcome, not
+    /// recompute or re-dispatch. The stored outcome, unchanged.
+    AlreadyDecided(OomRecoveryOutcome),
+    /// A decision already exists for a *later* attempt than `incoming.attempt` -- a
+    /// reordered/late-arriving delivery for an attempt this node has since moved past. No
+    /// effect: acting on stale per-attempt evidence here would race the newer decision a
+    /// caller may already have dispatched against.
+    Stale,
+    /// `incoming.current_size` is not present in the bounded ladder passed in -- a
+    /// configuration error upstream (the node's own reported instance type is not between its
+    /// configured min/max), not a shape [`decide_oom_recovery`] can resolve on its own
+    /// ([`rightsizing::oom_retry`]'s own `None` case, passed through).
+    NotInLadder,
+    /// A new decision for `incoming.attempt`, not previously recorded.
+    New(OomRecoveryOutcome),
+}
+
+/// Resolves one OOM event against whatever [`OomDecisionRecord`] (if any) this node already
+/// has, and -- only when none exists yet -- [`rightsizing::oom_retry`]'s own next-size-up/
+/// already-at-max math. `ladder` MUST already be the node's `[min, max]`-bounded slice
+/// ([`rightsizing::ladder_range`]'s output), exactly like `oom_retry` itself requires.
+///
+/// The one-retry-total rule ("first retry only"): once `existing` is `Some(_)` at all, this
+/// node has already spent its one retry regardless of what size that retry OOM'd at, so a
+/// further OOM for it is unconditionally [`OomRecoveryOutcome::FailedAtMax`] naming the
+/// *configured* max -- never a second [`rightsizing::oom_retry`] call, which would otherwise
+/// keep climbing the ladder one rung per OOM ("retrying indefinitely", which analytics.md
+/// explicitly rules out).
+///
+/// The "further OOM" match is `incoming.attempt == existing.attempt + 1` exactly, not
+/// "any attempt greater than `existing.attempt`" -- there is no `node_id` field on
+/// `SubmitResourceSamplesRequest` (`cloud-ci-proto`) to key this on directly, so
+/// `existing.attempt + 1` (the one, exact attempt number
+/// [`oom_retry_node_id`]'s own dispatched retry was given) is the closest identity check this
+/// layer can make: an attempt that jumped by more than one (a different, unrelated retry
+/// mechanism bumping the counter, or a reordered delivery skipping ahead) is `Stale`, never
+/// silently mistaken for the dispatched retry's own second OOM. This does **not** fully solve
+/// identity confusion: a retry that reports the *same* attempt as the original (its real
+/// dispatch never told it to use a new one -- there is no wiring that does this; an earlier
+/// attempt at it assumed `CLOUD_CI_ATTEMPT` carries a shard attempt, which is wrong, that env
+/// var is the *run* attempt used by `cloud-ci upload`/`split`, and the agent does not read it
+/// for this purpose at all) is indistinguishable from a duplicate delivery of the original's
+/// own decision -- `Equal` below -- and safely resolves to `AlreadyDecided` (the original
+/// `RetryAt`), not a crash or a wrong dispatch, but also not a detected second OOM. Closing
+/// that gap for real needs a node id on the wire plus a real agent-side attempt-carrying
+/// mechanism; see docs/design/parallelization.md's "not wired" section for the open
+/// prerequisites.
+pub fn decide_oom_recovery(
+    ladder: &[InstanceSize],
+    existing: Option<&OomDecisionRecord>,
+    incoming: &OomObservation,
+) -> OomRecoveryDecision {
+    if let Some(existing) = existing {
+        if matches!(existing.outcome, OomRecoveryOutcome::FailedAtMax { .. }) {
+            // Terminal: no further decision for this lineage, regardless of which attempt
+            // reports in -- analytics.md's "rather than retrying indefinitely".
+            return OomRecoveryDecision::AlreadyDecided(existing.outcome.clone());
+        }
+        return match incoming.attempt.cmp(&existing.attempt) {
+            std::cmp::Ordering::Less => OomRecoveryDecision::Stale,
+            std::cmp::Ordering::Equal => {
+                OomRecoveryDecision::AlreadyDecided(existing.outcome.clone())
+            }
+            std::cmp::Ordering::Greater if incoming.attempt == existing.attempt + 1 => {
+                match ladder.last() {
+                    None => OomRecoveryDecision::NotInLadder,
+                    Some(max) => OomRecoveryDecision::New(OomRecoveryOutcome::FailedAtMax {
+                        max: max.name.clone(),
+                        measured_peak_bytes: incoming.measured_peak_bytes,
+                    }),
+                }
+            }
+            std::cmp::Ordering::Greater => OomRecoveryDecision::Stale,
+        };
+    }
+
+    match rightsizing::oom_retry(
+        ladder,
+        &incoming.current_size,
+        incoming.measured_peak_bytes.unwrap_or(0),
+    ) {
+        None => OomRecoveryDecision::NotInLadder,
+        Some(OomRetryOutcome::RetryAt { to, reason }) => {
+            OomRecoveryDecision::New(OomRecoveryOutcome::RetryAt {
+                to: to.name,
+                reason,
+            })
+        }
+        Some(OomRetryOutcome::AlreadyAtMax { max, .. }) => {
+            OomRecoveryDecision::New(OomRecoveryOutcome::FailedAtMax {
+                max: max.name,
+                // Carries the real `Option<u64>` through rather than `oom_retry`'s own `u64`
+                // (which a `None` peak would otherwise have silently become `0` in, via the
+                // `unwrap_or(0)` fed into it above) -- a genuinely unknown peak must render as
+                // "unknown" in a failure message, never a fabricated zero.
+                measured_peak_bytes: incoming.measured_peak_bytes,
+            })
+        }
+    }
+}
+
+/// A distinct, run-scoped `node_id` for an OOM-retried node's new attempt -- analytics.md's
+/// "the new attempt gets a distinct, run-scoped container address". Run-scoping itself comes
+/// from `node_physical_address(run_do_name, node_id)` hashing the *run*'s own DO name
+/// alongside whatever this returns, exactly like every other node id; this function only needs
+/// to guarantee the `node_id` half changes per attempt, which the trailing `:attempt` suffix
+/// does unconditionally, regardless of `base_node_id`'s own shape.
+///
+/// Shard nodes do not need this: [`shard_node_id`] already embeds `attempt` in its own id
+/// scheme, and shard-terminal handling already resolves OOM-retried shard attempts through it
+/// directly. This helper is for a plain (non-shard) `runner: "auto"` node, whose `node_id` has
+/// no attempt of its own yet.
+pub fn oom_retry_node_id(base_node_id: &str, attempt: u32) -> String {
+    format!("{base_node_id}:oom-retry:{attempt}")
+}
+
+/// Resolves which real `node_id` a `SubmitResourceSamples` delivery's `(job_name, idx,
+/// attempt)` refers to, given whatever [`OomDecisionRecord`] already exists for this shard
+/// lineage. No decision yet: the delivery is for the original, never-retried node
+/// ([`shard_node_id`]'s own scheme). A `RetryAt` decision already exists: the *real* current
+/// node is the retry [`oom_retry_node_id`] actually dispatched, reconstructed from the
+/// decision's own `base_node_id`/`attempt` -- not recomputed from the delivery's own
+/// `attempt` via `shard_node_id`, which does not produce a retried node's real id at all. A
+/// `FailedAtMax` decision already exists: no retry was ever created, so the node needing
+/// cleanup is still the base node.
+pub fn resolve_oom_node_id(
+    job_name: &str,
+    idx: u32,
+    attempt: u32,
+    existing: Option<&OomDecisionRecord>,
+) -> String {
+    match existing {
+        Some(record) => match &record.outcome {
+            OomRecoveryOutcome::RetryAt { .. } => {
+                oom_retry_node_id(&record.base_node_id, record.attempt + 1)
+            }
+            OomRecoveryOutcome::FailedAtMax { .. } => record.base_node_id.clone(),
+        },
+        None => shard_node_id(job_name, idx, attempt),
+    }
+}
+
+/// Whether an OOM event for a node should even be considered: a late `oom_detected` batch
+/// for a node that already reached a terminal state on its own (naturally succeeded, or was
+/// cancelled) must never be overwritten to `failed`, and a terminal run must never have a
+/// new container started for it. `false` is a silent, stale no-op for the caller -- never an
+/// error, matching every other late-delivery guard in this file.
+pub fn oom_event_admissible(run_terminal: bool, node_state: NodeState) -> bool {
+    !run_terminal && !node_state.is_terminal()
+}
+
+/// One auto-sized node's resolved starting instance size, plus the `[min, max]` bounds a
+/// future `runner: "auto"` start path would freeze on the node's row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AutoStart {
+    pub initial: String,
+    pub min: String,
+    pub max: String,
+}
+
+/// Why [`resolve_auto_start`] could not resolve a starting size. The configured
+/// `Settings.runners.auto` bounds must be checked against the *executor's* real ladder before
+/// ever reaching a per-call container size override (whose own accepted-names list does not
+/// include every name `Settings.runners.auto` accepts, e.g. the documented default
+/// `"basic"`), so a node whose bounds fall outside that ladder fails closed here rather than
+/// either crashing the real container start or silently never participating in OOM
+/// recovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutoStartError {
+    /// `min`/`max` (explicit, or the ladder's own first/last rung when unset) do not both
+    /// resolve against `ladder` via [`rightsizing::ladder_range`] -- an inverted range, or a
+    /// name absent from this executor's real sizes (`"basic"` on the default Cloudflare
+    /// Containers executor, whose `CapabilityDescriptor` does not list it).
+    BoundsNotInLadder { min: String, max: String },
+    /// `initial` (explicit, or `min` when unset) is not within the resolved `[min, max]`
+    /// bound.
+    InitialOutOfBounds {
+        initial: String,
+        min: String,
+        max: String,
+    },
+}
+
+/// Resolves a `runner: "auto"` node's starting instance size against the *executor's* real
+/// ladder (e.g. `CapabilityDescriptor::sizes`, supplied by a future caller).
+/// `Settings.runners.auto.{min,max,initial}` are deployment-author-supplied strings that may
+/// name a size the active executor does not actually support for a per-call
+/// `durable_object` start, so a caller must resolve and validate against `ladder` before ever
+/// reaching a container start, never pass a `Settings.runners.auto` string through
+/// directly. `min`/`max` unset defaults to the ladder's own first/last rung (the deployment's
+/// full range); `initial` unset defaults to the resolved `min`.
+pub fn resolve_auto_start(
+    ladder: &[InstanceSize],
+    min: Option<&str>,
+    max: Option<&str>,
+    initial: Option<&str>,
+) -> Result<AutoStart, AutoStartError> {
+    let min_name = min
+        .map(str::to_string)
+        .or_else(|| ladder.first().map(|s| s.name.clone()));
+    let max_name = max
+        .map(str::to_string)
+        .or_else(|| ladder.last().map(|s| s.name.clone()));
+    let (Some(min_name), Some(max_name)) = (min_name, max_name) else {
+        return Err(AutoStartError::BoundsNotInLadder {
+            min: min.unwrap_or_default().to_string(),
+            max: max.unwrap_or_default().to_string(),
+        });
+    };
+    let Some(bounded) = rightsizing::ladder_range(ladder, &min_name, &max_name) else {
+        return Err(AutoStartError::BoundsNotInLadder {
+            min: min_name,
+            max: max_name,
+        });
+    };
+    let initial_name = initial
+        .map(str::to_string)
+        .unwrap_or_else(|| min_name.clone());
+    if !bounded.iter().any(|s| s.name == initial_name) {
+        return Err(AutoStartError::InitialOutOfBounds {
+            initial: initial_name,
+            min: min_name,
+            max: max_name,
+        });
+    }
+    Ok(AutoStart {
+        initial: initial_name,
+        min: min_name,
+        max: max_name,
+    })
+}
+
+/// Which of an OOM-recovery decision's durable side effects have already completed. A future
+/// wiring would persist these flags per decision and re-drive the remaining effects to
+/// completion on every call (a replayed delivery as well as a background sweep, not only the
+/// call that first created the decision), so a crash or a failed D1 write between any two
+/// of them heals later instead of silently leaving the system half-applied. Each effect is
+/// tracked independently for exactly that reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OomEffectFlags {
+    /// The OOM'd node's own row has been marked terminal (`failed`).
+    pub old_marked: bool,
+    /// The OOM'd node's real container has been stopped (or confirmed never addressable).
+    /// A retry must never be dispatched before this, so the old and new attempts never run
+    /// concurrently for the same shard.
+    pub old_stopped: bool,
+    /// The OOM'd node's now-terminal row has been projected to D1.
+    pub old_projected: bool,
+    /// The decision itself has been projected to a future `sizing_decisions` D1 table --
+    /// no such table exists today (the wiring that would create and write it was removed).
+    pub decision_projected: bool,
+    /// Only meaningful when the decision is `RetryAt`: the retry's `node` row exists.
+    pub retry_inserted: bool,
+    /// Only meaningful when the decision is `RetryAt`: the retry's real container start has
+    /// been attempted (succeeded, or failed and the row was marked `failed`). Tracked
+    /// separately from `retry_inserted` so a crash between inserting the row and starting the
+    /// container is detectable and retried, rather than a bare row-exists check wrongly
+    /// treating the retry as already dispatched.
+    pub retry_started: bool,
+    /// Only meaningful when the decision is `RetryAt`: the retry's row has been projected to
+    /// D1.
+    pub retry_projected: bool,
+}
+
+/// One durable side effect of an OOM-recovery decision, in the fixed order
+/// [`next_oom_effect`] always applies them: every container-state-critical effect (mark,
+/// stop, insert, start) comes before any D1 projection, so a D1 outage or an unapplied
+/// migration can never block the retry itself; the retry (if any) still only runs after the
+/// old node's container is confirmed stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OomEffect {
+    MarkOldTerminal,
+    StopOld,
+    InsertRetry,
+    StartRetry,
+    ProjectOld,
+    ProjectDecision,
+    ProjectRetry,
+}
+
+impl OomEffect {
+    /// Whether this effect is a best-effort D1 projection: a failure here must never stop the
+    /// critical effects, only be retried later on its own.
+    pub fn is_projection(self) -> bool {
+        matches!(
+            self,
+            Self::ProjectOld | Self::ProjectDecision | Self::ProjectRetry
+        )
+    }
+}
+
+/// The next not-yet-completed effect for one OOM-recovery decision, or `None` once every
+/// applicable effect (including the retry's, when `is_retry`) is done. A caller drains this by
+/// executing the returned effect, recording its own success back into `flags`, and calling
+/// this again -- "plan one step, apply it, re-plan".
+pub fn next_oom_effect(is_retry: bool, flags: OomEffectFlags) -> Option<OomEffect> {
+    next_oom_effect_excluding(is_retry, flags, &[])
+}
+
+/// [`next_oom_effect`], skipping every effect in `skipped` (projections that already failed
+/// during the current drain) so one failing projection does not hide the remaining pending
+/// ones.
+pub fn next_oom_effect_excluding(
+    is_retry: bool,
+    flags: OomEffectFlags,
+    skipped: &[OomEffect],
+) -> Option<OomEffect> {
+    let candidates = [
+        (!flags.old_marked, OomEffect::MarkOldTerminal, false),
+        (!flags.old_stopped, OomEffect::StopOld, false),
+        (!flags.retry_inserted, OomEffect::InsertRetry, true),
+        (!flags.retry_started, OomEffect::StartRetry, true),
+        (!flags.old_projected, OomEffect::ProjectOld, false),
+        (!flags.decision_projected, OomEffect::ProjectDecision, false),
+        (!flags.retry_projected, OomEffect::ProjectRetry, true),
+    ];
+    for (pending, effect, retry_only) in candidates {
+        if !pending || (retry_only && !is_retry) || skipped.contains(&effect) {
+            continue;
+        }
+        // A critical effect that is still pending blocks everything after it: only
+        // projections (which never gate anything) may be reached past a skipped sibling.
+        return Some(effect);
+    }
+    None
+}
+
+/// Whether any effect still needs draining: a future caller's check for whether a decision
+/// still needs background work, true until [`next_oom_effect`] returns `None`.
+pub fn oom_effects_pending(is_retry: bool, flags: OomEffectFlags) -> bool {
+    next_oom_effect(is_retry, flags).is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3426,5 +3838,542 @@ mod tests {
             resolve_stop_outcome(Some("addr"), false),
             StopOutcome::Pending
         );
+    }
+
+    // -- decide_oom_recovery / oom_retry_node_id -----------------------
+
+    fn bounded_ladder(names: &[&str]) -> Vec<InstanceSize> {
+        names
+            .iter()
+            .map(|name| InstanceSize {
+                name: (*name).to_string(),
+                vcpu: 1.0,
+                memory_bytes: 1,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn oom_recovery_first_oom_within_bounds_retries_to_next_size() {
+        let ladder = bounded_ladder(&["basic", "standard-1", "standard-2"]);
+        let incoming = OomObservation {
+            attempt: 1,
+            current_size: "basic".to_string(),
+            measured_peak_bytes: Some(2_000),
+        };
+        assert_eq!(
+            decide_oom_recovery(&ladder, None, &incoming),
+            OomRecoveryDecision::New(OomRecoveryOutcome::RetryAt {
+                to: "standard-1".to_string(),
+                reason: "basic -> standard-1: oom-retry".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn oom_recovery_first_oom_at_configured_max_fails_with_measured_peak() {
+        let ladder = bounded_ladder(&["basic", "standard-1", "standard-2"]);
+        let incoming = OomObservation {
+            attempt: 1,
+            current_size: "standard-2".to_string(),
+            measured_peak_bytes: Some(7_000_000_000),
+        };
+        assert_eq!(
+            decide_oom_recovery(&ladder, None, &incoming),
+            OomRecoveryDecision::New(OomRecoveryOutcome::FailedAtMax {
+                max: "standard-2".to_string(),
+                measured_peak_bytes: Some(7_000_000_000),
+            })
+        );
+    }
+
+    #[test]
+    fn oom_recovery_single_size_bound_fails_immediately_without_a_retry() {
+        // `min == max`: the node's own configured bounds leave no room to retry at all, so
+        // even the very first OOM is terminal.
+        let ladder = bounded_ladder(&["basic"]);
+        let incoming = OomObservation {
+            attempt: 1,
+            current_size: "basic".to_string(),
+            measured_peak_bytes: Some(500),
+        };
+        assert_eq!(
+            decide_oom_recovery(&ladder, None, &incoming),
+            OomRecoveryDecision::New(OomRecoveryOutcome::FailedAtMax {
+                max: "basic".to_string(),
+                measured_peak_bytes: Some(500),
+            })
+        );
+    }
+
+    #[test]
+    fn oom_recovery_second_oom_after_the_one_retry_fails_even_below_configured_max() {
+        // The retried attempt (now at standard-1, not the configured max standard-2) OOMs
+        // again: analytics.md grants exactly one retry ("rather than retrying indefinitely"),
+        // so this fails rather than climbing to standard-2 -- and the message still names the
+        // *configured* max, not the lower size this second OOM actually happened at.
+        let ladder = bounded_ladder(&["basic", "standard-1", "standard-2"]);
+        let existing = OomDecisionRecord {
+            attempt: 1,
+            base_node_id: "shard:e2e:0:1".to_string(),
+            outcome: OomRecoveryOutcome::RetryAt {
+                to: "standard-1".to_string(),
+                reason: "basic -> standard-1: oom-retry".to_string(),
+            },
+        };
+        let incoming = OomObservation {
+            attempt: 2,
+            current_size: "standard-1".to_string(),
+            measured_peak_bytes: Some(3_000_000_000),
+        };
+        assert_eq!(
+            decide_oom_recovery(&ladder, Some(&existing), &incoming),
+            OomRecoveryDecision::New(OomRecoveryOutcome::FailedAtMax {
+                max: "standard-2".to_string(),
+                measured_peak_bytes: Some(3_000_000_000),
+            })
+        );
+    }
+
+    #[test]
+    fn oom_recovery_duplicate_delivery_of_already_decided_attempt_returns_stored_outcome() {
+        let ladder = bounded_ladder(&["basic", "standard-1"]);
+        let outcome = OomRecoveryOutcome::RetryAt {
+            to: "standard-1".to_string(),
+            reason: "basic -> standard-1: oom-retry".to_string(),
+        };
+        let existing = OomDecisionRecord {
+            attempt: 1,
+            base_node_id: "shard:e2e:0:1".to_string(),
+            outcome: outcome.clone(),
+        };
+        let incoming = OomObservation {
+            attempt: 1,
+            current_size: "basic".to_string(),
+            measured_peak_bytes: Some(2_000),
+        };
+        // A redelivered batch for the exact same attempt must resolve to the already-stored
+        // outcome, not recompute (which would otherwise be harmless here, but must never
+        // re-dispatch a second real container start for the same attempt).
+        assert_eq!(
+            decide_oom_recovery(&ladder, Some(&existing), &incoming),
+            OomRecoveryDecision::AlreadyDecided(outcome)
+        );
+    }
+
+    #[test]
+    fn oom_recovery_reordered_earlier_attempt_after_later_decision_is_stale() {
+        let ladder = bounded_ladder(&["basic", "standard-1", "standard-2"]);
+        let existing = OomDecisionRecord {
+            attempt: 2,
+            base_node_id: "shard:e2e:0:1".to_string(),
+            outcome: OomRecoveryOutcome::RetryAt {
+                to: "standard-1".to_string(),
+                reason: "basic -> standard-1: oom-retry".to_string(),
+            },
+        };
+        // A late-arriving delivery for attempt 1, after attempt 2's own decision already
+        // landed -- must not overwrite or re-decide anything.
+        let incoming = OomObservation {
+            attempt: 1,
+            current_size: "basic".to_string(),
+            measured_peak_bytes: Some(2_000),
+        };
+        assert_eq!(
+            decide_oom_recovery(&ladder, Some(&existing), &incoming),
+            OomRecoveryDecision::Stale
+        );
+    }
+
+    #[test]
+    fn oom_recovery_reordered_attempt_after_a_failed_at_max_decision_is_already_decided_not_stale()
+    {
+        // A terminal lineage's stored outcome is returned for *any* later-arriving delivery
+        // regardless of whether its own attempt is older or newer than the one that decided
+        // it -- `AlreadyDecided`, not `Stale`, since there genuinely is a decision to report.
+        let ladder = bounded_ladder(&["basic", "standard-1", "standard-2"]);
+        let outcome = OomRecoveryOutcome::FailedAtMax {
+            max: "standard-2".to_string(),
+            measured_peak_bytes: Some(1),
+        };
+        let existing = OomDecisionRecord {
+            attempt: 2,
+            base_node_id: "shard:e2e:0:1".to_string(),
+            outcome: outcome.clone(),
+        };
+        let incoming = OomObservation {
+            attempt: 1,
+            current_size: "basic".to_string(),
+            measured_peak_bytes: Some(2_000),
+        };
+        assert_eq!(
+            decide_oom_recovery(&ladder, Some(&existing), &incoming),
+            OomRecoveryDecision::AlreadyDecided(outcome)
+        );
+    }
+
+    #[test]
+    fn oom_recovery_current_size_not_in_bounded_ladder_is_not_in_ladder() {
+        let ladder = bounded_ladder(&["basic", "standard-1"]);
+        let incoming = OomObservation {
+            attempt: 1,
+            current_size: "standard-4".to_string(),
+            measured_peak_bytes: Some(1),
+        };
+        assert_eq!(
+            decide_oom_recovery(&ladder, None, &incoming),
+            OomRecoveryDecision::NotInLadder
+        );
+    }
+
+    #[test]
+    fn oom_recovery_unknown_peak_stays_unknown_rather_than_a_fabricated_zero() {
+        let ladder = bounded_ladder(&["basic"]);
+        let incoming = OomObservation {
+            attempt: 1,
+            current_size: "basic".to_string(),
+            measured_peak_bytes: None,
+        };
+        assert_eq!(
+            decide_oom_recovery(&ladder, None, &incoming),
+            OomRecoveryDecision::New(OomRecoveryOutcome::FailedAtMax {
+                max: "basic".to_string(),
+                measured_peak_bytes: None,
+            })
+        );
+    }
+
+    #[test]
+    fn oom_retry_node_id_is_distinct_per_attempt_and_deterministic() {
+        assert_eq!(oom_retry_node_id("auto:build", 2), "auto:build:oom-retry:2");
+        assert_ne!(
+            oom_retry_node_id("auto:build", 2),
+            oom_retry_node_id("auto:build", 3)
+        );
+        assert_eq!(
+            oom_retry_node_id("auto:build", 2),
+            oom_retry_node_id("auto:build", 2)
+        );
+    }
+
+    // -- resolve_oom_node_id ---------------------------------------------
+
+    #[test]
+    fn resolve_oom_node_id_with_no_decision_uses_shard_node_id() {
+        assert_eq!(
+            resolve_oom_node_id("e2e", 2, 1, None),
+            shard_node_id("e2e", 2, 1)
+        );
+    }
+
+    #[test]
+    fn resolve_oom_node_id_with_a_retry_at_decision_reconstructs_the_retry_real_id() {
+        let existing = OomDecisionRecord {
+            attempt: 1,
+            base_node_id: shard_node_id("e2e", 2, 1),
+            outcome: OomRecoveryOutcome::RetryAt {
+                to: "standard-1".to_string(),
+                reason: "basic -> standard-1: oom-retry".to_string(),
+            },
+        };
+        // The delivery's own reported `attempt` (3, say) is irrelevant here -- trusting it
+        // instead would be the bug; the real id is reconstructed from the decision's own
+        // `base_node_id`/`attempt`.
+        assert_eq!(
+            resolve_oom_node_id("e2e", 2, 3, Some(&existing)),
+            oom_retry_node_id(&shard_node_id("e2e", 2, 1), 2)
+        );
+    }
+
+    #[test]
+    fn resolve_oom_node_id_with_a_failed_at_max_decision_points_back_at_the_base_node() {
+        let existing = OomDecisionRecord {
+            attempt: 2,
+            base_node_id: oom_retry_node_id(&shard_node_id("e2e", 2, 1), 2),
+            outcome: OomRecoveryOutcome::FailedAtMax {
+                max: "standard-2".to_string(),
+                measured_peak_bytes: Some(1),
+            },
+        };
+        assert_eq!(
+            resolve_oom_node_id("e2e", 2, 3, Some(&existing)),
+            existing.base_node_id
+        );
+    }
+
+    #[test]
+    fn a_second_oom_on_the_retried_node_resolves_to_failed_at_max() {
+        // A `RetryAt` decision already exists for shard e2e/2, and the node it dispatched
+        // (not `shard_node_id("e2e", 2, 2)`) itself now OOMs. The real id must be found, and
+        // the decision must be `FailedAtMax`, naming the configured max.
+        let ladder = bounded_ladder(&["basic", "standard-1", "standard-2"]);
+        let existing = OomDecisionRecord {
+            attempt: 1,
+            base_node_id: shard_node_id("e2e", 2, 1),
+            outcome: OomRecoveryOutcome::RetryAt {
+                to: "standard-1".to_string(),
+                reason: "basic -> standard-1: oom-retry".to_string(),
+            },
+        };
+        let retried_node_id = resolve_oom_node_id("e2e", 2, 999, Some(&existing));
+        assert_eq!(
+            retried_node_id,
+            oom_retry_node_id(&shard_node_id("e2e", 2, 1), 2)
+        );
+        let incoming = OomObservation {
+            attempt: 2,
+            current_size: "standard-1".to_string(),
+            measured_peak_bytes: Some(5_000_000_000),
+        };
+        assert_eq!(
+            decide_oom_recovery(&ladder, Some(&existing), &incoming),
+            OomRecoveryDecision::New(OomRecoveryOutcome::FailedAtMax {
+                max: "standard-2".to_string(),
+                measured_peak_bytes: Some(5_000_000_000),
+            })
+        );
+    }
+
+    #[test]
+    fn a_retried_node_reporting_the_same_attempt_as_the_original_resolves_to_already_decided() {
+        // An honestly-unresolvable residual: without a `node_id` field on
+        // `SubmitResourceSamplesRequest`, a retry whose real dispatch failed to carry its new
+        // attempt number is
+        // indistinguishable from a duplicate delivery of the original's own decision. This
+        // must degrade *safely* -- `AlreadyDecided`, never a crash, never a wrong dispatch --
+        // even though the real second OOM goes undetected in this specific broken-dispatch
+        // case.
+        let ladder = bounded_ladder(&["basic", "standard-1", "standard-2"]);
+        let outcome = OomRecoveryOutcome::RetryAt {
+            to: "standard-1".to_string(),
+            reason: "basic -> standard-1: oom-retry".to_string(),
+        };
+        let existing = OomDecisionRecord {
+            attempt: 1,
+            base_node_id: shard_node_id("e2e", 2, 1),
+            outcome: outcome.clone(),
+        };
+        let incoming = OomObservation {
+            attempt: 1,
+            current_size: "standard-1".to_string(),
+            measured_peak_bytes: Some(5_000_000_000),
+        };
+        assert_eq!(
+            decide_oom_recovery(&ladder, Some(&existing), &incoming),
+            OomRecoveryDecision::AlreadyDecided(outcome)
+        );
+    }
+
+    #[test]
+    fn an_attempt_past_the_retry_nodes_expected_attempt_is_stale_not_failed_at_max() {
+        // Exact-match hardening: only `existing.attempt + 1` (the one attempt
+        // `oom_retry_node_id` actually dispatched) is treated as the retry's own second OOM.
+        // An attempt that jumped further ahead (a different, unrelated mechanism bumping the
+        // counter) is `Stale`, never silently mistaken for it.
+        let ladder = bounded_ladder(&["basic", "standard-1", "standard-2"]);
+        let existing = OomDecisionRecord {
+            attempt: 1,
+            base_node_id: shard_node_id("e2e", 2, 1),
+            outcome: OomRecoveryOutcome::RetryAt {
+                to: "standard-1".to_string(),
+                reason: "basic -> standard-1: oom-retry".to_string(),
+            },
+        };
+        let incoming = OomObservation {
+            attempt: 3,
+            current_size: "standard-1".to_string(),
+            measured_peak_bytes: Some(5_000_000_000),
+        };
+        assert_eq!(
+            decide_oom_recovery(&ladder, Some(&existing), &incoming),
+            OomRecoveryDecision::Stale
+        );
+    }
+
+    // -- oom_event_admissible ----------------------------------------------
+
+    #[test]
+    fn oom_event_admissible_true_for_a_running_node_on_a_live_run() {
+        assert!(oom_event_admissible(false, NodeState::Running));
+        assert!(oom_event_admissible(false, NodeState::Pending));
+    }
+
+    #[test]
+    fn oom_event_admissible_false_for_a_terminal_node() {
+        assert!(!oom_event_admissible(false, NodeState::Succeeded));
+        assert!(!oom_event_admissible(false, NodeState::Cancelled));
+        assert!(!oom_event_admissible(false, NodeState::Failed));
+    }
+
+    #[test]
+    fn oom_event_admissible_false_for_a_terminal_run_even_with_a_running_node() {
+        assert!(!oom_event_admissible(true, NodeState::Running));
+    }
+
+    // -- resolve_auto_start --------------------------------------------------
+
+    #[test]
+    fn resolve_auto_start_with_explicit_bounds_and_initial() {
+        let ladder = bounded_ladder(&["lite", "standard-1", "standard-2"]);
+        assert_eq!(
+            resolve_auto_start(&ladder, Some("standard-1"), Some("standard-2"), None),
+            Ok(AutoStart {
+                initial: "standard-1".to_string(),
+                min: "standard-1".to_string(),
+                max: "standard-2".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_auto_start_unset_bounds_default_to_the_ladders_own_ends() {
+        let ladder = bounded_ladder(&["lite", "standard-1", "standard-2"]);
+        assert_eq!(
+            resolve_auto_start(&ladder, None, None, None),
+            Ok(AutoStart {
+                initial: "lite".to_string(),
+                min: "lite".to_string(),
+                max: "standard-2".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_auto_start_rejects_a_name_the_executor_ladder_does_not_support() {
+        // The documented default settings example (`initial: basic`) against the real
+        // Cloudflare Containers executor's ladder, which does not include `"basic"` for a
+        // per-call `durable_object` size.
+        let ladder = bounded_ladder(&["standard-4"]);
+        assert_eq!(
+            resolve_auto_start(&ladder, Some("basic"), Some("standard-3"), Some("basic")),
+            Err(AutoStartError::BoundsNotInLadder {
+                min: "basic".to_string(),
+                max: "standard-3".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_auto_start_rejects_an_inverted_range() {
+        let ladder = bounded_ladder(&["lite", "standard-1", "standard-2"]);
+        assert_eq!(
+            resolve_auto_start(&ladder, Some("standard-2"), Some("lite"), None),
+            Err(AutoStartError::BoundsNotInLadder {
+                min: "standard-2".to_string(),
+                max: "lite".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_auto_start_rejects_an_initial_outside_the_resolved_bounds() {
+        let ladder = bounded_ladder(&["lite", "standard-1", "standard-2"]);
+        assert_eq!(
+            resolve_auto_start(
+                &ladder,
+                Some("standard-1"),
+                Some("standard-2"),
+                Some("lite")
+            ),
+            Err(AutoStartError::InitialOutOfBounds {
+                initial: "lite".to_string(),
+                min: "standard-1".to_string(),
+                max: "standard-2".to_string(),
+            })
+        );
+    }
+
+    // -- next_oom_effect / oom_effects_pending ------------------------------
+
+    #[test]
+    fn next_oom_effect_walks_the_fixed_critical_first_order_for_a_retry_outcome() {
+        // Every container-state-critical effect (mark, stop, insert, start) is ordered
+        // before any D1 projection, so a D1 outage can never block the retry itself.
+        let mut flags = OomEffectFlags::default();
+        let order = [
+            OomEffect::MarkOldTerminal,
+            OomEffect::StopOld,
+            OomEffect::InsertRetry,
+            OomEffect::StartRetry,
+            OomEffect::ProjectOld,
+            OomEffect::ProjectDecision,
+            OomEffect::ProjectRetry,
+        ];
+        for expected in order {
+            assert_eq!(next_oom_effect(true, flags), Some(expected));
+            assert!(oom_effects_pending(true, flags));
+            match expected {
+                OomEffect::MarkOldTerminal => flags.old_marked = true,
+                OomEffect::StopOld => flags.old_stopped = true,
+                OomEffect::ProjectOld => flags.old_projected = true,
+                OomEffect::ProjectDecision => flags.decision_projected = true,
+                OomEffect::InsertRetry => flags.retry_inserted = true,
+                OomEffect::StartRetry => flags.retry_started = true,
+                OomEffect::ProjectRetry => flags.retry_projected = true,
+            }
+        }
+        assert_eq!(next_oom_effect(true, flags), None);
+        assert!(!oom_effects_pending(true, flags));
+    }
+
+    #[test]
+    fn next_oom_effect_excluding_skips_a_failed_projection_and_still_finds_the_next_one() {
+        // A projection that already failed during this drain must not hide the other
+        // still-pending ones -- `old_projected` failed and stays unset, but
+        // `decision_projected` is still reachable.
+        let flags = OomEffectFlags {
+            old_marked: true,
+            old_stopped: true,
+            retry_inserted: true,
+            retry_started: true,
+            ..OomEffectFlags::default()
+        };
+        assert_eq!(
+            next_oom_effect_excluding(true, flags, &[OomEffect::ProjectOld]),
+            Some(OomEffect::ProjectDecision)
+        );
+    }
+
+    #[test]
+    fn oom_effect_is_projection_distinguishes_critical_from_best_effort() {
+        assert!(OomEffect::ProjectOld.is_projection());
+        assert!(OomEffect::ProjectDecision.is_projection());
+        assert!(OomEffect::ProjectRetry.is_projection());
+        assert!(!OomEffect::MarkOldTerminal.is_projection());
+        assert!(!OomEffect::StopOld.is_projection());
+        assert!(!OomEffect::InsertRetry.is_projection());
+        assert!(!OomEffect::StartRetry.is_projection());
+    }
+
+    #[test]
+    fn next_oom_effect_stops_after_the_decision_projection_for_a_failed_at_max_outcome() {
+        // `is_retry = false`: there is no retry to insert/start/project, so draining a
+        // `FailedAtMax` decision must terminate right after `ProjectDecision`, never asking
+        // for any of the three retry-only effects.
+        let flags = OomEffectFlags {
+            old_marked: true,
+            old_stopped: true,
+            old_projected: true,
+            decision_projected: true,
+            ..OomEffectFlags::default()
+        };
+        assert_eq!(next_oom_effect(false, flags), None);
+        assert!(!oom_effects_pending(false, flags));
+    }
+
+    #[test]
+    fn next_oom_effect_resumes_exactly_at_the_first_unset_flag() {
+        // A crash between inserting the retry row and starting its
+        // container leaves `retry_inserted = true` but `retry_started = false` -- draining
+        // must resume at `StartRetry`, never re-run `InsertRetry` or skip ahead.
+        let flags = OomEffectFlags {
+            old_marked: true,
+            old_stopped: true,
+            old_projected: true,
+            decision_projected: true,
+            retry_inserted: true,
+            ..OomEffectFlags::default()
+        };
+        assert_eq!(next_oom_effect(true, flags), Some(OomEffect::StartRetry));
     }
 }

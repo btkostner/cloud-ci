@@ -1,55 +1,21 @@
 //! Pure decision logic for `runner: "auto"`, per
 //! `docs/design/analytics.md`'s "Rightsizing algorithm (`runner: \"auto\"`)"
-//! section and its mermaid flowchart: per-run resource reduction, cross-run
-//! p95 aggregation, instance selection against `[min, max]` with memory
-//! headroom and a CPU ceiling, 3-night hysteresis, and OOM-retry (which
-//! bypasses both hysteresis and p95).
+//! section: per-run resource reduction, cross-run p95 aggregation,
+//! instance selection against `[min, max]` with memory headroom and a CPU
+//! ceiling, 3-night hysteresis, and OOM-retry (which bypasses both
+//! hysteresis and p95 — a real-time reaction to an observed failure, not
+//! part of the nightly batch).
 //!
-//! Lives in `cloud-ci-core`, not `cloud-ci-worker`, for the same reason as
-//! [`crate::split`]/[`crate::sampler`]/[`crate::cgroup`]: no
+//! Lives in `cloud-ci-core`, not `cloud-ci-worker`: no
 //! `worker`/Durable-Object/Workers-runtime dependency, unit-testable with
-//! plain `cargo test`, and — per the doc's own "The algorithm below is
-//! executor-agnostic; the concrete sizes are not" — shaped so a future
-//! non-default [ADR 0010](../../../docs/adr/0010-pluggable-executors.md)
-//! `Executor` can hand this module its own [`InstanceSize`] ladder without
-//! this module changing. Unlike `split`, this logic is not actually called
-//! from `cloud-ci-cli` today (rightsizing is a no-op for `external`/BYO-CI
-//! runs — analytics.md: "`runner: \"auto\"` and OOM-retry are no-ops for
-//! `external` runs (no container to size)"), but it is still domain logic
-//! with no Worker dependency, and `cloud-ci-core`'s own module doc already
-//! named this as the intended home ("The future rightsizer ... are not
-//! added here since nothing in this round of work needs them" — that round
-//! is this one).
+//! plain `cargo test`, and shaped so a future non-default
+//! [ADR 0010](../../../docs/adr/0010-pluggable-executors.md) `Executor`
+//! can hand this module its own [`InstanceSize`] ladder without this
+//! module changing. Rightsizing is a no-op for `external`/BYO-CI runs
+//! (analytics.md: "no container to size"), so this logic is not called
+//! from `cloud-ci-cli`.
 //!
-//! # Scope boundary — what this round builds and what it does not
-//!
-//! This module is **only** the pure decision math: given already-computed
-//! per-node `p95_peak_memory`/`p95_cpu_saturation`/current instance/run
-//! count (or, for the per-run reduction step, raw per-sample inputs for one
-//! run), decide what to recommend, whether hysteresis lets a resize apply,
-//! and what an OOM retry does. It deliberately does **not** build:
-//!
-//! - The Analytics Engine `cloud_ci_metrics` `sample` row ingest
-//!   (`writeDataPoint`/`writeDataPoints()` calls from the job/sample/test/
-//!   cache events analytics.md's "Analytics Engine schema" table
-//!   describes) — grepping the whole `cloud-ci-worker` crate for
-//!   `writeDataPoint`/`AnalyticsEngineDataset`/`cloud_ci_metrics` finds none
-//!   of it; there is no real per-run resource-sample data for this module's
-//!   functions to be called with yet.
-//! - The nightly cron's Analytics Engine SQL API query (analytics.md's
-//!   `quantileExactWeighted(0.95)(double1, _sample_interval)` over the AE
-//!   `sample` rows) that would produce this module's `p95_peak_memory`/
-//!   `p95_cpu_saturation` inputs from real data.
-//! - The `sizing_decisions` D1 table write, or any D1 read of a node's
-//!   prior hysteresis state.
-//!
-//! A future round wires the real AE ingest (the `writeDataPoint` calls) and
-//! the nightly cron that queries it and calls this round's pure functions
-//! — [`reduce_run`], [`quantile_u64`]/[`quantile_f64`], [`recommend_naive`],
-//! [`apply_hysteresis`], [`oom_retry`] — with real data, persisting their
-//! results to `sizing_decisions`. Until then, nothing in the running Worker
-//! calls this module — same "foundation ahead of caller" pattern as
-//! `cloud-ci-worker`'s early `repo_state`/`pull_request_state` rounds.
+//! Nothing in the running Worker calls this module yet.
 
 // ---------------------------------------------------------------------------
 // The instance-size ladder (executor-agnostic input, not a hardcoded const)
@@ -488,14 +454,16 @@ pub enum OomRetryOutcome {
 }
 
 /// Resolves an OOM-kill event for a node currently at `current_name` within
-/// `ladder` (the node's *full* executor ladder — analytics.md: "the next
-/// size up from the one it just used (per the active executor's size
-/// ladder)" — not clamped to the node's configured `max`, since an OOM is
-/// "stronger evidence than any number of p95 samples that stayed under
-/// threshold" and the doc does not say OOM-retry respects the configured
-/// max; only the ladder's own top is named as the terminal case). `None` if
-/// `current_name` is not present in `ladder` at all (a configuration error
-/// upstream of this function).
+/// `ladder` — analytics.md: "the next size up from the one it just used
+/// (per the active executor's size ladder)", "bypassing hysteresis and the
+/// p95 computation", and "If the node OOMs again at `max`, it fails with a
+/// message naming the **configured** `max`" (not the ladder's own
+/// unrestricted top). Callers MUST pass the node's `[min, max]`-bounded
+/// slice ([`ladder_range`]), not the full executor ladder, so "next size
+/// up" and "already at max" are both evaluated against that configured
+/// bound, matching the doc's explicit wording. `None` if `current_name` is
+/// not present in `ladder` at all (a configuration error upstream of this
+/// function).
 ///
 /// # Reason string
 ///

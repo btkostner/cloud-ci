@@ -181,14 +181,109 @@ files })`'s returned command string. Every per-shard container id lives in
 the same `seenIds` set a script's own `ci.container` calls use, so a shard
 id and a plain container id can never collide.
 
-This round does NOT build the real network call to `ResolveShardPlan` —
-same posture as `ContainerExecutor` (see above): `ci.shard`'s dispatch
-contract is proven against the `ShardPlanner` interface and a fake,
-in-memory implementation (`test/shard.test.ts`'s `FakeShardPlanner`), not
-the real RPC. Calling `ci.shard` with no planner configured throws
+`src/rpc-shard-planner.ts`'s `RpcShardPlanner` is a real implementation of
+that interface: it reaches `ResolveShardPlan` over an injected
+`ShardPlanFetcher` (a `CONTAINER_WORKER`-style service binding — same
+shape `ContainerExecutor`'s doc comment describes), speaking the Connect
+unary-JSON wire format `cloud-ci-worker/src/connect.rs` implements
+(camelCase proto3-JSON field names, `uint64` as a quoted string, enums as
+their proto name, the `count` oneof flattened to `{ fixed }`/`{ range }`,
+`target` as a `google.protobuf.Duration` `"<seconds>s"` string — all taken
+from `packages/cloud-ci-proto-rust/generated`'s `buffa`-generated `serde`
+impls, since `cloud-ci-proto`'s `buf.gen.yaml` only generates a Rust
+client, not a TypeScript one). It is proven only against an in-process
+fake `ShardPlanFetcher` (`test/rpc-shard-planner.test.ts`) — unit-only,
+never a real deployed `cloud-ci-worker`; no `wrangler.toml` changes were
+made anywhere in this round, so wiring a real `CONTAINER_WORKER` binding
+into a real Dynamic Worker's `env` remains separate follow-up work (same
+posture `ContainerExecutor`'s own "no real network call" scope line
+already draws for container start). `ci.shard`'s dispatch contract itself
+is still proven primarily against the `ShardPlanner` interface and the
+fake, in-memory `FakeShardPlanner` (`test/shard.test.ts`). Calling
+`ci.shard` with no planner configured throws
 `ShardPlannerNotConfiguredError` rather than silently succeeding or
 no-opping — same "fail loudly, not silently" rule
 `ContainerExecutorNotConfiguredError` already follows.
+
+**Credential**: `RpcShardPlanner`'s `token` must be a GitHub Actions OIDC
+JWT, or a scoped API token with the `ingest:write` scope and this
+`repoId` in its allowlist (`cloud-ci-worker`'s
+`verify_scoped_api_token_begin_run_credential`). The run's own `BeginRun`
+ingest token is **not** accepted — `handle_resolve_shard_plan` reuses the
+`BeginRun`-style credential check rather than the run-scoped
+post-`BeginRun` flow every other ingest call after `BeginRun` uses (see
+that handler's own doc comment for the rationale).
+
+`RpcShardPlanner` validates its inputs client-side, before ever calling
+`fetch`: `repoId` and `count` (`fixed`, or `min`/`max` with `min <= max`)
+must be in-range integers, and `count.target`'s duration string must
+parse to a finite value within `google.protobuf.Duration`'s magnitude
+limit — each throws `ShardPlanRpcError("invalid_argument", ...)`
+synchronously (for `repoId`/`baseUrl`, in the constructor) or before the
+network call (for `count`/`token`, in `resolve()`). `token` must be a
+string or a function — anything else (`undefined`, a number, ...) is
+rejected with `"token must be a string or a function"` before a function
+token is ever called. A `token` callback that throws or rejects is
+caught and rewrapped as `ShardPlanRpcError("invalid_argument", ...)`,
+with the original error preserved as the standard `Error.cause` (so a
+caller's own error-reporting tooling that walks `.cause` still sees the
+real failure and its stack, not just the rewrap) — no raw error from
+caller code escapes this class's declared error contract, including a
+callback that resolves to `undefined`/`null`/a number instead of a
+string. A credential provider's own error text is itself echoed into the
+message (capped at 200 characters by `scrub`, which cannot redact it
+since no bearer token exists yet to redact against) and attached as
+`cause` — a provider should not put a secret into its own error message
+or stack. A token callback (or a plain string `token`) that resolves to
+an empty or whitespace-only string, or one containing a control
+character, is rejected the same way (a distinct message per case, never
+echoing the token value itself) before `fetch` ever runs, rather than
+silently sending `Bearer `/`Bearer    `/a malformed header to the
+server. `baseUrl` is parsed
+with `new URL()` (not a regex): the *parsed origin* must equal the exact
+documented internal service-binding default origin
+(`"http://cloud-ci.internal"` with any number of trailing slashes — e.g.
+`".../"`, `".../"` — still parses to that exact origin, so those forms
+stay accepted), or else the URL must use `https:` with no embedded
+username or password, no path (beyond any number of bare slashes), no
+query string (including a bare trailing `"?"`, which parses to an empty
+`url.search` and is checked separately so it can't slip through as "no
+query"), no fragment, and no whitespace anywhere. A plain `http://`
+override to a non-default origin is rejected, since it would send the
+bearer credential in cleartext; userinfo in the URL is a second,
+easily-overlooked place a credential could leak, and is itself never
+echoed into a rejection message (a `https://user:pass@host` `baseUrl` is
+reported by scheme and host only — `url.origin`, or `url.protocol` for
+an opaque-origin scheme like `javascript:` where `url.origin` is itself
+the unhelpful literal string `"null"` — never by `url.href`/the raw
+input, which would write the password straight into an exception a
+caller might log); and a path, query string, or fragment is rejected
+rather than kept — `resolve()` always appends the fixed `IngestService`
+RPC path onto whatever `normalizeBaseUrl` returns, so silently dropping
+a caller's path prefix would route a path-prefixed gateway to the wrong
+endpoint with no warning (a fragment is never transmitted over HTTP at
+all, so it is rejected for the same "don't silently discard part of the
+caller's input" consistency, not a routing risk).
+The decoded response is equally strict: a missing `shards` array, a
+non-integer or out-of-`1..MAX_SHARD_COUNT` `shardCount`
+(`MAX_SHARD_COUNT = 64`, exported both from `src/rpc-shard-planner.ts`
+and re-exported from this package's root `src/index.ts`, mirroring
+`cloud-ci-core/src/split.rs`'s `MAX_SHARDS` exactly — that Rust constant
+now has its own `max_shards_is_64` pin test, next to `MAX_SHARD_COUNT`'s
+own TypeScript pin test, so a change to either copy is a conscious,
+cross-language decision), a
+`shardCount`/`shards.length` mismatch, or a malformed per-shard entry are
+all `malformed_response` rather than a silently truncated plan (a
+`{"shardCount":4}` body with no `shards` must never resolve as "4 shards,
+0 files assigned") — a bare `{}` shard entry is still valid, since the
+server omits an empty `files` vec. Every error message that might echo
+server- or `Fetcher`-supplied text is redacted of the bearer token and
+capped at 200 characters before being thrown. That redaction is a
+best-effort exact-string match, not a guarantee: a token under 8
+characters is skipped (redacting a short string risks mangling an
+unrelated word like "token" in ordinary server text), and a token
+containing characters a JSON encoder re-escapes (e.g. a literal `"` or
+`\`) can fail to match the echoed, re-serialized text even when longer.
 
 **Scope lines this round draws, precisely:**
 
@@ -197,15 +292,29 @@ no-opping — same "fail loudly, not silently" rule
   example in dynamic-pipelines.md's "### Splitting tests across shards"
   (a per-shard `postgres` sidecar restored from a migration snapshot) is
   not implemented.
-- **`reports`/merge barrier** — `ShardOptions` has no `reports` field.
+- **`reports`/merge barrier** — `ShardOptions.reports` is a typed field
+  (`ShardReportSpec[]`, matching parallelization.md's worked example:
+  `{ type, path?, merge? }`), but giving it a non-empty value throws
+  `ShardReportsNotSupportedError` rather than silently taking effect.
   dynamic-pipelines.md describes `ci.shard` as also running "the generated
-  merge step once every shard reaches a terminal state"; `ShardResult`
-  only returns the resolved shard count and each shard's raw
-  `ContainerResult`, no merged-report id. The server-side merge logic this
-  would eventually trigger already exists
-  (`packages/cloud-ci-worker/src/shard_merge.rs`, from an earlier round) —
-  wiring `ci.shard`'s `reports`/`merge` options to call it is separate,
-  not-yet-scheduled follow-up work, not a missing dependency.
+  merge step once every shard reaches a terminal state", and the
+  server-side merge barrier/native junit/lcov merge dispatch this would
+  trigger already exists (`packages/cloud-ci-worker/src/shard_merge.rs`,
+  `coordinator::mod`'s `job_group` table and `/register-shard-group`
+  handler, from an earlier round). What's missing is not SDK wiring — it's
+  a public RPC to wire to: `/register-shard-group` is an internal Durable
+  Object HTTP route (`RunCoordinatorStore::call`'s `"/register-shard-group"`
+  branch in `coordinator/mod.rs`), never a `cloud_ci.ingest.v1
+  .IngestService` procedure a service-binding `Fetcher` can reach, and
+  none of `StartJobRequest` (`shard_total` only), `CompleteShardRequest`
+  (`job_id`/`shard_index`/`conclusion`/`external_url` only), or
+  `SubmitReportRequest` carry `expected_total`/`fail_fast`/
+  `merge_on_failure` fields either. **The missing proto addition**: a
+  public `IngestService` RPC (or new `StartJobRequest` fields) a managed
+  run's `ci.shard` could call from its `split:` step to register a shard
+  group's merge configuration, authenticated the same way `ResolveShardPlan`
+  is. Until that RPC exists, `ShardOptions.reports` stays typed-but-rejected
+  rather than silently dropped.
 - **Real `--granularity test` per-test splitting** — `SplitStrategy`'s
   `"count"` value round-robins at whole-file granularity, identical to
   `"file"`. `cloud_ci_core::split` (the Rust crate `ResolveShardPlan`
@@ -565,12 +674,18 @@ Each of these is a real, named gap — not a silent omission:
 - **Real `RunCoordinator`/`cloud-ci-worker` wiring** — `ci.container`
   never reaches the real `ContainerProbe` Durable Object or
   `RunCoordinator`; it calls whatever `ContainerExecutor` is injected (see
-  above). `ci.shard` likewise never reaches the real `ResolveShardPlan` RPC
-  this round — it calls whatever `ShardPlanner` is injected (see "`ci.shard`"
-  above). The Rust `ResolveShardPlan` RPC and its `cloud-ci-worker` handler
-  DO exist as of this round (`packages/cloud-ci-worker/src/shard_plan.rs`);
-  what doesn't exist yet is the TypeScript-side network call reaching it —
-  no `wrangler.toml` changes were made anywhere in this round.
+  above). `ci.shard`'s `ShardPlanner` injection point now has a real
+  implementation, `RpcShardPlanner` (`src/rpc-shard-planner.ts`), that
+  speaks `ResolveShardPlan`'s real Connect wire format — but it is proven
+  only against an in-process fake `ShardPlanFetcher`
+  (`test/rpc-shard-planner.test.ts`), never a real deployed
+  `cloud-ci-worker`; no `wrangler.toml` changes were made anywhere in this
+  round, so there is still no real `CONTAINER_WORKER`-style binding wired
+  into any Dynamic Worker's `env` for either `ContainerExecutor` or
+  `ShardPlanner` to use. `ci.shard`'s own dispatch contract (split →
+  per-shard dispatch, duplicate-id rejection, check attachment) is still
+  proven primarily against the fake, in-memory `FakeShardPlanner`
+  (`test/shard.test.ts`).
 - **`ci.skip`, `ci.cached`, `ci.turboCache`, `ci.readFile`** — none of
   these exist on `CiContext`. `ci.limit` IS implemented this round (see
   below); `turbo.execute`'s own use of the other three missing members is
@@ -596,8 +711,76 @@ Each of these is a real, named gap — not a silent omission:
   request passthrough to the planner, replay reusing the recorded plan
   without re-dispatching containers, check attachment across every
   resolved shard, the shared container-id namespace with plain
-  `ci.container` calls, duplicate shard-id rejection, and the
-  no-planner-configured error.
+  `ci.container` calls, duplicate shard-id rejection, the
+  no-planner-configured error, and `reports`'s rejection (non-empty throws
+  `ShardReportsNotSupportedError` before the split step runs; empty/omitted
+  is a no-op).
+- `test/rpc-shard-planner.test.ts` — `RpcShardPlanner`'s real
+  `ResolveShardPlan` request/response wire shape against an in-process
+  fake `ShardPlanFetcher` (unit-only, never a real deployed
+  `cloud-ci-worker`): the exact proto3-JSON request body (camelCase names,
+  `repoId` as a quoted `uint64` string, `strategy` as its proto enum name,
+  `count` encoded as both a fixed `uint32` and a `{min,max,target}`
+  Duration-string range), decoding a success response including a bare
+  `{}` shard entry (the server omits an empty `files` vec), a function
+  token called fresh per call, Connect error body → `code`/`message`/
+  HTTP-status mapping, the non-Connect-error-body transport fallback,
+  unparsable JSON on both a 200 (`malformed_response`) and a non-2xx
+  (`transport`, carrying the HTTP status), a rejected `Fetcher.fetch()`
+  promise, strict response decoding (missing `shards`, a non-array
+  `shards`, a `shardCount`/`shards.length` mismatch — asserted against its
+  exact message, not just a `toContain` digit check — `shardCount`
+  outside `1..MAX_SHARD_COUNT` or non-integer including the `64` upper
+  bound itself, a malformed per-shard `files` field), that the bearer
+  token is redacted out of every error path that could echo server- or
+  `Fetcher`-supplied text (a thrown `Error`, a Connect error `code` and
+  `message`, `decodeResponse`'s `show()` path, the non-Connect-body
+  fallback, and a `token` supplied as a function) with the exact
+  200-character cap asserted, that a token under 8 characters that *does*
+  occur in the echoed text is left unredacted (proven with a token equal
+  to a substring of the server text, not an unrelated short token, so the
+  assertion actually exercises the length guard), client-side validation
+  rejecting a non-integer `count`, `count.min > count.max`, an
+  unrecognized `count.target` unit, and an out-of-range duration
+  (including the exact `30s`/`1h`/`315576000000s` boundary values
+  accepted and one second over rejected) — each before ever calling
+  `fetch` or the token function — a throwing and a rejecting token
+  callback both rewrapped as `invalid_argument` with no raw error
+  escaping and the original error preserved as `.cause` (except for the
+  client-side empty/whitespace-only/control-character/wrong-type token
+  checks, which assert `"cause" in err === false` since those are this
+  call's own validation failures, not a rewrap of anything), an
+  empty-string or whitespace-only token rejected before `fetch` whether
+  it comes from a callback or is given directly, a token with an
+  embedded `\n`/`\r`/`\t`/NUL/DEL control character rejected, a `token`
+  that is neither a string nor a function (bypassing its declared type
+  via a deliberate `unknown` cast — see that test's own doc comment)
+  rejected with a message naming the actual problem rather than an
+  opaque "is not a function" `TypeError`, and a token callback resolving
+  to `undefined`/`null`/a number surfacing as `ShardPlanRpcError`, never
+  a raw `TypeError` (replayed against two reviewer-supplied mutants in a
+  throwaway scratch copy — deleting the resolved-token type check, and
+  making `ShardPlanRpcError`'s `cause` unconditional — to confirm these
+  specific tests, and only these, actually fail on each; the real
+  package files were never touched), `MAX_SHARD_COUNT` pinned at `64`
+  and re-exported correctly from this package's root `index.ts`,
+  constructor-time validation of `repoId` (including a `bigint` at
+  exactly `2^64-1` accepted and `2^64` rejected), a plain `http://`
+  override, embedded userinfo (asserting the credential never appears in
+  the rejection message — including the defense-in-depth case where the
+  same `baseUrl` also contains whitespace, proven against a mutation
+  that reintroduces the leak and genuinely fails), a non-root path, a
+  query string (including a bare trailing `"?"`, which parses to an
+  empty `url.search` and so is checked separately), a fragment, an
+  opaque-origin scheme like `javascript:` reporting its scheme rather
+  than the unhelpful literal `"null"`, and whitespace (including a tab
+  and a newline, which `new URL()` silently strips rather than
+  rejecting) all rejected, and — asserted against the actual request URL
+  `ShardPlanFetcher.fetch` receives, not just a non-throwing constructor
+  call — that the documented default origin with one or two trailing
+  slashes, a trailing slash on an `https://` override, and an uppercase
+  `HTTPS://` scheme are all still accepted and normalize to the same
+  request.
 - `test/group.test.ts` — `ci.group`'s single-container batch dispatch
   against a fake `WorkflowStepLike`/`ContainerExecutor` (same conventions
   as `container.test.ts`): one executor call covers every id in `ids`,

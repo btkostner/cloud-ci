@@ -310,4 +310,41 @@ mod tests {
             ))
         );
     }
+
+    #[test]
+    fn auto_sizing_with_inverted_range_is_rejected_as_a_split_error() {
+        // `handle_resolve_shard_plan` maps any `Err` here straight to
+        // `Code::InvalidArgument` via `Display` -- this proves both that the proto
+        // `ShardCountRange { min, max }` reaches `cloud_ci_core::split::SplitError`
+        // unmodified, and that the resulting message is Connect-ready, not a raw panic.
+        let count = ProtoShardCountSpec {
+            spec: Some(ProtoShardCountSpecOneof::Range(Box::new(ShardCountRange {
+                min: 20,
+                max: 10,
+                target: buffa_types::google::protobuf::Duration {
+                    seconds: 5,
+                    nanos: 0,
+                    ..Default::default()
+                }
+                .into(),
+                ..Default::default()
+            }))),
+            ..Default::default()
+        };
+        let result = resolve_plan(
+            &req(SplitStrategy::SPLIT_STRATEGY_TIMING, count, &["a.spec.ts"]),
+            &HashMap::new(),
+        );
+        assert_eq!(
+            result,
+            Err(ShardPlanError::Split(split::SplitError::InvertedRange {
+                min: 20,
+                max: 10
+            }))
+        );
+        assert_eq!(
+            result.err().map(|e| e.to_string()).unwrap_or_default(),
+            "shard-count min (20) must not exceed max (10)"
+        );
+    }
 }

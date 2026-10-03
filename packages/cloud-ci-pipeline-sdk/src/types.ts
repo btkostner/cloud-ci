@@ -206,12 +206,37 @@ export interface ShardRunArgs {
   readonly files: readonly string[];
 }
 
+/** One entry of `ci.shard`'s `reports` option — parallelization.md's
+ * worked example: `reports: [{ type: "playwright-blob", path: "blob-report/",
+ * merge: "html" }]`. `type` selects the report kind
+ * `cloud-ci-worker/src/shard_merge.rs`'s `mergeable_kind` dispatches on
+ * (`"junit"`/`"lcov"` merge natively; anything else, including
+ * `"playwright-blob"`/`"vitest-blob"`, is logged and skipped server-side —
+ * see that module's docs). `path` and `merge` are carried through
+ * unparsed; this SDK does not interpret them. */
+export interface ShardReportSpec {
+  readonly type: string;
+  readonly path?: string;
+  readonly merge?: string;
+}
+
 /** Options accepted by `ci.shard(id, opts)`. This round implements
  * `split`/`count`/`files`/`run`/`check` — the design doc's full shape also
  * documents `snapshot`, `sidecars`, and `reports`/merge-barrier options
  * (dynamic-pipelines.md's "### Splitting tests across shards" worked
- * example), none of which this round implements; see README's scope
- * boundary list for why. */
+ * example); `reports` is a typed field here (`ShardReportSpec[]`), but
+ * giving it a non-empty value throws `ShardReportsNotSupportedError` — the
+ * server-side merge barrier (`cloud-ci-worker/src/shard_merge.rs`,
+ * `coordinator::mod`'s `job_group`/`register-shard-group`) has no public
+ * `IngestService` RPC `ci.shard` can call to register a shard group's
+ * merge configuration (`expected_total`/`fail_fast`/`merge_on_failure`):
+ * `/register-shard-group` is an internal Durable Object HTTP route, not a
+ * `cloud_ci.ingest.v1.IngestService` procedure, and `StartJob`/
+ * `CompleteShard`/`SubmitReport` carry no such fields either — see
+ * parallelization.md's "Implementation status" merge paragraph and
+ * README's scope boundary list for exactly what proto addition is
+ * missing. `snapshot`/`sidecars` remain entirely absent, same as
+ * `ContainerOptions`'s own scope boundary. */
 export interface ShardOptions {
   readonly split: SplitStrategy;
   readonly count: ShardCountOption;
@@ -228,6 +253,11 @@ export interface ShardOptions {
    * already uses, since each shard is dispatched as one `ci.container`
    * call under the hood. */
   readonly check?: Check | null;
+  /** Native (`junit`/`lcov`) and framework-blob report merge spec —
+   * parallelization.md's "### Shard groups / merge barrier". See
+   * `ShardReportSpec`'s doc comment for why a non-empty value throws
+   * `ShardReportsNotSupportedError` rather than silently taking effect. */
+  readonly reports?: readonly ShardReportSpec[];
 }
 
 /** Result of one finished `ci.shard` call: the resolved shard count and
@@ -269,16 +299,45 @@ export interface ShardPlan {
  * Deterministic assignment, end to end" goal: "the same binary and the
  * same split algorithm ... used in both places, so a BYO CI matrix and a
  * cloud-ci-managed shard group produce byte-identical assignments for the
- * same inputs." This round does NOT build the real network call to that
- * RPC (see README's scope boundary list, same posture as
- * `ContainerExecutor`): `ci.shard`'s plan-resolution contract is proven
- * against this interface and a fake in-memory implementation instead. A
- * future round supplies a real `ShardPlanner` that reaches
- * `ResolveShardPlan` over the same `CONTAINER_WORKER`-style service
- * binding `ContainerExecutor`'s own doc comment describes.
+ * same inputs." `ci.shard`'s dispatch logic is proven against this
+ * interface and a fake in-memory implementation
+ * (`test/shard.test.ts`'s `FakeShardPlanner`); `RpcShardPlanner`
+ * (`src/rpc-shard-planner.ts`) is a real implementation that reaches
+ * `ResolveShardPlan` over an injected `ShardPlanFetcher` — the same
+ * `CONTAINER_WORKER`-style service binding `ContainerExecutor`'s own doc
+ * comment describes — proven only against an in-process fake `Fetcher`
+ * (`test/rpc-shard-planner.test.ts`), never a real deployed
+ * `cloud-ci-worker`.
  */
 export interface ShardPlanner {
   resolve(request: ShardPlanRequest): Promise<ShardPlan>;
+}
+
+/** Minimal shape `RpcShardPlanner` needs from a real Workers service
+ * binding (`Fetcher` in `@cloudflare/workers-types`). Typed structurally
+ * here — matching `WorkflowStepLike`'s own convention above — so this
+ * package does not have to depend on a specific `workers-types` version at
+ * the call site, only in its own devDependency for typechecking this
+ * file. A real `Fetcher.fetch` and a real `Response` both satisfy this
+ * shape as-is. */
+export interface ShardPlanFetcher {
+  fetch(url: string, init: ShardPlanFetchInit): Promise<ShardPlanFetchResponse>;
+}
+
+/** `RequestInit` subset `RpcShardPlanner` sends — always a `POST` with a
+ * JSON body, per `cloud-ci-worker/src/connect.rs`'s `negotiate()` (unary
+ * Connect RPC, no streaming). */
+export interface ShardPlanFetchInit {
+  readonly method: "POST";
+  readonly headers: Readonly<Record<string, string>>;
+  readonly body: string;
+}
+
+/** `Response` subset `RpcShardPlanner` reads. */
+export interface ShardPlanFetchResponse {
+  readonly ok: boolean;
+  readonly status: number;
+  json(): Promise<unknown>;
 }
 
 /** Options accepted by `ci.group(ids, opts)`. The design doc's only text

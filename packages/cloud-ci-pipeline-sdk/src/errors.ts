@@ -88,6 +88,49 @@ export class ShardPlannerNotConfiguredError extends Error {
   }
 }
 
+/** Thrown when `ResolveShardPlan` cannot produce a usable plan: transport
+ * failure, a Connect error body (`code`/`message`, per
+ * `cloud-ci-worker/src/connect.rs`'s `ErrorBody`), or a malformed success
+ * body. `code` is the Connect code string (`"unauthenticated"`,
+ * `"invalid_argument"`, ...) or `"transport"`/`"malformed_response"` for
+ * failures that never produced a Connect error body. There is deliberately
+ * no local fallback plan: re-implementing `cloud_ci_core::split` in
+ * TypeScript would break the byte-identical-assignment guarantee.
+ *
+ * `cause`, when given, is the original error this one was rewrapped from
+ * (e.g. a caller's `token` callback throwing) — set via the standard
+ * `Error.cause` mechanism (`super(message, { cause })`) so a caller's
+ * `console.error`/error-reporting tooling that already walks `.cause`
+ * still sees the original stack, rather than that error being silently
+ * dropped by the rewrap. */
+export class ShardPlanRpcError extends Error {
+  readonly code: string;
+  readonly httpStatus: number | undefined;
+  constructor(code: string, message: string, httpStatus?: number, cause?: unknown) {
+    super(
+      `ResolveShardPlan failed (${code}): ${message}`,
+      cause === undefined ? undefined : { cause },
+    );
+    this.name = "ShardPlanRpcError";
+    this.code = code;
+    this.httpStatus = httpStatus;
+  }
+}
+
+/** Thrown when `ci.shard` is given a non-empty `reports` option. The
+ * public ingest proto has no RPC for registering a shard group's
+ * merge/report configuration (see README), so the option cannot take
+ * effect; failing loudly beats silently dropping the merge barrier. */
+export class ShardReportsNotSupportedError extends Error {
+  constructor(id: string) {
+    super(
+      `ci.shard("${id}", ...) was given \`reports\`, but no public RPC can register ` +
+        `a shard group's merge configuration yet — see README's "ci.shard reports/merge" section`,
+    );
+    this.name = "ShardReportsNotSupportedError";
+  }
+}
+
 /** Thrown when a script calls `ci.group` with an empty `ids` array.
  * Grouping zero nodes into one container dispatches nothing and names no
  * node — same "fail loudly on a meaningless call" posture as

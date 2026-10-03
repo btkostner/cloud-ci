@@ -24,12 +24,15 @@ export {
   EmptyGroupError,
   InvalidConcurrencyError,
   ShardPlannerNotConfiguredError,
+  ShardPlanRpcError,
+  ShardReportsNotSupportedError,
   UnknownGraphDependencyError,
   UnknownGraphNodeError,
 } from "./errors.js";
 export type { Graph, GraphNode } from "./graph.js";
 export { graph } from "./graph.js";
 export { limit } from "./limit.js";
+export { MAX_SHARD_COUNT, RpcShardPlanner } from "./rpc-shard-planner.js";
 export type {
   Check,
   CheckConclusion,
@@ -48,8 +51,12 @@ export type {
   ShardCountRange,
   ShardOptions,
   ShardPlan,
+  ShardPlanFetcher,
+  ShardPlanFetchInit,
+  ShardPlanFetchResponse,
   ShardPlanner,
   ShardPlanRequest,
+  ShardReportSpec,
   ShardResult,
   ShardRunArgs,
   SplitStrategy,

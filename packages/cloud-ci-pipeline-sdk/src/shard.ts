@@ -1,5 +1,9 @@
 import { runContainer } from "./container.js";
-import { DuplicateShardIdError, ShardPlannerNotConfiguredError } from "./errors.js";
+import {
+  DuplicateShardIdError,
+  ShardPlannerNotConfiguredError,
+  ShardReportsNotSupportedError,
+} from "./errors.js";
 import type {
   Check,
   ContainerExecutor,
@@ -18,8 +22,10 @@ import type {
  * shard ..." — this function does exactly that, in two durable phases:
  *
  * 1. `step.do("split:" + id, ...)` resolves the plan via the injected
- *    `ShardPlanner` (`cloud_ci_core::split`'s real algorithm, reached over
- *    a real RPC in a future round — see `ShardPlanner`'s doc comment).
+ *    `ShardPlanner` (`cloud_ci_core::split`'s real algorithm; the caller
+ *    injects either the test-only `FakeShardPlanner` or the real
+ *    `RpcShardPlanner`, which reaches `ResolveShardPlan` over an injected
+ *    `ShardPlanFetcher` — see `ShardPlanner`'s doc comment).
  *    Wrapping this in `step.do` matches parallelization.md's "###
  *    Deterministic assignment, end to end" step 2 exactly: "For managed
  *    runs, `RunCoordinator` computes the assignment once ... when
@@ -46,6 +52,12 @@ import type {
  * nothing in the design doc requires shard containers to start one at a
  * time, and dispatching concurrently is what lets several shards actually
  * run in parallel.
+ *
+ * `opts.reports` is rejected with `ShardReportsNotSupportedError` rather
+ * than silently ignored: there is no public RPC this function could call
+ * to wire it to the real server-side merge barrier yet — see
+ * `ShardOptions.reports`'s doc comment (`types.ts`) for exactly what proto
+ * addition is missing.
  */
 export async function runShard(
   deps: {
@@ -61,6 +73,11 @@ export async function runShard(
   if (deps.seenShardIds.has(id)) {
     throw new DuplicateShardIdError(id);
   }
+
+  if (opts.reports !== undefined && opts.reports.length > 0) {
+    throw new ShardReportsNotSupportedError(id);
+  }
+
   deps.seenShardIds.add(id);
 
   const check: Check | null = opts.check ?? null;

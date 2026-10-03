@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { CheckRegistry } from "../src/check.js";
-import { DuplicateShardIdError, ShardPlannerNotConfiguredError } from "../src/errors.js";
+import {
+  DuplicateShardIdError,
+  ShardPlannerNotConfiguredError,
+  ShardReportsNotSupportedError,
+} from "../src/errors.js";
 import { runShard } from "../src/shard.js";
 import type {
   ContainerExecutor,
@@ -238,5 +242,68 @@ describe("ci.shard dispatch", () => {
         },
       ),
     ).rejects.toThrow(ShardPlannerNotConfiguredError);
+  });
+
+  it("throws ShardReportsNotSupportedError when a non-empty reports option is given", async () => {
+    const step = new FakeWorkflowStep();
+    const executor = new FakeContainerExecutor();
+    const planner = new FakeShardPlanner();
+
+    await expect(
+      runShard({ step, executor, planner, seenIds: new Set(), seenShardIds: new Set() }, "e2e", {
+        split: "file",
+        count: 1,
+        files: ["a.spec.ts"],
+        run: ({ files }) => `test ${files.join(" ")}`,
+        reports: [{ type: "junit" }],
+      }),
+    ).rejects.toThrow(ShardReportsNotSupportedError);
+    // Never reached the planner — rejected before the split step runs.
+    expect(planner.callCount).toBe(0);
+  });
+
+  it("accepts an empty or omitted reports option (no-op, not rejected)", async () => {
+    const step = new FakeWorkflowStep();
+    const executor = new FakeContainerExecutor();
+    const planner = new FakeShardPlanner();
+
+    await expect(
+      runShard({ step, executor, planner, seenIds: new Set(), seenShardIds: new Set() }, "e2e", {
+        split: "file",
+        count: 1,
+        files: ["a.spec.ts"],
+        run: ({ files }) => `test ${files.join(" ")}`,
+        reports: [],
+      }),
+    ).resolves.toBeDefined();
+  });
+
+  it("does not register the shard id on a reports rejection, so a retry without reports succeeds", async () => {
+    const step = new FakeWorkflowStep();
+    const executor = new FakeContainerExecutor();
+    const planner = new FakeShardPlanner();
+    const seenShardIds = new Set<string>();
+
+    await expect(
+      runShard({ step, executor, planner, seenIds: new Set(), seenShardIds }, "e2e", {
+        split: "file",
+        count: 1,
+        files: ["a.spec.ts"],
+        run: ({ files }) => `test ${files.join(" ")}`,
+        reports: [{ type: "junit" }],
+      }),
+    ).rejects.toThrow(ShardReportsNotSupportedError);
+    expect(seenShardIds.has("e2e")).toBe(false);
+
+    // A caller that catches the rejection and retries the same id without
+    // `reports` must succeed, not hit `DuplicateShardIdError`.
+    await expect(
+      runShard({ step, executor, planner, seenIds: new Set(), seenShardIds }, "e2e", {
+        split: "file",
+        count: 1,
+        files: ["a.spec.ts"],
+        run: ({ files }) => `test ${files.join(" ")}`,
+      }),
+    ).resolves.toBeDefined();
   });
 });

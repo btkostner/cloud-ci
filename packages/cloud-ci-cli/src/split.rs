@@ -359,15 +359,67 @@ mod tests {
         let body = serde_json::to_vec(response).unwrap_or_default();
         std::thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 8192];
-                let _ = stream.read(&mut buf);
-                let header = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                    body.len()
-                );
-                let _ = stream.write_all(header.as_bytes());
-                let _ = stream.write_all(&body);
-                let _ = stream.flush();
+                // Read the full request -- headers plus its `Content-Length`
+                // body -- before responding. A single, unlooped `read()`
+                // (the prior version of this fixture) can return only the
+                // headers under scheduling load: directly observed a
+                // 202-byte read with no JSON body present, because the
+                // client's header and body writes landed in separate TCP
+                // segments. Responding and dropping the socket right after
+                // that short read, while the client is still writing the
+                // rest of the request, leaves unread data sitting in the
+                // kernel receive buffer at close time; the OS then answers
+                // with a reset instead of a clean FIN, which surfaces to the
+                // client as a transport error (observed on macOS: `io:
+                // Invalid argument (os error 22)`) -- intermittently, only
+                // under load, never in isolation. Draining the declared
+                // `Content-Length` before writing the response and closing
+                // makes this deterministic regardless of segmentation.
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let header_end = loop {
+                    let Ok(n) = stream.read(&mut chunk) else {
+                        break None;
+                    };
+                    if n == 0 {
+                        break None;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break Some(pos + 4);
+                    }
+                };
+
+                if let Some(header_end) = header_end {
+                    let content_length: usize = String::from_utf8_lossy(&buf[..header_end])
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().to_string())
+                        })
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+
+                    let mut received = buf.len() - header_end;
+                    while received < content_length {
+                        let Ok(n) = stream.read(&mut chunk) else {
+                            break;
+                        };
+                        if n == 0 {
+                            break;
+                        }
+                        received += n;
+                    }
+
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes());
+                    let _ = stream.write_all(&body);
+                    let _ = stream.flush();
+                }
             }
         });
         Ok(format!("http://{addr}"))
