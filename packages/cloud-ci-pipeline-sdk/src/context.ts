@@ -12,6 +12,7 @@ import type {
   ContainerResult,
   GroupOptions,
   GroupResult,
+  ShardGroupRegistrar,
   ShardOptions,
   ShardPlanner,
   ShardResult,
@@ -26,6 +27,7 @@ export interface CiContextOptions {
   readonly step: WorkflowStepLike;
   readonly executor: ContainerExecutor | undefined;
   readonly planner: ShardPlanner | undefined;
+  readonly registrar: ShardGroupRegistrar | undefined;
 }
 
 /**
@@ -45,6 +47,7 @@ export class CiContext {
   private readonly step: WorkflowStepLike;
   private readonly executor: ContainerExecutor | undefined;
   private readonly planner: ShardPlanner | undefined;
+  private readonly registrar: ShardGroupRegistrar | undefined;
   private readonly containerIds = new Set<string>();
   private readonly shardIds = new Set<string>();
   readonly checks = new CheckRegistry();
@@ -57,6 +60,7 @@ export class CiContext {
     this.step = opts.step;
     this.executor = opts.executor;
     this.planner = opts.planner;
+    this.registrar = opts.registrar;
   }
 
   check(name: string, opts: CheckOptions): Check {
@@ -77,6 +81,7 @@ export class CiContext {
         step: this.step,
         executor: this.executor,
         planner: this.planner,
+        registrar: this.registrar,
         seenIds: this.containerIds,
         seenShardIds: this.shardIds,
       },

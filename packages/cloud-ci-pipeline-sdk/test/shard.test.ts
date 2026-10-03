@@ -2,14 +2,17 @@ import { describe, expect, it } from "vitest";
 import { CheckRegistry } from "../src/check.js";
 import {
   DuplicateShardIdError,
+  ShardGroupRegistrarNotConfiguredError,
   ShardPlannerNotConfiguredError,
-  ShardReportsNotSupportedError,
 } from "../src/errors.js";
 import { runShard } from "../src/shard.js";
 import type {
   ContainerExecutor,
   ContainerResult,
   ContainerStartRequest,
+  ShardGroupRegisterRequest,
+  ShardGroupRegisterResult,
+  ShardGroupRegistrar,
   ShardPlan,
   ShardPlanner,
   ShardPlanRequest,
@@ -69,6 +72,21 @@ class FakeShardPlanner implements ShardPlanner {
   }
 }
 
+/** Fake `ShardGroupRegistrar` — explicitly NOT the real `RegisterShardGroup`
+ * RPC (see `ShardGroupRegistrar`'s doc comment in `types.ts`). Records
+ * every call so tests can assert what `runShard` sent, same role
+ * `FakeShardPlanner` plays for `ShardPlanner`. */
+class FakeShardGroupRegistrar implements ShardGroupRegistrar {
+  callCount = 0;
+  readonly requests: ShardGroupRegisterRequest[] = [];
+
+  async register(request: ShardGroupRegisterRequest): Promise<ShardGroupRegisterResult> {
+    this.callCount += 1;
+    this.requests.push(request);
+    return { jobName: request.jobName };
+  }
+}
+
 describe("ci.shard dispatch", () => {
   it("resolves the plan and dispatches one ci.container per shard", async () => {
     const step = new FakeWorkflowStep();
@@ -76,7 +94,14 @@ describe("ci.shard dispatch", () => {
     const planner = new FakeShardPlanner();
 
     const result = await runShard(
-      { step, executor, planner, seenIds: new Set(), seenShardIds: new Set() },
+      {
+        step,
+        executor,
+        planner,
+        registrar: undefined,
+        seenIds: new Set(),
+        seenShardIds: new Set(),
+      },
       "e2e",
       {
         split: "file",
@@ -101,7 +126,14 @@ describe("ci.shard dispatch", () => {
     const planner = new FakeShardPlanner();
 
     await runShard(
-      { step, executor, planner, seenIds: new Set(), seenShardIds: new Set() },
+      {
+        step,
+        executor,
+        planner,
+        registrar: undefined,
+        seenIds: new Set(),
+        seenShardIds: new Set(),
+      },
       "e2e",
       {
         split: "timing",
@@ -131,14 +163,28 @@ describe("ci.shard dispatch", () => {
     };
 
     const first = await runShard(
-      { step, executor, planner, seenIds: new Set(), seenShardIds: new Set() },
+      {
+        step,
+        executor,
+        planner,
+        registrar: undefined,
+        seenIds: new Set(),
+        seenShardIds: new Set(),
+      },
       "e2e",
       opts,
     );
     // Simulated isolate-recycle replay: fresh seenIds/seenShardIds (fresh
     // CiContext), but the same persisted `step`.
     const second = await runShard(
-      { step, executor, planner, seenIds: new Set(), seenShardIds: new Set() },
+      {
+        step,
+        executor,
+        planner,
+        registrar: undefined,
+        seenIds: new Set(),
+        seenShardIds: new Set(),
+      },
       "e2e",
       opts,
     );
@@ -156,7 +202,14 @@ describe("ci.shard dispatch", () => {
     const check = registry.create("ci/e2e", { required: true });
 
     await runShard(
-      { step, executor, planner, seenIds: new Set(), seenShardIds: new Set() },
+      {
+        step,
+        executor,
+        planner,
+        registrar: undefined,
+        seenIds: new Set(),
+        seenShardIds: new Set(),
+      },
       "e2e",
       {
         split: "file",
@@ -178,7 +231,14 @@ describe("ci.shard dispatch", () => {
     const check = registry.create("ci/e2e", { required: true });
 
     await runShard(
-      { step, executor, planner, seenIds: new Set(), seenShardIds: new Set() },
+      {
+        step,
+        executor,
+        planner,
+        registrar: undefined,
+        seenIds: new Set(),
+        seenShardIds: new Set(),
+      },
       "e2e",
       {
         split: "file",
@@ -204,9 +264,17 @@ describe("ci.shard dispatch", () => {
       run: ({ files }: { files: readonly string[] }) => `test ${files.join(" ")}`,
     };
 
-    await runShard({ step, executor, planner, seenIds: new Set(), seenShardIds }, "e2e", opts);
+    await runShard(
+      { step, executor, planner, registrar: undefined, seenIds: new Set(), seenShardIds },
+      "e2e",
+      opts,
+    );
     await expect(
-      runShard({ step, executor, planner, seenIds: new Set(), seenShardIds }, "e2e", opts),
+      runShard(
+        { step, executor, planner, registrar: undefined, seenIds: new Set(), seenShardIds },
+        "e2e",
+        opts,
+      ),
     ).rejects.toThrow(DuplicateShardIdError);
   });
 
@@ -217,12 +285,16 @@ describe("ci.shard dispatch", () => {
     const seenIds = new Set<string>(["e2e#1"]);
 
     await expect(
-      runShard({ step, executor, planner, seenIds, seenShardIds: new Set() }, "e2e", {
-        split: "file",
-        count: 1,
-        files: ["a.spec.ts"],
-        run: ({ files }) => `test ${files.join(" ")}`,
-      }),
+      runShard(
+        { step, executor, planner, registrar: undefined, seenIds, seenShardIds: new Set() },
+        "e2e",
+        {
+          split: "file",
+          count: 1,
+          files: ["a.spec.ts"],
+          run: ({ files }) => `test ${files.join(" ")}`,
+        },
+      ),
     ).rejects.toThrow('container id "e2e#1" was already used in this run');
   });
 
@@ -232,7 +304,14 @@ describe("ci.shard dispatch", () => {
 
     await expect(
       runShard(
-        { step, executor, planner: undefined, seenIds: new Set(), seenShardIds: new Set() },
+        {
+          step,
+          executor,
+          planner: undefined,
+          registrar: undefined,
+          seenIds: new Set(),
+          seenShardIds: new Set(),
+        },
         "e2e",
         {
           split: "file",
@@ -244,38 +323,104 @@ describe("ci.shard dispatch", () => {
     ).rejects.toThrow(ShardPlannerNotConfiguredError);
   });
 
-  it("throws ShardReportsNotSupportedError when a non-empty reports option is given", async () => {
+  it("throws ShardGroupRegistrarNotConfiguredError when a non-empty reports option is given with no registrar", async () => {
     const step = new FakeWorkflowStep();
     const executor = new FakeContainerExecutor();
     const planner = new FakeShardPlanner();
 
     await expect(
-      runShard({ step, executor, planner, seenIds: new Set(), seenShardIds: new Set() }, "e2e", {
+      runShard(
+        {
+          step,
+          executor,
+          planner,
+          registrar: undefined,
+          seenIds: new Set(),
+          seenShardIds: new Set(),
+        },
+        "e2e",
+        {
+          split: "file",
+          count: 1,
+          files: ["a.spec.ts"],
+          run: ({ files }) => `test ${files.join(" ")}`,
+          reports: [{ type: "junit" }],
+        },
+      ),
+    ).rejects.toThrow(ShardGroupRegistrarNotConfiguredError);
+    // Never reached the planner — rejected before the split step runs.
+    expect(planner.callCount).toBe(0);
+  });
+
+  it("registers the shard group via the injected registrar when reports is non-empty", async () => {
+    const step = new FakeWorkflowStep();
+    const executor = new FakeContainerExecutor();
+    const planner = new FakeShardPlanner();
+    const registrar = new FakeShardGroupRegistrar();
+
+    await runShard(
+      { step, executor, planner, registrar, seenIds: new Set(), seenShardIds: new Set() },
+      "e2e",
+      {
+        split: "file",
+        count: 2,
+        files: ["a.spec.ts", "b.spec.ts"],
+        run: ({ files }) => `test ${files.join(" ")}`,
+        failFast: true,
+        reports: [{ type: "junit" }],
+      },
+    );
+
+    expect(registrar.callCount).toBe(1);
+    expect(registrar.requests[0]).toEqual({
+      jobName: "e2e",
+      expectedTotal: 2,
+      failFast: true,
+      mergeOnFailure: "if_any_passed",
+    });
+  });
+
+  it("defaults failFast to false when registering a shard group", async () => {
+    const step = new FakeWorkflowStep();
+    const executor = new FakeContainerExecutor();
+    const planner = new FakeShardPlanner();
+    const registrar = new FakeShardGroupRegistrar();
+
+    await runShard(
+      { step, executor, planner, registrar, seenIds: new Set(), seenShardIds: new Set() },
+      "e2e",
+      {
         split: "file",
         count: 1,
         files: ["a.spec.ts"],
         run: ({ files }) => `test ${files.join(" ")}`,
         reports: [{ type: "junit" }],
-      }),
-    ).rejects.toThrow(ShardReportsNotSupportedError);
-    // Never reached the planner — rejected before the split step runs.
-    expect(planner.callCount).toBe(0);
+      },
+    );
+
+    expect(registrar.requests[0]?.failFast).toBe(false);
   });
 
-  it("accepts an empty or omitted reports option (no-op, not rejected)", async () => {
+  it("accepts an empty or omitted reports option without registering anything (no-op, not rejected)", async () => {
     const step = new FakeWorkflowStep();
     const executor = new FakeContainerExecutor();
     const planner = new FakeShardPlanner();
+    const registrar = new FakeShardGroupRegistrar();
 
     await expect(
-      runShard({ step, executor, planner, seenIds: new Set(), seenShardIds: new Set() }, "e2e", {
-        split: "file",
-        count: 1,
-        files: ["a.spec.ts"],
-        run: ({ files }) => `test ${files.join(" ")}`,
-        reports: [],
-      }),
+      runShard(
+        { step, executor, planner, registrar, seenIds: new Set(), seenShardIds: new Set() },
+        "e2e",
+        {
+          split: "file",
+          count: 1,
+          files: ["a.spec.ts"],
+          run: ({ files }) => `test ${files.join(" ")}`,
+          reports: [],
+        },
+      ),
     ).resolves.toBeDefined();
+    expect(registrar.callCount).toBe(0);
   });
 
   it("does not register the shard id on a reports rejection, so a retry without reports succeeds", async () => {
@@ -285,25 +430,33 @@ describe("ci.shard dispatch", () => {
     const seenShardIds = new Set<string>();
 
     await expect(
-      runShard({ step, executor, planner, seenIds: new Set(), seenShardIds }, "e2e", {
-        split: "file",
-        count: 1,
-        files: ["a.spec.ts"],
-        run: ({ files }) => `test ${files.join(" ")}`,
-        reports: [{ type: "junit" }],
-      }),
-    ).rejects.toThrow(ShardReportsNotSupportedError);
+      runShard(
+        { step, executor, planner, registrar: undefined, seenIds: new Set(), seenShardIds },
+        "e2e",
+        {
+          split: "file",
+          count: 1,
+          files: ["a.spec.ts"],
+          run: ({ files }) => `test ${files.join(" ")}`,
+          reports: [{ type: "junit" }],
+        },
+      ),
+    ).rejects.toThrow(ShardGroupRegistrarNotConfiguredError);
     expect(seenShardIds.has("e2e")).toBe(false);
 
     // A caller that catches the rejection and retries the same id without
     // `reports` must succeed, not hit `DuplicateShardIdError`.
     await expect(
-      runShard({ step, executor, planner, seenIds: new Set(), seenShardIds }, "e2e", {
-        split: "file",
-        count: 1,
-        files: ["a.spec.ts"],
-        run: ({ files }) => `test ${files.join(" ")}`,
-      }),
+      runShard(
+        { step, executor, planner, registrar: undefined, seenIds: new Set(), seenShardIds },
+        "e2e",
+        {
+          split: "file",
+          count: 1,
+          files: ["a.spec.ts"],
+          run: ({ files }) => `test ${files.join(" ")}`,
+        },
+      ),
     ).resolves.toBeDefined();
   });
 });

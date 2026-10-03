@@ -185,12 +185,16 @@ describe("ci.group dispatch", () => {
     const seenIds = new Set<string>();
     const seenShardIds = new Set<string>();
 
-    await runShard({ step, executor, planner, seenIds, seenShardIds }, "e2e", {
-      split: "count",
-      count: 2,
-      files: ["a.spec.ts", "b.spec.ts"],
-      run: () => "echo hi",
-    });
+    await runShard(
+      { step, executor, planner, registrar: undefined, seenIds, seenShardIds },
+      "e2e",
+      {
+        split: "count",
+        count: 2,
+        files: ["a.spec.ts", "b.spec.ts"],
+        run: () => "echo hi",
+      },
+    );
 
     // `runShard` dispatches containers with ids `` `${id}#${shardIndex}` ``,
     // i.e. "e2e#1" and "e2e#2" — collide a group with one of those exact ids.

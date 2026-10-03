@@ -53,6 +53,7 @@ function makeCi(executor: ContainerExecutor): CiContext {
     step: new FakeWorkflowStep(),
     executor,
     planner: undefined,
+    registrar: undefined,
   });
 }
 

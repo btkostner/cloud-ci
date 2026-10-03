@@ -23,15 +23,17 @@ export {
   DuplicateShardIdError,
   EmptyGroupError,
   InvalidConcurrencyError,
+  ShardGroupRegisterRpcError,
+  ShardGroupRegistrarNotConfiguredError,
   ShardPlannerNotConfiguredError,
   ShardPlanRpcError,
-  ShardReportsNotSupportedError,
   UnknownGraphDependencyError,
   UnknownGraphNodeError,
 } from "./errors.js";
 export type { Graph, GraphNode } from "./graph.js";
 export { graph } from "./graph.js";
 export { limit } from "./limit.js";
+export { RpcShardGroupRegistrar } from "./rpc-shard-group-registrar.js";
 export { MAX_SHARD_COUNT, RpcShardPlanner } from "./rpc-shard-planner.js";
 export type {
   Check,
@@ -49,6 +51,9 @@ export type {
   PipelineContext,
   ShardCountOption,
   ShardCountRange,
+  ShardGroupRegisterRequest,
+  ShardGroupRegisterResult,
+  ShardGroupRegistrar,
   ShardOptions,
   ShardPlan,
   ShardPlanFetcher,

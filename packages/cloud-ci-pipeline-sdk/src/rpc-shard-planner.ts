@@ -1,3 +1,11 @@
+import {
+  assertUint,
+  decodeConnectError,
+  normalizeBaseUrl,
+  resolveBearerToken,
+  scrub,
+  show,
+} from "./connect-rpc-support.js";
 import { ShardPlanRpcError } from "./errors.js";
 import type {
   ShardCountOption,
@@ -76,14 +84,14 @@ export class RpcShardPlanner implements ShardPlanner {
       readonly baseUrl?: string;
     },
   ) {
-    this.baseUrl = normalizeBaseUrl(deps.baseUrl);
+    this.baseUrl = normalizeBaseUrl(deps.baseUrl, DEFAULT_BASE_URL, invalid);
     const repoId = deps.repoId;
     if (typeof repoId === "bigint") {
       if (repoId < 0n || repoId > 2n ** 64n - 1n) {
         throw invalid(`repoId must be in 0..2^64-1, got ${String(repoId)}`);
       }
     } else {
-      assertUint("repoId", repoId, Number.MAX_SAFE_INTEGER);
+      assertUint("repoId", repoId, Number.MAX_SAFE_INTEGER, invalid);
     }
   }
 
@@ -99,54 +107,7 @@ export class RpcShardPlanner implements ShardPlanner {
       count: encodeCount(request.count),
     });
 
-    // Narrowed through `unknown` at every step: the declared type promises
-    // `string | () => string | Promise<string>`, but this is caller
-    // supplied data/code and untyped JS (or a bug) can hand over anything.
-    const tokenSource: unknown = this.deps.token;
-    let resolvedToken: unknown;
-    if (typeof tokenSource === "string") {
-      resolvedToken = tokenSource;
-    } else if (typeof tokenSource === "function") {
-      try {
-        resolvedToken = await tokenSource();
-      } catch (err) {
-        // No raw error escapes this class's declared `ShardPlanRpcError`
-        // contract — a throwing or rejecting token callback surfaces the
-        // same way every other client-side validation failure does. The
-        // original error is preserved as `cause` so a caller's own
-        // error-reporting tooling (which typically walks `.cause`) still
-        // sees the token callback's real stack, not just this rewrap's.
-        throw invalid(
-          scrub(`token callback failed: ${err instanceof Error ? err.message : String(err)}`, ""),
-          err,
-        );
-      }
-    } else {
-      throw invalid(`token must be a string or a function, got ${typeof tokenSource}`);
-    }
-    // Sending `Bearer undefined`, `Bearer ` or a header with embedded
-    // control characters is a confusing failure far from this call site,
-    // so `fetch` never runs with a token that is not a usable credential.
-    // None of these messages echo the token value itself.
-    if (typeof resolvedToken !== "string") {
-      throw invalid(
-        `token callback must resolve to a non-empty string, got ${typeof resolvedToken}`,
-      );
-    }
-    if (resolvedToken.length === 0) {
-      throw invalid("token must be a non-empty string, got an empty string");
-    }
-    if (resolvedToken.trim().length === 0) {
-      throw invalid("token must be a non-empty string, got a whitespace-only string");
-    }
-    const hasControlChar = [...resolvedToken].some((ch) => {
-      const code = ch.charCodeAt(0);
-      return code < 0x20 || code === 0x7f;
-    });
-    if (hasControlChar) {
-      throw invalid("token must not contain control characters");
-    }
-    const token: string = resolvedToken;
+    const token = await resolveBearerToken(this.deps.token, invalid);
     const url = `${this.baseUrl}/cloud_ci.ingest.v1.IngestService/ResolveShardPlan`;
 
     let res: { readonly ok: boolean; readonly status: number; json(): Promise<unknown> };
@@ -201,12 +162,6 @@ const UINT32_MAX = 4_294_967_295;
 /** `google.protobuf.Duration`'s documented maximum magnitude (10 000 years). */
 const MAX_DURATION_SECS = 315_576_000_000;
 const DEFAULT_BASE_URL = "http://cloud-ci.internal";
-const MAX_ECHO_CHARS = 200;
-/** Below this length, redacting every occurrence of `token` in echoed text
- * risks mangling ordinary words (e.g. a server message that happens to
- * contain the literal substring "token"). Only bearer credentials long
- * enough to be unambiguous get redacted — see `scrub`'s own doc comment. */
-const MIN_REDACTABLE_TOKEN_LENGTH = 8;
 
 function invalid(message: string, cause?: unknown): ShardPlanRpcError {
   return new ShardPlanRpcError("invalid_argument", message, undefined, cause);
@@ -214,118 +169,6 @@ function invalid(message: string, cause?: unknown): ShardPlanRpcError {
 
 function malformed(message: string): ShardPlanRpcError {
   return new ShardPlanRpcError("malformed_response", message);
-}
-
-/** Redacts every occurrence of the bearer `token` in text that may echo
- * network input (a transport error, a server body), then caps the result
- * at `MAX_ECHO_CHARS`. This is a best-effort exact-string match, not a
- * guarantee: a token under `MIN_REDACTABLE_TOKEN_LENGTH` characters is
- * skipped (redacting a short string risks mangling an unrelated word like
- * "token" in ordinary server text), and a token containing characters a
- * JSON encoder re-escapes (e.g. a literal `"` or `\`) can fail to match
- * the echoed, re-serialized text even when longer. Redaction runs before
- * truncation so a cut can never leave a partial token visible. */
-function scrub(text: string, token: string): string {
-  const redacted =
-    token.length >= MIN_REDACTABLE_TOKEN_LENGTH ? text.split(token).join("[redacted]") : text;
-  return redacted.length > MAX_ECHO_CHARS
-    ? `${redacted.slice(0, MAX_ECHO_CHARS)}…(truncated)`
-    : redacted;
-}
-
-function show(value: unknown, token: string): string {
-  return scrub(typeof value === "string" ? value : String(JSON.stringify(value)), token);
-}
-
-function assertUint(name: string, value: number, max: number): void {
-  if (!Number.isInteger(value) || value < 0 || value > max) {
-    throw invalid(`${name} must be an integer in 0..${max}, got ${String(value)}`);
-  }
-}
-
-/** Validates and normalizes `baseUrl` using `new URL()` (not a regex) so
- * scheme/userinfo/host parsing matches the platform's own URL grammar.
- * Accepts only the exact documented internal service-binding default
- * origin, or an `https:` URL with no embedded userinfo, path, query, or
- * fragment — a plain `http://` override would send the bearer credential
- * in cleartext, userinfo in the URL is a second, easily-overlooked place
- * a credential could leak, and a non-root path/query/fragment is
- * silently dropped below (`resolve()` always appends the fixed
- * `IngestService` RPC path to this result) — a caller routing through a
- * path-prefixed gateway would otherwise get a wrong-endpoint 404 with no
- * warning, so this rejects rather than discarding any of them. Rejects
- * any whitespace outright, since the WHATWG `URL` parser silently strips
- * some whitespace variants rather than rejecting them. Compares the
- * *parsed* origin (not the raw string) against the documented default,
- * so `"http://cloud-ci.internal/"` and `"http://cloud-ci.internal//"`
- * are still exactly the default — only a raw string that parses to a
- * *different* origin needs `https:`. */
-function normalizeBaseUrl(raw: string | undefined): string {
-  if (raw === undefined) {
-    return DEFAULT_BASE_URL;
-  }
-  if (/\s/.test(raw)) {
-    throw invalid(
-      `baseUrl must not contain whitespace, got "${scrub(redactUserinfoInUrl(raw), "")}"`,
-    );
-  }
-  let url: URL;
-  try {
-    url = new URL(raw);
-  } catch {
-    throw invalid(`baseUrl "${scrub(redactUserinfoInUrl(raw), "")}" is not a valid URL`);
-  }
-  // From here on every message below describes `url`, never the raw
-  // input — `describeOrigin`/`url.protocol` never include userinfo, a
-  // path, or a query string by construction, so they are always safe to
-  // echo into an exception a caller might log (U3: a rejected
-  // `user:pass@host` URL must not write that password into its own
-  // rejection message).
-  const isDefaultOrigin = url.origin === DEFAULT_BASE_URL;
-  if (!isDefaultOrigin && url.protocol.toLowerCase() !== "https:") {
-    throw invalid(
-      `baseUrl "${describeOrigin(url)}" must use https:, or be the internal service-binding ` +
-        `default ${DEFAULT_BASE_URL}`,
-    );
-  }
-  if (url.username !== "" || url.password !== "") {
-    throw invalid(`baseUrl "${describeOrigin(url)}" must not contain a username or password`);
-  }
-  // Any number of leading slashes with nothing else ("/", "//", ...) still
-  // counts as "no path", so the documented default's trailing-slash forms
-  // keep working through this same check. A bare trailing "?" parses to
-  // `url.search === ""` (the WHATWG URL spec drops an empty query), so
-  // that case is checked against `raw` directly rather than `url.search`.
-  const hasPath = url.pathname.replace(/\/+/g, "") !== "";
-  const hasBareQuestionMark = raw.includes("?");
-  if (hasPath || url.search !== "" || hasBareQuestionMark || url.hash !== "") {
-    throw invalid(
-      `baseUrl "${describeOrigin(url)}" must be a bare origin with no path, query string, or ` +
-        `fragment`,
-    );
-  }
-  return url.origin;
-}
-
-/** `url.origin` is the literal string `"null"` for opaque-origin schemes
- * (`javascript:`, a bare `scheme:opaque` string with no `//` authority,
- * ...) — printing that into a rejection message ("baseUrl "null" must
- * use https:...") names nothing useful. Falls back to `url.protocol`
- * (e.g. `"javascript:"`), which is always present and, like `origin`,
- * never includes userinfo. */
-function describeOrigin(url: URL): string {
-  return url.origin === "null" ? url.protocol : url.origin;
-}
-
-/** Strips a `user:pass@`/`user@` userinfo prefix from `raw` before it is
- * echoed into an exception message. Defense-in-depth for the two
- * `normalizeBaseUrl` branches above that run *before* `new URL()` has
- * successfully parsed `raw` (whitespace, and an unparsable URL), where
- * `url.origin`'s stronger guarantee isn't available yet — a plain regex
- * rather than `new URL()`, since this runs on strings that may be exactly
- * what `new URL()` itself refuses to parse. */
-function redactUserinfoInUrl(raw: string): string {
-  return raw.replace(/^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^/?#@]*@/, "$1");
 }
 
 function encodeStrategy(strategy: SplitStrategy): string {
@@ -345,11 +188,11 @@ function encodeStrategy(strategy: SplitStrategy): string {
  * fields are validated here so a bad value fails before any network call. */
 function encodeCount(count: ShardCountOption): unknown {
   if (typeof count === "number") {
-    assertUint("count", count, UINT32_MAX);
+    assertUint("count", count, UINT32_MAX, invalid);
     return { fixed: count };
   }
-  assertUint("count.min", count.min, UINT32_MAX);
-  assertUint("count.max", count.max, UINT32_MAX);
+  assertUint("count.min", count.min, UINT32_MAX, invalid);
+  assertUint("count.max", count.max, UINT32_MAX, invalid);
   if (count.min > count.max) {
     throw invalid(`count.min (${count.min}) must be <= count.max (${count.max})`);
   }
@@ -455,23 +298,4 @@ function decodeShardFiles(shard: unknown, response: unknown, token: string): rea
  * exempt from the tiny-function inlining convention for that reason. */
 function isStringArray(v: unknown): v is string[] {
   return Array.isArray(v) && v.every((e) => typeof e === "string");
-}
-
-/** Connect error body (`cloud-ci-worker/src/connect.rs`'s `ErrorBody`):
- * `{ code, message }`. Falls back to a `"transport"` code with the raw
- * body when the error body itself doesn't match that shape (e.g. a
- * non-Connect-aware proxy's HTML error page) — narrowed via `in`/`typeof`,
- * never cast, since this is unvalidated network input. */
-function decodeConnectError(body: unknown, token: string): { code: string; message: string } {
-  if (
-    typeof body === "object" &&
-    body !== null &&
-    "code" in body &&
-    typeof body.code === "string" &&
-    "message" in body &&
-    typeof body.message === "string"
-  ) {
-    return { code: scrub(body.code, token), message: scrub(body.message, token) };
-  }
-  return { code: "transport", message: `non-Connect error response: ${show(body, token)}` };
 }

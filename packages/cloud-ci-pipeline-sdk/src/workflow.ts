@@ -4,6 +4,7 @@ import type {
   ContainerExecutor,
   OnTrigger,
   PipelineContext,
+  ShardGroupRegistrar,
   ShardPlanner,
   WorkflowStepLike,
 } from "./types.js";
@@ -29,13 +30,15 @@ export interface WorkflowOptions {
  * second argument. A real `.cloud-ci/pipelines/*.ts` script written per
  * the design doc never passes this — it only ever calls
  * `workflow({ on, run })`. It exists so whichever future round wires a
- * real `ContainerExecutor`/`ShardPlanner` (reaching `RunCoordinator`/
- * `ResolveShardPlan`, see README) has a seam to inject it, and so this
- * round's own tests can inject fakes without the SDK silently no-opping
- * `ci.container`/`ci.shard` calls. */
+ * real `ContainerExecutor`/`ShardPlanner`/`ShardGroupRegistrar` (reaching
+ * `RunCoordinator`/`ResolveShardPlan`/`RegisterShardGroup`, see README)
+ * has a seam to inject it, and so this round's own tests can inject
+ * fakes without the SDK silently no-opping `ci.container`/`ci.shard`
+ * calls. */
 export interface WorkflowDependencies {
   readonly executor?: ContainerExecutor;
   readonly planner?: ShardPlanner;
+  readonly registrar?: ShardGroupRegistrar;
 }
 
 /** Structural shape of a real `Workflow` binding's `.create()` call, typed
@@ -122,6 +125,7 @@ export function workflow(
         step,
         executor: deps.executor,
         planner: deps.planner,
+        registrar: deps.registrar,
       });
       await opts.run(ci);
       // "Check sealing": automatic rule — "when the script's `run`

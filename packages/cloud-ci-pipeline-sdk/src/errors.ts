@@ -117,17 +117,38 @@ export class ShardPlanRpcError extends Error {
   }
 }
 
-/** Thrown when `ci.shard` is given a non-empty `reports` option. The
- * public ingest proto has no RPC for registering a shard group's
- * merge/report configuration (see README), so the option cannot take
- * effect; failing loudly beats silently dropping the merge barrier. */
-export class ShardReportsNotSupportedError extends Error {
+/** Thrown when `ci.shard` is given a non-empty `reports` option without a
+ * `ShardGroupRegistrar` injected into `workflow()`. Same posture as
+ * `ShardPlannerNotConfiguredError`: a script run with no registrar
+ * configured fails loudly instead of silently dropping the merge
+ * barrier. */
+export class ShardGroupRegistrarNotConfiguredError extends Error {
   constructor(id: string) {
     super(
-      `ci.shard("${id}", ...) was given \`reports\`, but no public RPC can register ` +
-        `a shard group's merge configuration yet — see README's "ci.shard reports/merge" section`,
+      `ci.shard("${id}", ...) was given \`reports\` but no ShardGroupRegistrar was configured; ` +
+        `pass one via workflow(opts, { registrar }) — see README's "ci.shard reports/merge" section`,
     );
-    this.name = "ShardReportsNotSupportedError";
+    this.name = "ShardGroupRegistrarNotConfiguredError";
+  }
+}
+
+/** Thrown when `RegisterShardGroup` cannot register a shard group's merge
+ * configuration: transport failure, a Connect error body (`code`/
+ * `message`, per `cloud-ci-worker/src/connect.rs`'s `ErrorBody`), or a
+ * malformed success body. Same shape and the same rationale as
+ * `ShardPlanRpcError` (this file, above) — see that class's own doc
+ * comment for `code`'s exact values and why `cause` is preserved. */
+export class ShardGroupRegisterRpcError extends Error {
+  readonly code: string;
+  readonly httpStatus: number | undefined;
+  constructor(code: string, message: string, httpStatus?: number, cause?: unknown) {
+    super(
+      `RegisterShardGroup failed (${code}): ${message}`,
+      cause === undefined ? undefined : { cause },
+    );
+    this.name = "ShardGroupRegisterRpcError";
+    this.code = code;
+    this.httpStatus = httpStatus;
   }
 }
 

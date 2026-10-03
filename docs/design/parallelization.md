@@ -279,16 +279,19 @@ Merge: real for `junit`/`lcov`. The Queue consumer (`src/lib.rs`'s `handle_shard
 `src/shard_merge.rs`, `cloud_ci_reports::merge`) reads the included shards' canonical reports from
 D1/R2, merges them, and writes the result to R2 plus a `shard_merges` row. Not built: a generated
 `<id>/merge` container node for `playwright-blob`/`vitest-blob`. `ci.shard` itself exists
-(`cloud-ci-pipeline-sdk`'s `src/shard.ts`: split/count/files/run/check) and `ShardOptions.reports`
-is now a typed field (`ShardReportSpec[]`, matching this doc's worked example), but giving it a
-non-empty value throws `ShardReportsNotSupportedError` rather than taking effect: no public
-`cloud_ci.ingest.v1.IngestService` RPC lets a managed run's `ci.shard` register a shard group's
-merge configuration (`expected_total`/`fail_fast`/`merge_on_failure`) — `/register-shard-group`
-(`coordinator::mod`'s `RegisterShardGroupRequest`) is an internal Durable Object HTTP route, not
-an `IngestService` procedure a service-binding `Fetcher` can reach, and `StartJob`/`CompleteShard`/
-`SubmitReport` carry no such fields either. That public RPC (or equivalent `StartJobRequest`
-fields) is the missing proto addition, not SDK wiring — see
-`packages/cloud-ci-pipeline-sdk/README.md`'s `ci.shard` section for the full detail. A
+(`cloud-ci-pipeline-sdk`'s `src/shard.ts`: split/count/files/run/check/failFast/reports) and
+`ShardOptions.reports` (`ShardReportSpec[]`, matching this doc's worked example) now takes real
+effect: a non-empty value registers the shard group's merge configuration
+(`expected_total`/`fail_fast`/`merge_on_failure`, the last fixed at `"if_any_passed"` — no
+public per-call override yet) through the public `cloud_ci.ingest.v1.IngestService
+.RegisterShardGroup` RPC (`handle_register_shard_group`, `cloud-ci-worker/src/lib.rs`), which
+forwards to the same internal `/register-shard-group` Durable Object route
+(`coordinator::mod::RegisterShardGroupRequest`) unchanged — `RunCoordinator` stays the only
+writer. The SDK side (`RpcShardGroupRegistrar`, `packages/cloud-ci-pipeline-sdk/src/
+rpc-shard-group-registrar.ts`) is proven only against an in-process fake `Fetcher`, never a
+real deployed `cloud-ci-worker`, and no real instance is constructed/injected anywhere in this
+repo yet (no run-scoped-ingest-token plumbing exists in this SDK or
+`cloud-ci-dynamic-workflows-host` — see that package's README for the exact boundary). A
 `playwright-blob`/`vitest-blob` report reaching the consumer today is logged and skipped, not
 merged.
 

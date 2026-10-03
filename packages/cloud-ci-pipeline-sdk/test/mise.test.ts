@@ -23,6 +23,7 @@ function makeCi(executor: ContainerExecutor): CiContext {
     step: { do: (_name, callback) => callback() },
     executor,
     planner: undefined,
+    registrar: undefined,
   });
 }
 

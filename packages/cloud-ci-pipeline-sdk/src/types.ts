@@ -213,7 +213,10 @@ export interface ShardRunArgs {
  * (`"junit"`/`"lcov"` merge natively; anything else, including
  * `"playwright-blob"`/`"vitest-blob"`, is logged and skipped server-side —
  * see that module's docs). `path` and `merge` are carried through
- * unparsed; this SDK does not interpret them. */
+ * unparsed; this SDK does not interpret them — only `type`'s presence or
+ * absence (via `ShardOptions.reports`' own length) decides whether
+ * `ci.shard` registers a shard group at all, see that field's doc
+ * comment. */
 export interface ShardReportSpec {
   readonly type: string;
   readonly path?: string;
@@ -221,22 +224,20 @@ export interface ShardReportSpec {
 }
 
 /** Options accepted by `ci.shard(id, opts)`. This round implements
- * `split`/`count`/`files`/`run`/`check` — the design doc's full shape also
- * documents `snapshot`, `sidecars`, and `reports`/merge-barrier options
+ * `split`/`count`/`files`/`run`/`check`/`failFast`/`reports` — the design
+ * doc's full shape also documents `snapshot` and `sidecars`
  * (dynamic-pipelines.md's "### Splitting tests across shards" worked
- * example); `reports` is a typed field here (`ShardReportSpec[]`), but
- * giving it a non-empty value throws `ShardReportsNotSupportedError` — the
- * server-side merge barrier (`cloud-ci-worker/src/shard_merge.rs`,
- * `coordinator::mod`'s `job_group`/`register-shard-group`) has no public
- * `IngestService` RPC `ci.shard` can call to register a shard group's
- * merge configuration (`expected_total`/`fail_fast`/`merge_on_failure`):
- * `/register-shard-group` is an internal Durable Object HTTP route, not a
- * `cloud_ci.ingest.v1.IngestService` procedure, and `StartJob`/
- * `CompleteShard`/`SubmitReport` carry no such fields either — see
- * parallelization.md's "Implementation status" merge paragraph and
- * README's scope boundary list for exactly what proto addition is
- * missing. `snapshot`/`sidecars` remain entirely absent, same as
- * `ContainerOptions`'s own scope boundary. */
+ * example), neither of which this round implements; see README's scope
+ * boundary list, same as `ContainerOptions`'s own boundary. A non-empty
+ * `reports` registers the shard group's merge-barrier configuration via
+ * the injected `ShardGroupRegistrar` (`expectedTotal` from the resolved
+ * plan's `shardCount`, `failFast` from this option, `mergeOnFailure`
+ * fixed at `"if_any_passed"` — parallelization.md's documented default;
+ * there is no public per-call override for it yet) before any shard
+ * container is dispatched — see `ShardGroupRegistrar`'s own doc comment
+ * for the real `RegisterShardGroup` RPC this reaches, and
+ * `ShardGroupRegistrarNotConfiguredError`'s doc comment (`errors.ts`) for
+ * what happens with a non-empty `reports` and no registrar configured. */
 export interface ShardOptions {
   readonly split: SplitStrategy;
   readonly count: ShardCountOption;
@@ -253,10 +254,16 @@ export interface ShardOptions {
    * already uses, since each shard is dispatched as one `ci.container`
    * call under the hood. */
   readonly check?: Check | null;
+  /** Cancel the remaining shards in the group on the first shard failure —
+   * parallelization.md's `ci.shard` options table, `failFast` row.
+   * Defaults to `false`, matching that table's documented default. Only
+   * meaningful once the merge barrier is actually registered (a non-empty
+   * `reports`); with `reports` omitted or empty this value is still
+   * accepted but has nothing to register it against. */
+  readonly failFast?: boolean;
   /** Native (`junit`/`lcov`) and framework-blob report merge spec —
-   * parallelization.md's "### Shard groups / merge barrier". See
-   * `ShardReportSpec`'s doc comment for why a non-empty value throws
-   * `ShardReportsNotSupportedError` rather than silently taking effect. */
+   * parallelization.md's "### Shard groups / merge barrier". See this
+   * interface's own doc comment for exactly what a non-empty value does. */
   readonly reports?: readonly ShardReportSpec[];
 }
 
@@ -313,31 +320,74 @@ export interface ShardPlanner {
   resolve(request: ShardPlanRequest): Promise<ShardPlan>;
 }
 
-/** Minimal shape `RpcShardPlanner` needs from a real Workers service
- * binding (`Fetcher` in `@cloudflare/workers-types`). Typed structurally
- * here — matching `WorkflowStepLike`'s own convention above — so this
- * package does not have to depend on a specific `workers-types` version at
- * the call site, only in its own devDependency for typechecking this
- * file. A real `Fetcher.fetch` and a real `Response` both satisfy this
- * shape as-is. */
+/** Minimal shape `RpcShardPlanner`/`RpcShardGroupRegistrar` need from a
+ * real Workers service binding (`Fetcher` in `@cloudflare/workers-types`).
+ * Typed structurally here — matching `WorkflowStepLike`'s own convention
+ * above — so this package does not have to depend on a specific
+ * `workers-types` version at the call site, only in its own devDependency
+ * for typechecking this file. A real `Fetcher.fetch` and a real
+ * `Response` both satisfy this shape as-is. Despite the `ShardPlan*`
+ * naming (this type predates `RpcShardGroupRegistrar`), the shape is the
+ * generic Connect unary-JSON transport contract both RPC clients in this
+ * package speak, not anything specific to `ResolveShardPlan`. */
 export interface ShardPlanFetcher {
   fetch(url: string, init: ShardPlanFetchInit): Promise<ShardPlanFetchResponse>;
 }
 
-/** `RequestInit` subset `RpcShardPlanner` sends — always a `POST` with a
- * JSON body, per `cloud-ci-worker/src/connect.rs`'s `negotiate()` (unary
- * Connect RPC, no streaming). */
+/** `RequestInit` subset this package's Connect RPC clients send — always
+ * a `POST` with a JSON body, per `cloud-ci-worker/src/connect.rs`'s
+ * `negotiate()` (unary Connect RPC, no streaming). */
 export interface ShardPlanFetchInit {
   readonly method: "POST";
   readonly headers: Readonly<Record<string, string>>;
   readonly body: string;
 }
 
-/** `Response` subset `RpcShardPlanner` reads. */
+/** `Response` subset this package's Connect RPC clients read. */
 export interface ShardPlanFetchResponse {
   readonly ok: boolean;
   readonly status: number;
   json(): Promise<unknown>;
+}
+
+/** Request `ci.shard` hands to the injected `ShardGroupRegistrar` to
+ * register a shard group's merge-barrier configuration — see
+ * `ShardOptions.reports`'s own doc comment for exactly how `ci.shard`
+ * fills each field in. Matches `cloud_ci.ingest.v1.RegisterShardGroupRequest`'s
+ * own `job_name`/`expected_total`/`fail_fast`/`merge_on_failure` fields
+ * field-for-field (its `run_id` is a `ShardGroupRegistrar`
+ * implementation's own constructor-level concern, not part of a
+ * per-call request — see `RpcShardGroupRegistrar`'s doc comment). */
+export interface ShardGroupRegisterRequest {
+  readonly jobName: string;
+  readonly expectedTotal: number;
+  readonly failFast: boolean;
+  readonly mergeOnFailure: "if_any_passed" | "always" | "never";
+}
+
+/** `RegisterShardGroupResponse`'s decoded shape. */
+export interface ShardGroupRegisterResult {
+  readonly jobName: string;
+}
+
+/**
+ * Injectable boundary to the real shard-group-registration mechanism —
+ * the Rust `RegisterShardGroup` RPC `cloud-ci-worker` exposes
+ * (`packages/cloud-ci-worker/src/lib.rs`'s `handle_register_shard_group`),
+ * which forwards to `RunCoordinator`'s existing internal
+ * `/register-shard-group` Durable Object route — the single writer for
+ * `job_group` (parallelization.md's "Shard groups / merge barrier").
+ * Mirrors `ShardPlanner`'s own injection-seam convention exactly: `
+ * ci.shard`'s dispatch logic is proven against this interface and a fake
+ * in-memory implementation (`test/shard.test.ts`'s `FakeShardGroupRegistrar`);
+ * `RpcShardGroupRegistrar` (`src/rpc-shard-group-registrar.ts`) is a real
+ * implementation that reaches `RegisterShardGroup` over an injected
+ * `ShardPlanFetcher` — proven only against an in-process fake `Fetcher`
+ * (`test/rpc-shard-group-registrar.test.ts`), never a real deployed
+ * `cloud-ci-worker`.
+ */
+export interface ShardGroupRegistrar {
+  register(request: ShardGroupRegisterRequest): Promise<ShardGroupRegisterResult>;
 }
 
 /** Options accepted by `ci.group(ids, opts)`. The design doc's only text

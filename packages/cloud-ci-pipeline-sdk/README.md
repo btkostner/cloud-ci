@@ -294,27 +294,29 @@ containing characters a JSON encoder re-escapes (e.g. a literal `"` or
   not implemented.
 - **`reports`/merge barrier** — `ShardOptions.reports` is a typed field
   (`ShardReportSpec[]`, matching parallelization.md's worked example:
-  `{ type, path?, merge? }`), but giving it a non-empty value throws
-  `ShardReportsNotSupportedError` rather than silently taking effect.
-  dynamic-pipelines.md describes `ci.shard` as also running "the generated
-  merge step once every shard reaches a terminal state", and the
-  server-side merge barrier/native junit/lcov merge dispatch this would
-  trigger already exists (`packages/cloud-ci-worker/src/shard_merge.rs`,
-  `coordinator::mod`'s `job_group` table and `/register-shard-group`
-  handler, from an earlier round). What's missing is not SDK wiring — it's
-  a public RPC to wire to: `/register-shard-group` is an internal Durable
-  Object HTTP route (`RunCoordinatorStore::call`'s `"/register-shard-group"`
-  branch in `coordinator/mod.rs`), never a `cloud_ci.ingest.v1
-  .IngestService` procedure a service-binding `Fetcher` can reach, and
-  none of `StartJobRequest` (`shard_total` only), `CompleteShardRequest`
-  (`job_id`/`shard_index`/`conclusion`/`external_url` only), or
-  `SubmitReportRequest` carry `expected_total`/`fail_fast`/
-  `merge_on_failure` fields either. **The missing proto addition**: a
-  public `IngestService` RPC (or new `StartJobRequest` fields) a managed
-  run's `ci.shard` could call from its `split:` step to register a shard
-  group's merge configuration, authenticated the same way `ResolveShardPlan`
-  is. Until that RPC exists, `ShardOptions.reports` stays typed-but-rejected
-  rather than silently dropped.
+  `{ type, path?, merge? }`), and now takes real effect: a non-empty
+  value registers the shard group's merge-barrier configuration
+  (`expectedTotal` from the resolved plan's `shardCount`, `failFast` from
+  `ShardOptions.failFast`, `mergeOnFailure` fixed at `"if_any_passed"` —
+  parallelization.md's documented default, no public per-call override
+  yet) through the injected `ShardGroupRegistrar`, reaching
+  `cloud-ci-worker`'s public `RegisterShardGroup` RPC
+  (`cloud_ci.ingest.v1.IngestService/RegisterShardGroup`,
+  `handle_register_shard_group` in `lib.rs`), which forwards to the same
+  internal `RunCoordinator`/`job_group`/`/register-shard-group` plumbing
+  an earlier round already built. `ci.shard` given `reports` with no
+  `ShardGroupRegistrar` configured throws
+  `ShardGroupRegistrarNotConfiguredError` — same "fail loudly, not
+  silently" posture `ShardPlannerNotConfiguredError` already has — and
+  `src/rpc-shard-group-registrar.ts`'s `RpcShardGroupRegistrar` is a real
+  implementation, proven only against an in-process fake `Fetcher`
+  (`test/rpc-shard-group-registrar.test.ts`, unit-only — see "Test
+  coverage" below), never a real deployed `cloud-ci-worker`. Still not
+  implemented: a generated `<id>/merge` container node for
+  `playwright-blob`/`vitest-blob` report kinds, and the `mergeOnFailure`
+  per-call override (parallelization.md's own `ci.shard` options table
+  has no row for it, so this SDK exposes no knob — see
+  `ShardOptions.reports`'s own doc comment, `src/types.ts`).
 - **Real `--granularity test` per-test splitting** — `SplitStrategy`'s
   `"count"` value round-robins at whole-file granularity, identical to
   `"file"`. `cloud_ci_core::split` (the Rust crate `ResolveShardPlan`
@@ -645,11 +647,13 @@ proven).
 
 Each of these is a real, named gap — not a silent omission:
 
-- **`ci.shard`'s `sidecars`, `reports`/merge barrier, and real `--granularity
-  test` per-test splitting** — `ci.shard` itself IS implemented this round
-  (`split`/`count`/`files`/`run`/`check`); see "`ci.shard`: shard-plan
+- **`ci.shard`'s `sidecars`, real `--granularity test` per-test splitting,
+  and the `playwright-blob`/`vitest-blob` generated merge node** —
+  `ci.shard` itself IS implemented this round (`split`/`count`/`files`/
+  `run`/`check`/`failFast`/`reports`); see "`ci.shard`: shard-plan
   resolution and per-shard dispatch" above for exactly what is and isn't
-  built, including the `ResolveShardPlan` RPC's own scope boundary.
+  built, including the `ResolveShardPlan`/`RegisterShardGroup` RPCs' own
+  scope boundaries.
 - **`ci.snapshot`** — layered filesystem snapshots (`toolchain`/`deps`
   layers, sidecar-volume capture). Not implemented; `ContainerOptions` has
   no `snapshot` field.
@@ -674,17 +678,28 @@ Each of these is a real, named gap — not a silent omission:
 - **Real `RunCoordinator`/`cloud-ci-worker` wiring** — `ci.container`
   never reaches the real `ContainerProbe` Durable Object or
   `RunCoordinator`; it calls whatever `ContainerExecutor` is injected (see
-  above). `ci.shard`'s `ShardPlanner` injection point now has a real
-  implementation, `RpcShardPlanner` (`src/rpc-shard-planner.ts`), that
-  speaks `ResolveShardPlan`'s real Connect wire format — but it is proven
-  only against an in-process fake `ShardPlanFetcher`
-  (`test/rpc-shard-planner.test.ts`), never a real deployed
-  `cloud-ci-worker`; no `wrangler.toml` changes were made anywhere in this
-  round, so there is still no real `CONTAINER_WORKER`-style binding wired
-  into any Dynamic Worker's `env` for either `ContainerExecutor` or
-  `ShardPlanner` to use. `ci.shard`'s own dispatch contract (split →
-  per-shard dispatch, duplicate-id rejection, check attachment) is still
-  proven primarily against the fake, in-memory `FakeShardPlanner`
+  above). `ci.shard`'s `ShardPlanner`/`ShardGroupRegistrar` injection
+  points now have real implementations, `RpcShardPlanner`
+  (`src/rpc-shard-planner.ts`) and `RpcShardGroupRegistrar`
+  (`src/rpc-shard-group-registrar.ts`), that speak
+  `ResolveShardPlan`'s/`RegisterShardGroup`'s real Connect wire formats —
+  but each is proven only against an in-process fake `Fetcher`
+  (`test/rpc-shard-planner.test.ts`, `test/rpc-shard-group-registrar.test.ts`),
+  never a real deployed `cloud-ci-worker`; no `wrangler.toml` changes were
+  made anywhere in this round, so there is still no real
+  `CONTAINER_WORKER`-style binding wired into any Dynamic Worker's `env`
+  for `ContainerExecutor`, `ShardPlanner`, or `ShardGroupRegistrar` to
+  use — `workflow.ts`'s `WorkflowDependencies` accepts all three, but
+  nothing in this repo (this package or `cloud-ci-dynamic-workflows-host`)
+  constructs and injects a real one yet. `RpcShardGroupRegistrar` also
+  needs a *run-scoped* ingest token (`BeginRunResponse.ingest_token`) and
+  `runId`, a different credential than `RpcShardPlanner`'s repo-scoped
+  one — see that class's own doc comment for why, and
+  `handle_register_shard_group`'s doc comment (`cloud-ci-worker/src/
+  lib.rs`) for the server-side auth this reaches. `ci.shard`'s own
+  dispatch contract (split → register → per-shard dispatch, duplicate-id
+  rejection, check attachment) is still proven primarily against the
+  fake, in-memory `FakeShardPlanner`/`FakeShardGroupRegistrar`
   (`test/shard.test.ts`).
 - **`ci.skip`, `ci.cached`, `ci.turboCache`, `ci.readFile`** — none of
   these exist on `CiContext`. `ci.limit` IS implemented this round (see
@@ -705,16 +720,21 @@ Each of these is a real, named gap — not a silent omission:
   `ContainerExecutor` (call-count assertion), plus duplicate-id rejection,
   check attachment, and the no-executor-configured error.
 - `test/shard.test.ts` — `ci.shard`'s dispatch logic against a fake
-  `ShardPlanner` and the real `runContainer` dispatched per shard (via a
-  fake `ContainerExecutor`, same convention as `container.test.ts`):
-  shard-plan resolution feeding `run({shard, shards, files})` per shard,
-  request passthrough to the planner, replay reusing the recorded plan
-  without re-dispatching containers, check attachment across every
-  resolved shard, the shared container-id namespace with plain
-  `ci.container` calls, duplicate shard-id rejection, the
-  no-planner-configured error, and `reports`'s rejection (non-empty throws
-  `ShardReportsNotSupportedError` before the split step runs; empty/omitted
-  is a no-op).
+  `ShardPlanner`/`ShardGroupRegistrar` and the real `runContainer`
+  dispatched per shard (via a fake `ContainerExecutor`, same convention
+  as `container.test.ts`): shard-plan resolution feeding
+  `run({shard, shards, files})` per shard, request passthrough to the
+  planner, replay reusing the recorded plan without re-dispatching
+  containers, check attachment across every resolved shard, the shared
+  container-id namespace with plain `ci.container` calls, duplicate
+  shard-id rejection, the no-planner-configured error, the
+  no-registrar-configured error for a non-empty `reports` (before the
+  split step runs, never consuming the shard id — a retry without
+  `reports`, or with a registrar now configured, succeeds), a real
+  `reports` call registering `{jobName, expectedTotal, failFast,
+  mergeOnFailure}` through the injected registrar (`expectedTotal` from
+  the resolved plan, `failFast` defaulting to `false`), and empty/omitted
+  `reports` registering nothing (a no-op).
 - `test/rpc-shard-planner.test.ts` — `RpcShardPlanner`'s real
   `ResolveShardPlan` request/response wire shape against an in-process
   fake `ShardPlanFetcher` (unit-only, never a real deployed
@@ -781,6 +801,25 @@ Each of these is a real, named gap — not a silent omission:
   slashes, a trailing slash on an `https://` override, and an uppercase
   `HTTPS://` scheme are all still accepted and normalize to the same
   request.
+- `test/rpc-shard-group-registrar.test.ts` — `RpcShardGroupRegistrar`'s
+  real `RegisterShardGroup` request/response wire shape against an
+  in-process fake `ShardPlanFetcher` (unit-only, never a real deployed
+  `cloud-ci-worker` — same posture as `rpc-shard-planner.test.ts`): the
+  exact proto3-JSON request body (`runId` from the constructor dep,
+  `jobName`/`expectedTotal`/`failFast`/`mergeOnFailure` from the
+  per-call request, `mergeOnFailure` sent unchanged for all three
+  documented values), decoding a success response, calling `register()`
+  twice with identical fields as two real idempotent-on-the-server
+  requests (no client-side cache of its own), a Connect error body →
+  `code`/`message`/HTTP-status mapping, a malformed 200 body (missing
+  `jobName`, and a non-string `jobName`), a rejected
+  `ShardPlanFetcher.fetch()` promise mapped to a `"transport"` error, the
+  non-Connect-error-body transport fallback, client-side validation of a
+  non-positive or non-integer `expectedTotal` and an empty `jobName`
+  before ever calling `fetch`, constructor-time validation of an empty
+  `runId` and a non-`https://`/non-default `baseUrl`, an empty-string
+  token rejected before `fetch`, and the bearer token scrubbed out of an
+  echoed transport error message.
 - `test/group.test.ts` — `ci.group`'s single-container batch dispatch
   against a fake `WorkflowStepLike`/`ContainerExecutor` (same conventions
   as `container.test.ts`): one executor call covers every id in `ids`,

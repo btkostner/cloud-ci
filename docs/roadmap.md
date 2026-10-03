@@ -93,27 +93,50 @@ button, which is blocked by Cloudflare's isolated-subdirectory rule, see
 
 ## Next steps
 
-Ordered by dependency; nothing below is done. Each item unblocks the ones after it.
+Ordered by dependency; items 1-2 are done (details and limitations inline), the rest are not.
+Each item unblocks the ones after it.
 
-1. **Proto and contract work first** (backward compatible, `buf breaking` against `main`):
-   - A `node_id` on `SubmitResourceSamplesRequest`, so a sample is tied to a node, not inferred.
-   - A public RPC to register a shard group's merge settings, which unblocks
-     `ShardOptions.reports`.
-   - An agent-side way to carry the shard attempt.
-2. **OOM recovery wiring**, once the contract exists: a multi-size executor ladder,
-   lineage- and attempt-aware shard-terminal resolution, and a live smoke test. The pure logic
-   already exists; only the wiring and the live proof are missing.
-3. **NodeContainer isolation live proof.** Run-scoped addressing is unit-tested only; proving it
+1. ~~**Proto and contract work first**~~ **Done (2026-10-03).** All backward compatible
+   (additive fields/RPCs only, no renumbering); `buf breaking` passes against `main`:
+   - `optional string node_id = 8` on `SubmitResourceSamplesRequest`, so an OOM report can name
+     the exact container that produced it. Wired into
+     `coordinator::logic::resource_sample_batch_content_hash` (an absent or empty value hashes
+     identically to the pre-`node_id` shape, so an old agent's idempotency is unchanged) and
+     into `cloud-ci agent`'s new `--node-id`/`CLOUD_CI_NODE_ID`.
+   - `RegisterShardGroupRequest`/`Response` + `IngestService.RegisterShardGroup`, a public RPC
+     equivalent in shape to the existing internal `coordinator::mod::RegisterShardGroupRequest`/
+     `/register-shard-group` Durable Object route, authenticated like every other run-bound
+     ingest call (`StartJob` etc.) and routed to `RunCoordinator`, the only writer.
+   - `cloud-ci agent --attempt` now falls back to `CLOUD_CI_SHARD_ATTEMPT` (then `1`) — a
+     different env var than `CLOUD_CI_ATTEMPT`, which stays the *run* attempt
+     `cloud-ci upload`/`cloud-ci split` use.
+2. **`ci.shard`'s `reports`/merge-barrier SDK wiring — done, unit-only (2026-10-03).**
+   `packages/cloud-ci-pipeline-sdk`'s `ShardOptions.reports` now registers a shard group's
+   merge configuration for real: `RpcShardGroupRegistrar` (`src/rpc-shard-group-registrar.ts`)
+   reaches the `RegisterShardGroup` RPC above over the same injected service-binding `Fetcher`
+   pattern `RpcShardPlanner` uses, replacing the old blanket `ShardReportsNotSupportedError`.
+   Proven only against an in-process fake `Fetcher`
+   (`test/rpc-shard-group-registrar.test.ts`) — never a real deployed `cloud-ci-worker`, and no
+   real `RpcShardGroupRegistrar` is constructed/injected anywhere in this repo yet (no
+   `wrangler.toml` binding, and no run-scoped-ingest-token plumbing exists in this SDK or
+   `cloud-ci-dynamic-workflows-host`, same documented gap `RpcShardPlanner`'s own credential
+   has). See the SDK's README "Explicitly out of scope this round" for the exact boundary.
+3. **OOM recovery wiring**, now that the `node_id`/shard-attempt contract exists (item 1): a
+   multi-size executor ladder, lineage- and attempt-aware shard-terminal resolution, and a live
+   smoke test. The pure logic already exists; only the wiring and the live proof are missing —
+   see [parallelization.md](./design/parallelization.md)'s "not wired" section for the exact
+   remaining prerequisites.
+4. **NodeContainer isolation live proof.** Run-scoped addressing is unit-tested only; proving it
    needs `wrangler dev` with a `CLOUDFLARE_API_TOKEN`, which this environment lacks.
-4. **Phase 7.** The Deploy-to-Cloudflare button is blocked by Cloudflare's isolated-subdirectory
+5. **Phase 7.** The Deploy-to-Cloudflare button is blocked by Cloudflare's isolated-subdirectory
    rule: the worker has path dependencies outside its directory
    (developers.cloudflare.com/workers/platform/deploy-buttons/, "Last updated Jul 22, 2026",
    as cited in [deployment](./design/deployment.md#deploy-to-cloudflare); not re-fetched for
    this entry). Partial setup subcommands already exist (`cloud-ci setup github-app` and
    `cloud-ci setup allowed-orgs`); the wizard needs an orchestrating subcommand on top of them.
-5. **Then:** the `step` and `cache` Analytics Engine events, the nightly rightsizing cron that
+6. **Then:** the `step` and `cache` Analytics Engine events, the nightly rightsizing cron that
    calls the pure rightsizing functions with real Analytics Engine data, the Phase 5 AI context
    builder, and the dashboard.
-6. **Blocked on credentials or tooling:** real AWS and Kubernetes executors, the forced-recycle
+7. **Blocked on credentials or tooling:** real AWS and Kubernetes executors, the forced-recycle
    test, the live cold-start measurement, and a live GitHub SHA lookup for the frozen settings
    SHA. Until then these are `[unverified]` at runtime.
