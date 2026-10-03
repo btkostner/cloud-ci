@@ -9,6 +9,7 @@
 
 pub mod junit;
 pub mod lcov;
+pub mod merge;
 pub mod playwright;
 pub mod vitest;
 
