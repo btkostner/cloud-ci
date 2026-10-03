@@ -281,7 +281,12 @@ to substitute for it.
 ### Machine auth
 
 All three machine identities present credentials to the same ingest/query surface; only the
-mechanism that produces a verified `(scope[], repo_id, run_id?)` tuple differs.
+mechanism that produces a verified `(scope[], repo_id, run_id?)` tuple differs. Every call after
+`BeginRun` — `StartJob`, `CreateUpload`, `CompleteUpload`, `SubmitReport`, `CompleteShard`, and
+the raw upload-part `PUT` (data plane) — authenticates with the resulting ingest token and
+cross-checks **both** its `repo_id` and `run_id` claims against the request's real owning run,
+resolved independently via D1 (never trusted from the request itself): a token valid for one run
+authorizes nothing for a different run, even under the same repo.
 
 #### 1. GitHub Actions OIDC
 

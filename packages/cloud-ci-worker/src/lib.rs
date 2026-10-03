@@ -994,7 +994,9 @@ async fn route(
         "/cloud_ci.ingest.v1.IngestService/BeginRun" => {
             handle_begin_run(codec, body, env, bearer).await
         }
-        "/cloud_ci.ingest.v1.IngestService/StartJob" => handle_start_job(codec, body, env).await,
+        "/cloud_ci.ingest.v1.IngestService/StartJob" => {
+            handle_start_job(codec, body, env, bearer).await
+        }
         "/cloud_ci.ingest.v1.IngestService/GetRun" => handle_get_run(codec, body, env).await,
         "/cloud_ci.ingest.v1.IngestService/GetTestTimings" => {
             handle_get_test_timings(codec, body, env, bearer).await
@@ -1003,19 +1005,19 @@ async fn route(
             handle_resolve_shard_plan(codec, body, env, bearer).await
         }
         "/cloud_ci.ingest.v1.IngestService/CreateUpload" => {
-            handle_create_upload(codec, body, env).await
+            handle_create_upload(codec, body, env, bearer).await
         }
         "/cloud_ci.ingest.v1.IngestService/CompleteUpload" => {
-            handle_complete_upload(codec, body, env).await
+            handle_complete_upload(codec, body, env, bearer).await
         }
         "/cloud_ci.ingest.v1.IngestService/SubmitReport" => {
-            handle_submit_report(codec, body, env).await
+            handle_submit_report(codec, body, env, bearer).await
         }
         "/cloud_ci.ingest.v1.IngestService/SubmitResourceSamples" => {
             handle_submit_resource_samples(codec, body, env, bearer).await
         }
         "/cloud_ci.ingest.v1.IngestService/CompleteShard" => {
-            handle_complete_shard(codec, body, env).await
+            handle_complete_shard(codec, body, env, bearer).await
         }
         _ => Err(ConnectError::new(
             Code::Unimplemented,
@@ -1233,14 +1235,53 @@ fn ingest_token_secret(env: &Env) -> std::result::Result<Vec<u8>, ConnectError> 
     Ok(secret.to_string().into_bytes())
 }
 
+fn authenticate_ingest_bearer(
+    env: &Env,
+    bearer: Option<&str>,
+) -> std::result::Result<ingest_token::VerifiedClaims, ConnectError> {
+    let Some(bearer) = bearer else {
+        return Err(ConnectError::new(
+            Code::Unauthenticated,
+            "missing bearer ingest token",
+        ));
+    };
+    let secret = ingest_token_secret(env)?;
+    let now_s = Date::now().as_millis() / 1000;
+    ingest_token::verify(&secret, bearer, now_s).map_err(|e| {
+        ConnectError::new(
+            Code::Unauthenticated,
+            format!("invalid or expired ingest token: {e}"),
+        )
+    })
+}
+
+/// Rejects `claims` that don't match `identity`'s real run/repo —
+/// "run/repo inferred from the authorized job/run/upload, never trusted
+/// client linkage" (docs/design/auth.md's Machine auth section).
+fn require_matching_identity(
+    claims: &ingest_token::VerifiedClaims,
+    identity: &JobRunIdentity,
+) -> std::result::Result<(), ConnectError> {
+    if claims.repo_id != identity.repo_id || claims.run_id != identity.run_id {
+        return Err(ConnectError::new(
+            Code::PermissionDenied,
+            "ingest token does not match this request's own run/repo",
+        ));
+    }
+    Ok(())
+}
+
 async fn handle_start_job(
     codec: Codec,
     body: &[u8],
     env: &Env,
+    bearer: Option<&str>,
 ) -> std::result::Result<Vec<u8>, ConnectError> {
     let req: StartJobRequest = codec.decode(body)?;
-    let do_name = resolve_do_name_for_run(env, &req.run_id).await?;
-    let store = RunCoordinatorStore::new(env, &do_name).map_err(coordinator_error)?;
+    let claims = authenticate_ingest_bearer(env, bearer)?;
+    let identity = resolve_run_identity(env, &req.run_id).await?;
+    require_matching_identity(&claims, &identity)?;
+    let store = RunCoordinatorStore::new(env, &identity.do_name).map_err(coordinator_error)?;
     let outcome = store.start_job(&req).await.map_err(coordinator_error)?;
 
     let resp = StartJobResponse {
@@ -1402,57 +1443,17 @@ async fn handle_resolve_shard_plan(
     codec.encode(&resp)
 }
 
-/// `StartJob` only carries a `run_id` (no `RunKey`), but the Durable Object
-/// is addressed by `(repo_id, sha, run_key, attempt)`
-/// ([`coordinator::do_name`]). D1's `runs` table is `RunCoordinator`'s own
-/// projection (ADR 0004), so reading it back here to resolve `run_id` to its
-/// routing key is a read of the projection, not a second writer of run
-/// state.
-async fn resolve_do_name_for_run(
-    env: &Env,
-    run_id: &str,
-) -> std::result::Result<String, ConnectError> {
-    #[derive(serde::Deserialize)]
-    struct RunIdentity {
-        repo_id: i64,
-        sha: String,
-        run_key: String,
-        attempt: i64,
-    }
-
-    let db = env
-        .d1("DB")
-        .map_err(|e| ConnectError::new(Code::Internal, format!("D1 unavailable: {e}")))?;
-    let row: Option<RunIdentity> = db
-        .prepare("SELECT repo_id, sha, run_key, attempt FROM runs WHERE id = ?1")
-        .bind(&[run_id.into()])
-        .map_err(|e| ConnectError::new(Code::Internal, format!("D1 bind failed: {e}")))?
-        .first(None)
-        .await
-        .map_err(|e| ConnectError::new(Code::Internal, format!("D1 query failed: {e}")))?;
-
-    match row {
-        Some(r) => Ok(coordinator::do_name(
-            r.repo_id as u64,
-            &r.sha,
-            &r.run_key,
-            r.attempt as u32,
-        )),
-        None => Err(ConnectError::new(
-            Code::NotFound,
-            format!("run {run_id} not found"),
-        )),
-    }
-}
-
 async fn handle_create_upload(
     codec: Codec,
     body: &[u8],
     env: &Env,
+    bearer: Option<&str>,
 ) -> std::result::Result<Vec<u8>, ConnectError> {
     let req: CreateUploadRequest = codec.decode(body)?;
-    let do_name = resolve_do_name_for_job(env, &req.job_id).await?;
-    let store = RunCoordinatorStore::new(env, &do_name).map_err(coordinator_error)?;
+    let claims = authenticate_ingest_bearer(env, bearer)?;
+    let identity = resolve_job_identity(env, &req.job_id).await?;
+    require_matching_identity(&claims, &identity)?;
+    let store = RunCoordinatorStore::new(env, &identity.do_name).map_err(coordinator_error)?;
     let outcome = store.create_upload(&req).await.map_err(coordinator_error)?;
 
     let resp = CreateUploadResponse {
@@ -1469,10 +1470,13 @@ async fn handle_complete_upload(
     codec: Codec,
     body: &[u8],
     env: &Env,
+    bearer: Option<&str>,
 ) -> std::result::Result<Vec<u8>, ConnectError> {
     let req: CompleteUploadRequest = codec.decode(body)?;
-    let do_name = resolve_do_name_for_upload(env, &req.upload_id).await?;
-    let store = RunCoordinatorStore::new(env, &do_name).map_err(coordinator_error)?;
+    let claims = authenticate_ingest_bearer(env, bearer)?;
+    let identity = resolve_upload_identity(env, &req.upload_id).await?;
+    require_matching_identity(&claims, &identity)?;
+    let store = RunCoordinatorStore::new(env, &identity.do_name).map_err(coordinator_error)?;
     store
         .complete_upload(&req)
         .await
@@ -1484,10 +1488,13 @@ async fn handle_submit_report(
     codec: Codec,
     body: &[u8],
     env: &Env,
+    bearer: Option<&str>,
 ) -> std::result::Result<Vec<u8>, ConnectError> {
     let req: SubmitReportRequest = codec.decode(body)?;
-    let do_name = resolve_do_name_for_job(env, &req.job_id).await?;
-    let store = RunCoordinatorStore::new(env, &do_name).map_err(coordinator_error)?;
+    let claims = authenticate_ingest_bearer(env, bearer)?;
+    let identity = resolve_job_identity(env, &req.job_id).await?;
+    require_matching_identity(&claims, &identity)?;
+    let store = RunCoordinatorStore::new(env, &identity.do_name).map_err(coordinator_error)?;
     store.submit_report(&req).await.map_err(coordinator_error)?;
     codec.encode(&SubmitReportResponse::default())
 }
@@ -1499,30 +1506,9 @@ async fn handle_submit_resource_samples(
     bearer: Option<&str>,
 ) -> std::result::Result<Vec<u8>, ConnectError> {
     let req: SubmitResourceSamplesRequest = codec.decode(body)?;
-
-    let Some(bearer) = bearer else {
-        return Err(ConnectError::new(
-            Code::Unauthenticated,
-            "missing bearer ingest token",
-        ));
-    };
-    let secret = ingest_token_secret(env)?;
-    let now_s = Date::now().as_millis() / 1000;
-    let claims = ingest_token::verify(&secret, bearer, now_s).map_err(|e| {
-        ConnectError::new(
-            Code::Unauthenticated,
-            format!("invalid or expired ingest token: {e}"),
-        )
-    })?;
-
-    let identity = resolve_job_run_identity_for_resource_samples(env, &req.job_id).await?;
-    if claims.repo_id != identity.repo_id || claims.run_id != identity.run_id {
-        return Err(ConnectError::new(
-            Code::PermissionDenied,
-            "ingest token does not match this job's own run/repo",
-        ));
-    }
-
+    let claims = authenticate_ingest_bearer(env, bearer)?;
+    let identity = resolve_job_identity(env, &req.job_id).await?;
+    require_matching_identity(&claims, &identity)?;
     let store = RunCoordinatorStore::new(env, &identity.do_name).map_err(coordinator_error)?;
     store
         .submit_resource_samples(&req)
@@ -1535,10 +1521,13 @@ async fn handle_complete_shard(
     codec: Codec,
     body: &[u8],
     env: &Env,
+    bearer: Option<&str>,
 ) -> std::result::Result<Vec<u8>, ConnectError> {
     let req: CompleteShardRequest = codec.decode(body)?;
-    let do_name = resolve_do_name_for_job(env, &req.job_id).await?;
-    let store = RunCoordinatorStore::new(env, &do_name).map_err(coordinator_error)?;
+    let claims = authenticate_ingest_bearer(env, bearer)?;
+    let identity = resolve_job_identity(env, &req.job_id).await?;
+    require_matching_identity(&claims, &identity)?;
+    let store = RunCoordinatorStore::new(env, &identity.do_name).map_err(coordinator_error)?;
     store
         .complete_shard(&req)
         .await
@@ -1546,79 +1535,64 @@ async fn handle_complete_shard(
     codec.encode(&CompleteShardResponse::default())
 }
 
-/// `CreateUpload`/`SubmitReport`/`CompleteShard` only carry a `job_id`;
-/// resolves it to the owning run's Durable Object name the same way
-/// [`resolve_do_name_for_run`] does for a `run_id`.
-async fn resolve_do_name_for_job(
-    env: &Env,
-    job_id: &str,
-) -> std::result::Result<String, ConnectError> {
-    #[derive(serde::Deserialize)]
-    struct RunIdentity {
-        repo_id: i64,
-        sha: String,
-        run_key: String,
-        attempt: i64,
-    }
-
-    let db = env
-        .d1("DB")
-        .map_err(|e| ConnectError::new(Code::Internal, format!("D1 unavailable: {e}")))?;
-    let row: Option<RunIdentity> = db
-        .prepare(
-            "SELECT runs.repo_id as repo_id, runs.sha as sha, runs.run_key as run_key, runs.attempt as attempt \
-             FROM jobs JOIN runs ON jobs.run_id = runs.id WHERE jobs.id = ?1",
-        )
-        .bind(&[job_id.into()])
-        .map_err(|e| ConnectError::new(Code::Internal, format!("D1 bind failed: {e}")))?
-        .first(None)
-        .await
-        .map_err(|e| ConnectError::new(Code::Internal, format!("D1 query failed: {e}")))?;
-
-    match row {
-        Some(r) => Ok(coordinator::do_name(
-            r.repo_id as u64,
-            &r.sha,
-            &r.run_key,
-            r.attempt as u32,
-        )),
-        None => Err(ConnectError::new(
-            Code::NotFound,
-            format!("job {job_id} not found"),
-        )),
-    }
-}
-
-/// `SubmitResourceSamples`-only sibling of [`resolve_do_name_for_job`]:
-/// also returns the owning run's own `id` (the ULID `run_id`), not just
-/// enough to derive the DO name, so [`handle_submit_resource_samples`]
-/// can cross-check an ingest token's `run_id`/`repo_id` claims against
-/// this job's *real* run before ever reaching the DO — "run/repo
-/// inferred from the authorized job, never trusted client linkage"
-/// (docs/design/auth.md's Machine auth section).
+/// `repo_id`/`run_id` resolved independently via D1, never trusted from
+/// the request itself.
 struct JobRunIdentity {
     do_name: String,
     repo_id: u64,
     run_id: String,
 }
 
-async fn resolve_job_run_identity_for_resource_samples(
+async fn resolve_run_identity(
+    env: &Env,
+    run_id: &str,
+) -> std::result::Result<JobRunIdentity, ConnectError> {
+    #[derive(serde::Deserialize)]
+    struct Row {
+        repo_id: i64,
+        sha: String,
+        run_key: String,
+        attempt: i64,
+    }
+    let db = env
+        .d1("DB")
+        .map_err(|e| ConnectError::new(Code::Internal, format!("D1 unavailable: {e}")))?;
+    let row: Option<Row> = db
+        .prepare("SELECT repo_id, sha, run_key, attempt FROM runs WHERE id = ?1")
+        .bind(&[run_id.into()])
+        .map_err(|e| ConnectError::new(Code::Internal, format!("D1 bind failed: {e}")))?
+        .first(None)
+        .await
+        .map_err(|e| ConnectError::new(Code::Internal, format!("D1 query failed: {e}")))?;
+    match row {
+        Some(r) => Ok(JobRunIdentity {
+            do_name: coordinator::do_name(r.repo_id as u64, &r.sha, &r.run_key, r.attempt as u32),
+            repo_id: r.repo_id as u64,
+            run_id: run_id.to_string(),
+        }),
+        None => Err(ConnectError::new(
+            Code::NotFound,
+            format!("run {run_id} not found"),
+        )),
+    }
+}
+
+async fn resolve_job_identity(
     env: &Env,
     job_id: &str,
 ) -> std::result::Result<JobRunIdentity, ConnectError> {
     #[derive(serde::Deserialize)]
-    struct RunIdentity {
+    struct Row {
         run_id: String,
         repo_id: i64,
         sha: String,
         run_key: String,
         attempt: i64,
     }
-
     let db = env
         .d1("DB")
         .map_err(|e| ConnectError::new(Code::Internal, format!("D1 unavailable: {e}")))?;
-    let row: Option<RunIdentity> = db
+    let row: Option<Row> = db
         .prepare(
             "SELECT runs.id as run_id, runs.repo_id as repo_id, runs.sha as sha, \
              runs.run_key as run_key, runs.attempt as attempt \
@@ -1629,7 +1603,6 @@ async fn resolve_job_run_identity_for_resource_samples(
         .first(None)
         .await
         .map_err(|e| ConnectError::new(Code::Internal, format!("D1 query failed: {e}")))?;
-
     match row {
         Some(r) => Ok(JobRunIdentity {
             do_name: coordinator::do_name(r.repo_id as u64, &r.sha, &r.run_key, r.attempt as u32),
@@ -1643,27 +1616,25 @@ async fn resolve_job_run_identity_for_resource_samples(
     }
 }
 
-/// `CompleteUpload` only carries an `upload_id`; resolves it to the owning
-/// run's Durable Object name via the `uploads` -> `jobs` -> `runs`
-/// projection join.
-async fn resolve_do_name_for_upload(
+async fn resolve_upload_identity(
     env: &Env,
     upload_id: &str,
-) -> std::result::Result<String, ConnectError> {
+) -> std::result::Result<JobRunIdentity, ConnectError> {
     #[derive(serde::Deserialize)]
-    struct RunIdentity {
+    struct Row {
+        run_id: String,
         repo_id: i64,
         sha: String,
         run_key: String,
         attempt: i64,
     }
-
     let db = env
         .d1("DB")
         .map_err(|e| ConnectError::new(Code::Internal, format!("D1 unavailable: {e}")))?;
-    let row: Option<RunIdentity> = db
+    let row: Option<Row> = db
         .prepare(
-            "SELECT runs.repo_id as repo_id, runs.sha as sha, runs.run_key as run_key, runs.attempt as attempt \
+            "SELECT runs.id as run_id, runs.repo_id as repo_id, runs.sha as sha, \
+             runs.run_key as run_key, runs.attempt as attempt \
              FROM uploads JOIN jobs ON uploads.job_id = jobs.id JOIN runs ON jobs.run_id = runs.id \
              WHERE uploads.id = ?1",
         )
@@ -1672,14 +1643,12 @@ async fn resolve_do_name_for_upload(
         .first(None)
         .await
         .map_err(|e| ConnectError::new(Code::Internal, format!("D1 query failed: {e}")))?;
-
     match row {
-        Some(r) => Ok(coordinator::do_name(
-            r.repo_id as u64,
-            &r.sha,
-            &r.run_key,
-            r.attempt as u32,
-        )),
+        Some(r) => Ok(JobRunIdentity {
+            do_name: coordinator::do_name(r.repo_id as u64, &r.sha, &r.run_key, r.attempt as u32),
+            repo_id: r.repo_id as u64,
+            run_id: r.run_id,
+        }),
         None => Err(ConnectError::new(
             Code::NotFound,
             format!("upload {upload_id} not found"),
@@ -1701,6 +1670,7 @@ fn parse_upload_part_path(path: &str) -> Option<(&str, u32)> {
 
 struct UploadForPart {
     repo_id: u64,
+    run_id: String,
     r2_key: String,
     sha256: String,
 }
@@ -1709,13 +1679,14 @@ async fn lookup_upload_for_part(env: &Env, upload_id: &str) -> Result<Option<Upl
     #[derive(serde::Deserialize)]
     struct Row {
         repo_id: i64,
+        run_id: String,
         r2_key: String,
         sha256: String,
     }
     let db = env.d1("DB")?;
     let row: Option<Row> = db
         .prepare(
-            "SELECT runs.repo_id as repo_id, uploads.r2_key as r2_key, uploads.sha256 as sha256 \
+            "SELECT runs.repo_id as repo_id, runs.id as run_id, uploads.r2_key as r2_key, uploads.sha256 as sha256 \
              FROM uploads JOIN jobs ON uploads.job_id = jobs.id JOIN runs ON jobs.run_id = runs.id \
              WHERE uploads.id = ?1",
         )
@@ -1724,6 +1695,7 @@ async fn lookup_upload_for_part(env: &Env, upload_id: &str) -> Result<Option<Upl
         .await?;
     Ok(row.map(|r| UploadForPart {
         repo_id: r.repo_id as u64,
+        run_id: r.run_id,
         r2_key: r.r2_key,
         sha256: r.sha256,
     }))
@@ -1774,13 +1746,17 @@ async fn handle_upload_part(mut req: Request, env: &Env) -> Result<Response> {
         Err(_) => return Response::error("invalid or expired ingest token", 401),
     };
 
-    // Security consideration: a part PUT without a valid token for the
-    // owning run's `repo_id` is rejected before touching R2.
+    // A part PUT must match both the owning run's `repo_id` and its own
+    // `run_id` — repo_id alone would let a valid token for a different
+    // run under the same repo overwrite this upload's bytes.
     let Some(info) = lookup_upload_for_part(env, &upload_id).await? else {
         return Response::error("upload not found", 404);
     };
-    if info.repo_id != claims.repo_id {
-        return Response::error("ingest token does not match the upload's repo", 403);
+    if info.repo_id != claims.repo_id || info.run_id != claims.run_id {
+        return Response::error(
+            "ingest token does not match this upload's own run/repo",
+            403,
+        );
     }
 
     let bytes = req.bytes().await?;

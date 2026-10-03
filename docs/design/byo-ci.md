@@ -408,6 +408,12 @@ outlives it — GitHub-issued OIDC JWTs are themselves short-lived [unverified e
 documented as a fixed duration in GitHub's reference docs], so the exchange, not the original
 JWT, is what the rest of the run relies on.
 
+Every call after `BeginRun` — `StartJob`, `CreateUpload`, `CompleteUpload`, `SubmitReport`,
+`CompleteShard`, and the raw upload-part `PUT` — authenticates with this token and cross-checks
+**both** its `repo_id` and `run_id` claims against the request's real owning run, resolved
+independently via D1: a token valid for one run authorizes nothing for a different run under
+the same repo.
+
 ### Checks and scopes
 
 External jobs attach to the same named-check and report-scope model managed pipelines use:
@@ -623,8 +629,9 @@ only specifies what `cloud-ci upload` writes, not how it's served.
 ## Security considerations
 
 - **Token scope.** Ingest tokens (OIDC-exchanged or API-token-derived) carry `scope: ["ingest:write"]`
-  and a `repo_id` claim; the Worker rejects any call whose target `repo_id` doesn't match.
-  Neither credential can read, cancel, or modify anything outside ingest for that one repo.
+  and `repo_id`/`run_id` claims; the Worker rejects any call whose target `repo_id` or `run_id`
+  doesn't match, resolved independently via D1, never trusted from the request itself. Neither
+  credential can read, cancel, or modify anything outside ingest for that one run.
 - **Audience pinning.** The CLI requests a deployment-specific `aud` for its OIDC JWT rather
   than accepting GitHub's default (the repository owner's URL), so a JWT minted for one
   `cloud-ci` deployment cannot be replayed against a different Connect RPC audience or a
@@ -640,8 +647,8 @@ only specifies what `cloud-ci upload` writes, not how it's served.
   inherent to `pull_request_target` generally, not specific to `cloud-ci`, and one we do not
   paper over.
 - **Upload parts are keyed by an unguessable `upload_id` (ULID)** plus the bearer ingest token;
-  a part PUT without a valid token for the owning run's `repo_id` is rejected before touching
-  R2.
+  a part PUT without a valid token matching both the owning run's `repo_id` and `run_id` is
+  rejected before touching R2.
 - **Part size cap enforced before touching R2.** The Worker rejects any part whose
   `Content-Length` exceeds 32 MiB at the HTTP layer, so an oversized or hostile upload never
   reaches the R2 binding.
