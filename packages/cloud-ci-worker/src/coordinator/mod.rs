@@ -128,6 +128,52 @@
 //! completion events for cancelled nodes are dropped" — rather than an
 //! error or a relabel.
 
+//! ## Shard groups / merge barrier
+//!
+//! docs/design/parallelization.md's "### Merge barrier (RunCoordinator)"
+//! and "### Failed-shard retry semantics" describe `job_group`/
+//! `shard_state` and the barrier a shard group's terminal shard-ingest
+//! calls evaluate. This round builds the **state machine only** —
+//! [`RunCoordinator::handle_register_shard_group`] and
+//! [`RunCoordinator::handle_shard_terminal`] (pure decisions in
+//! [`logic`]'s "Shard groups / merge barrier" section) — never real merge
+//! execution or real container cancellation:
+//!
+//! - **No merge execution.** No JUnit/coverage parsing
+//!   (`cloud-ci-reports`), no generated `<id>/merge` container node, no
+//!   `post-run-analysis` Queue consumer. `handle_shard_terminal` returns
+//!   [`ShardBarrierDecision::Satisfied`] (`merge`/`included_idxs`) as a
+//!   pure decision; nothing dispatches it. That is a separate, later
+//!   round, same "foundation ahead of its full caller" pattern as the
+//!   Nodes section above.
+//! - **No real cancellation wiring.** `fail_fast`'s
+//!   [`ShardBarrierDecision::FailFastTriggered`] only returns the *set*
+//!   of shard indices that should be cancelled
+//!   ([`logic::evaluate_barrier`]'s doc comment explains why: shards are
+//!   not yet modeled as `node` rows this round — there is no RPC to
+//!   register "shard N started running" — so there is no real container
+//!   handle for `handle_shard_terminal` to hand to
+//!   [`RunCoordinator::stop_node_container`]/[`RunCoordinator::handle_cancel_run`]
+//!   yet). A future round that dispatches shards as real nodes can wire
+//!   this decision straight into that existing cancellation path.
+//! - **Idempotency** matches [`logic::resolve_complete_node`]'s exact
+//!   discipline, applied to shards: [`logic::resolve_shard_terminal`]
+//!   treats a redelivered call with the same terminal status as a no-op
+//!   that never re-evaluates the barrier, and a redelivered call with a
+//!   *different* terminal status as a 409 conflict. A late-finishing
+//!   shard after its group already reached a terminal decision
+//!   (`job_group.status` no longer `running`) resolves to
+//!   [`ShardBarrierDecision::GroupAlreadyTerminal`] instead of
+//!   re-evaluating the barrier a second time.
+//! - **Storage.** `job_group`/`shard_state` (see [`ensure_schema`]) are
+//!   DO-local only, keyed by `job_name` and `(job_name, idx, attempt)`
+//!   respectively — this DO instance *is* one run, same "run_id
+//!   implicit" pattern as every other table here. `shard_state` has a D1
+//!   projection (`shard_states`, migration 0014); `job_group` does not —
+//!   migration 0014's own comment explains why (no reader yet, same
+//!   reasoning migration 0011 used to exclude `report_summaries`/
+//!   `test_failures`).
+
 pub mod logic;
 
 use crate::github_checks;
@@ -327,6 +373,73 @@ pub struct CancelRunOutcome {
     pub cancelled_nodes: Vec<String>,
 }
 
+/// `registerShardGroup(job_name, expected_total, fail_fast,
+/// merge_on_failure)` — module docs' "Shard groups / merge barrier"
+/// section. `merge_on_failure` must be one of
+/// [`logic::MergeOnFailure::from_db_str`]'s three values.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterShardGroupRequest {
+    pub job_name: String,
+    pub expected_total: u32,
+    pub fail_fast: bool,
+    pub merge_on_failure: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterShardGroupOutcome {
+    pub job_name: String,
+}
+
+/// `shardTerminal(job_name, idx, attempt, status, report_key,
+/// duration_ms)` — one shard's terminal ingest call (module docs' "Shard
+/// groups / merge barrier" section). `status` must be one of
+/// [`logic::ShardTerminalStatus::from_db_str`]'s two terminal values.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardTerminalRequest {
+    pub job_name: String,
+    pub idx: u32,
+    pub attempt: u32,
+    pub status: String,
+    pub report_key: Option<String>,
+    pub duration_ms: Option<i64>,
+}
+
+/// The barrier decision produced by a `shardTerminal` call, per
+/// [`logic::BarrierOutcome`] plus the duplicate-redelivery and
+/// already-terminal-group cases that never reach `evaluate_barrier` at
+/// all. **Decision only** — see `coordinator` module docs' "Shard groups
+/// / merge barrier" section for exactly what is and is not wired from
+/// here: `FailFastTriggered.cancel_idxs` is not stopped as a real
+/// container, and `Satisfied` does not dispatch any real merge.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ShardBarrierDecision {
+    /// This exact `(job_name, idx, attempt)` terminal status was already
+    /// recorded by an earlier call — the barrier was not re-evaluated.
+    Duplicate,
+    /// The group already reached a terminal decision
+    /// (`FailFastTriggered`/`Satisfied`) before this call arrived — a
+    /// late-finishing shard after the group already decided. The shard's
+    /// own row is still recorded, but the barrier is not re-evaluated.
+    GroupAlreadyTerminal,
+    Waiting,
+    FailFastTriggered {
+        cancel_idxs: Vec<u32>,
+    },
+    Satisfied {
+        merge: bool,
+        included_idxs: Vec<u32>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardTerminalOutcome {
+    pub job_name: String,
+    pub idx: u32,
+    pub attempt: u32,
+    pub decision: ShardBarrierDecision,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct ErrorBody {
     error: String,
@@ -413,6 +526,47 @@ struct NodeRow {
     /// JSON-encoded `Vec<String>` (`StartNodeRequest.command`'s on-disk
     /// form, matching `check_names`' existing JSON-column convention).
     command: String,
+}
+
+/// One shard group's `job_group` row, keyed by `job_name` alone — this DO
+/// instance *is* one run, same "run_id implicit" pattern as every other
+/// DO-local table (module docs' "Shard groups / merge barrier" section).
+/// `status` is this implementation's own addition beyond
+/// parallelization.md's literal `job_group` columns (`job_name`,
+/// `expected_total`, `fail_fast`, `merge_on_failure`, `merge_job_id`): it
+/// is what makes a redelivered/late shard-terminal call after the group
+/// already decided (`failed` via fail-fast, or `satisfied` via the normal
+/// barrier) resolve to [`ShardBarrierDecision::GroupAlreadyTerminal`]
+/// instead of re-evaluating the barrier a second time — the same role
+/// `node.status`/`run.status` already play for their own idempotency
+/// guards elsewhere in this file.
+#[derive(Debug, Clone, Deserialize)]
+struct ShardGroupRow {
+    /// Only used to populate the `SELECT` column binding; the caller
+    /// already knows the `job_name` it queried by.
+    #[allow(dead_code)]
+    job_name: String,
+    expected_total: i64,
+    fail_fast: i64,
+    merge_on_failure: String,
+    /// Reserved for the later merge-execution round that actually
+    /// dispatches the generated `<id>/merge` node or Queue consumer job
+    /// (module docs' scope boundary) — never set or read this round.
+    #[allow(dead_code)]
+    merge_job_id: Option<String>,
+    /// `running | failed | satisfied`.
+    status: String,
+}
+
+/// One shard's terminal row, keyed by `(job_name, idx, attempt)` — one
+/// row per terminal ingest call, never for a shard still
+/// `queued`/`running` (this round has no RPC to register those; see
+/// module docs' scope boundary).
+#[derive(Debug, Clone, Deserialize)]
+struct ShardStateDbRow {
+    idx: i64,
+    attempt: i64,
+    status: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -571,6 +725,14 @@ impl DurableObject for RunCoordinator {
                 self.handle_ack_node(&sql, body).await
             }
             (Method::Post, "/cancel-run") => self.handle_cancel_run(&sql).await,
+            (Method::Post, "/register-shard-group") => {
+                let body: RegisterShardGroupRequest = req.json().await?;
+                self.handle_register_shard_group(&sql, body).await
+            }
+            (Method::Post, "/shard-terminal") => {
+                let body: ShardTerminalRequest = req.json().await?;
+                self.handle_shard_terminal(&sql, body).await
+            }
             _ => error_response(404, "unknown RunCoordinator route"),
         }
     }
@@ -2091,6 +2253,194 @@ impl RunCoordinator {
         Ok(())
     }
 
+    /// Projects one terminal `shard_state` row into D1's `shard_states`
+    /// table (migration 0014), keyed by `(run_id, job_name, idx,
+    /// attempt)` since D1 is shared across runs — same split as
+    /// [`Self::project_node_to_d1`]. `job_group` is deliberately not
+    /// projected (module docs' "Shard groups / merge barrier" section).
+    async fn project_shard_state_to_d1(
+        &self,
+        run_id: &str,
+        job_name: &str,
+        row: &ShardStateDbRow,
+        report_key: Option<&str>,
+        duration_ms: Option<i64>,
+        finished_at_ms: i64,
+    ) -> worker::Result<()> {
+        let db = self.env.d1("DB")?;
+        db.prepare(
+            "INSERT INTO shard_states (run_id, job_name, idx, attempt, status, report_key, duration_ms, finished_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+             ON CONFLICT (run_id, job_name, idx, attempt) DO UPDATE SET \
+               status = excluded.status, \
+               report_key = excluded.report_key, \
+               duration_ms = excluded.duration_ms, \
+               finished_at = excluded.finished_at",
+        )
+        .bind(&[
+            JsValue::from_str(run_id),
+            JsValue::from_str(job_name),
+            JsValue::from_f64(row.idx as f64),
+            JsValue::from_f64(row.attempt as f64),
+            JsValue::from_str(&row.status),
+            report_key.map_or(JsValue::NULL, JsValue::from_str),
+            duration_ms.map_or(JsValue::NULL, |v| JsValue::from_f64(v as f64)),
+            JsValue::from_f64(finished_at_ms as f64),
+        ])?
+        .run()
+        .await?;
+        Ok(())
+    }
+
+    /// `registerShardGroup(job_name, expected_total, fail_fast,
+    /// merge_on_failure)` — module docs' "Shard groups / merge barrier"
+    /// section, parallelization.md bullet 1. Idempotent: a redelivered
+    /// call for an already-registered `job_name` is a clean no-op
+    /// (existing config untouched), never a conflict — nothing in
+    /// parallelization.md documents a config-mismatch rejection for this
+    /// call the way `StartJob`'s `shard_total`/`BeginRun`'s
+    /// `expect_jobs` do, so this stays deliberately permissive rather
+    /// than inventing an undocumented conflict rule.
+    async fn handle_register_shard_group(
+        &self,
+        sql: &SqlStorage,
+        req: RegisterShardGroupRequest,
+    ) -> worker::Result<Response> {
+        if read_run(sql)?.is_none() {
+            return error_response(404, "run not found");
+        }
+        if logic::MergeOnFailure::from_db_str(&req.merge_on_failure).is_none() {
+            return error_response(400, "unknown merge_on_failure value");
+        }
+        if read_job_group(sql, &req.job_name)?.is_none() {
+            insert_job_group(
+                sql,
+                &req.job_name,
+                req.expected_total,
+                req.fail_fast,
+                &req.merge_on_failure,
+            )?;
+        }
+        Response::from_json(&RegisterShardGroupOutcome {
+            job_name: req.job_name,
+        })
+    }
+
+    /// One shard's terminal ingest call — module docs' "Shard groups /
+    /// merge barrier" section, parallelization.md bullets 2-4. Produces
+    /// [`ShardBarrierDecision`] only: see this module's doc comment and
+    /// [`logic::evaluate_barrier`]'s doc comment for the exact
+    /// decision-only scope boundary this round stops at (no real
+    /// cancellation, no real merge dispatch).
+    async fn handle_shard_terminal(
+        &self,
+        sql: &SqlStorage,
+        req: ShardTerminalRequest,
+    ) -> worker::Result<Response> {
+        let Some(run_row) = read_run(sql)? else {
+            return error_response(404, "run not found");
+        };
+        let Some(group) = read_job_group(sql, &req.job_name)? else {
+            return error_response(404, "shard group not registered");
+        };
+        let Some(incoming_status) = logic::ShardTerminalStatus::from_db_str(&req.status) else {
+            return error_response(400, "unknown shard terminal status");
+        };
+
+        let existing_status =
+            match read_shard_state_status(sql, &req.job_name, req.idx, req.attempt)? {
+                None => None,
+                Some(s) => Some(logic::ShardTerminalStatus::from_db_str(&s).ok_or_else(|| {
+                    worker::Error::RustError("unknown shard_state status already stored".into())
+                })?),
+            };
+
+        let decision = match logic::resolve_shard_terminal(existing_status, incoming_status) {
+            Err(logic::ConflictingShardStatus) => {
+                return error_response(
+                    409,
+                    "shard already concluded with a different terminal status",
+                );
+            }
+            Ok(logic::ShardTerminalDecision::AlreadyRecorded) => ShardBarrierDecision::Duplicate,
+            Ok(logic::ShardTerminalDecision::Recorded) => {
+                let now_ms = worker::Date::now().as_millis() as i64;
+                insert_shard_state(
+                    sql,
+                    &req.job_name,
+                    req.idx,
+                    req.attempt,
+                    incoming_status.as_db_str(),
+                    req.report_key.as_deref(),
+                    req.duration_ms,
+                    now_ms,
+                )?;
+                self.project_shard_state_to_d1(
+                    &run_row.id,
+                    &req.job_name,
+                    &ShardStateDbRow {
+                        idx: req.idx as i64,
+                        attempt: req.attempt as i64,
+                        status: incoming_status.as_db_str().to_string(),
+                    },
+                    req.report_key.as_deref(),
+                    req.duration_ms,
+                    now_ms,
+                )
+                .await?;
+
+                if group.status != "running" {
+                    // Module docs' "Shard groups / merge barrier"
+                    // section: a late-finishing shard after the group
+                    // already decided (fail-fast or satisfied) is
+                    // recorded but does not re-run the barrier.
+                    ShardBarrierDecision::GroupAlreadyTerminal
+                } else {
+                    let Some(merge_on_failure) =
+                        logic::MergeOnFailure::from_db_str(&group.merge_on_failure)
+                    else {
+                        return Err(worker::Error::RustError(format!(
+                            "unknown merge_on_failure stored for {}: {}",
+                            req.job_name, group.merge_on_failure
+                        )));
+                    };
+                    let config = logic::JobGroupConfig {
+                        expected_total: group.expected_total as u32,
+                        fail_fast: group.fail_fast != 0,
+                        merge_on_failure,
+                    };
+                    let latest_terminal = logic::latest_attempt_per_shard(
+                        &read_all_shard_terminal_rows(sql, &req.job_name)?,
+                    );
+                    match logic::evaluate_barrier(config, &latest_terminal, incoming_status) {
+                        logic::BarrierOutcome::Waiting => ShardBarrierDecision::Waiting,
+                        logic::BarrierOutcome::FailFastTriggered { cancel_idxs } => {
+                            update_job_group_status(sql, &req.job_name, "failed")?;
+                            ShardBarrierDecision::FailFastTriggered { cancel_idxs }
+                        }
+                        logic::BarrierOutcome::Satisfied {
+                            merge,
+                            included_idxs,
+                        } => {
+                            update_job_group_status(sql, &req.job_name, "satisfied")?;
+                            ShardBarrierDecision::Satisfied {
+                                merge,
+                                included_idxs,
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        Response::from_json(&ShardTerminalOutcome {
+            job_name: req.job_name,
+            idx: req.idx,
+            attempt: req.attempt,
+            decision,
+        })
+    }
+
     /// Best-effort resolution of the installation token needed to call
     /// GitHub's Check Run API for `repo_id` — the same
     /// `roles::lookup_repo_owner` + App-JWT-mint + installation-token
@@ -2479,6 +2829,30 @@ fn ensure_schema(sql: &SqlStorage) -> worker::Result<()> {
             acked INTEGER NOT NULL DEFAULT 0, \
             image TEXT NOT NULL DEFAULT '', \
             command TEXT NOT NULL DEFAULT '[]' \
+        )",
+        None,
+    )?;
+    sql.exec(
+        "CREATE TABLE IF NOT EXISTS job_group ( \
+            job_name TEXT PRIMARY KEY, \
+            expected_total INTEGER NOT NULL, \
+            fail_fast INTEGER NOT NULL, \
+            merge_on_failure TEXT NOT NULL, \
+            merge_job_id TEXT, \
+            status TEXT NOT NULL DEFAULT 'running' \
+        )",
+        None,
+    )?;
+    sql.exec(
+        "CREATE TABLE IF NOT EXISTS shard_state ( \
+            job_name TEXT NOT NULL, \
+            idx INTEGER NOT NULL, \
+            attempt INTEGER NOT NULL DEFAULT 1, \
+            status TEXT NOT NULL, \
+            report_key TEXT, \
+            duration_ms INTEGER, \
+            finished_at INTEGER, \
+            PRIMARY KEY (job_name, idx, attempt) \
         )",
         None,
     )?;
@@ -3207,6 +3581,137 @@ fn mark_node_cancelled(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Shard groups / merge barrier (`job_group`/`shard_state`, module docs'
+// "Shard groups / merge barrier" section).
+// ---------------------------------------------------------------------------
+
+const JOB_GROUP_COLUMNS: &str =
+    "job_name, expected_total, fail_fast, merge_on_failure, merge_job_id, status";
+
+fn read_job_group(sql: &SqlStorage, job_name: &str) -> worker::Result<Option<ShardGroupRow>> {
+    let rows: Vec<ShardGroupRow> = sql
+        .exec(
+            &format!("SELECT {JOB_GROUP_COLUMNS} FROM job_group WHERE job_name = ?1"),
+            vec![SqlStorageValue::from(job_name)],
+        )?
+        .to_array()?;
+    Ok(rows.into_iter().next())
+}
+
+fn insert_job_group(
+    sql: &SqlStorage,
+    job_name: &str,
+    expected_total: u32,
+    fail_fast: bool,
+    merge_on_failure: &str,
+) -> worker::Result<()> {
+    sql.exec(
+        "INSERT INTO job_group (job_name, expected_total, fail_fast, merge_on_failure, merge_job_id, status) \
+         VALUES (?1, ?2, ?3, ?4, NULL, 'running')",
+        vec![
+            SqlStorageValue::from(job_name),
+            SqlStorageValue::try_from_i64(i64::from(expected_total))?,
+            SqlStorageValue::try_from_i64(i64::from(fail_fast))?,
+            SqlStorageValue::from(merge_on_failure),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Transitions a group out of `running` once [`logic::evaluate_barrier`]
+/// returns a decision — `failed` for `FailFastTriggered`, `satisfied` for
+/// `Satisfied`. Never called back to `running`: both are terminal group
+/// states (module docs' "Shard groups / merge barrier" section).
+fn update_job_group_status(sql: &SqlStorage, job_name: &str, status: &str) -> worker::Result<()> {
+    sql.exec(
+        "UPDATE job_group SET status = ?1 WHERE job_name = ?2",
+        vec![
+            SqlStorageValue::from(status),
+            SqlStorageValue::from(job_name),
+        ],
+    )?;
+    Ok(())
+}
+
+/// The exact `(job_name, idx, attempt)` row's status, if a terminal
+/// ingest call already recorded one — [`logic::resolve_shard_terminal`]'s
+/// `existing_status` input.
+fn read_shard_state_status(
+    sql: &SqlStorage,
+    job_name: &str,
+    idx: u32,
+    attempt: u32,
+) -> worker::Result<Option<String>> {
+    let rows: Vec<ShardStateDbRow> = sql
+        .exec(
+            "SELECT idx, attempt, status FROM shard_state WHERE job_name = ?1 AND idx = ?2 AND attempt = ?3",
+            vec![
+                SqlStorageValue::from(job_name),
+                SqlStorageValue::try_from_i64(i64::from(idx))?,
+                SqlStorageValue::try_from_i64(i64::from(attempt))?,
+            ],
+        )?
+        .to_array()?;
+    Ok(rows.into_iter().next().map(|r| r.status))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_shard_state(
+    sql: &SqlStorage,
+    job_name: &str,
+    idx: u32,
+    attempt: u32,
+    status: &str,
+    report_key: Option<&str>,
+    duration_ms: Option<i64>,
+    finished_at_ms: i64,
+) -> worker::Result<()> {
+    sql.exec(
+        "INSERT INTO shard_state (job_name, idx, attempt, status, report_key, duration_ms, finished_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        vec![
+            SqlStorageValue::from(job_name),
+            SqlStorageValue::try_from_i64(i64::from(idx))?,
+            SqlStorageValue::try_from_i64(i64::from(attempt))?,
+            SqlStorageValue::from(status),
+            SqlStorageValue::from(report_key.map(str::to_string)),
+            SqlStorageValue::from(duration_ms),
+            SqlStorageValue::try_from_i64(finished_at_ms)?,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Every terminal row recorded so far for `job_name`, across every
+/// attempt of every shard — [`logic::latest_attempt_per_shard`]'s input.
+/// Every row in `shard_state` is already terminal by construction (this
+/// round only ever inserts a row from a terminal ingest call; see
+/// `ShardStateDbRow`'s doc comment), so no status filter is needed here.
+fn read_all_shard_terminal_rows(
+    sql: &SqlStorage,
+    job_name: &str,
+) -> worker::Result<Vec<logic::ShardStateRow>> {
+    let rows: Vec<ShardStateDbRow> = sql
+        .exec(
+            "SELECT idx, attempt, status FROM shard_state WHERE job_name = ?1",
+            vec![SqlStorageValue::from(job_name)],
+        )?
+        .to_array()?;
+    rows.into_iter()
+        .map(|row| {
+            let status = logic::ShardTerminalStatus::from_db_str(&row.status).ok_or_else(|| {
+                worker::Error::RustError(format!("unknown shard_state status: {}", row.status))
+            })?;
+            Ok(logic::ShardStateRow {
+                idx: row.idx as u32,
+                attempt: row.attempt as u32,
+                status,
+            })
+        })
+        .collect()
+}
+
 /// `RunCoordinator`'s own per-run monotonic counter for `accepted_seq`
 /// (byo-ci.md's Idempotency section), derived from the DO's own storage
 /// rather than a dedicated counter column: one more than the highest
@@ -3540,6 +4045,21 @@ impl RunCoordinatorStore {
 
     pub async fn cancel_run(&self) -> Result<CancelRunOutcome, CoordinatorError> {
         self.call::<(), _>(Method::Post, "/cancel-run", None).await
+    }
+
+    pub async fn register_shard_group(
+        &self,
+        req: &RegisterShardGroupRequest,
+    ) -> Result<RegisterShardGroupOutcome, CoordinatorError> {
+        self.call(Method::Post, "/register-shard-group", Some(req))
+            .await
+    }
+
+    pub async fn shard_terminal(
+        &self,
+        req: &ShardTerminalRequest,
+    ) -> Result<ShardTerminalOutcome, CoordinatorError> {
+        self.call(Method::Post, "/shard-terminal", Some(req)).await
     }
 
     async fn call<B, R>(

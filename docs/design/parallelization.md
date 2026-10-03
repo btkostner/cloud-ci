@@ -272,6 +272,15 @@ token) RPCs into `RunCoordinator`, which updates `shard_state` and checks:
   any other node — merge dispatch still respects `RepoState`'s per-repo concurrency cap, so it may
   wait briefly behind other running containers.
 
+**Implementation status.** `shard_state`/`job_group` and the barrier logic above are built as a
+state machine only (`cloud-ci-worker`'s `coordinator::logic` "Shard groups / merge barrier"
+section, `coordinator::mod`'s `handle_register_shard_group`/`handle_shard_terminal`): every rule
+on this page is decided correctly and unit-tested, but nothing dispatches the decision yet — no
+real `job-dispatch` Queue enqueue, no generated `<id>/merge` node, and `fail_fast`'s cancellation
+is a computed shard-index set only, not a real `stop_node_container`/`handle_cancel_run` call
+(shards are not yet modeled as `node` rows, so there is nothing to stop). See
+`coordinator::mod`'s "Shard groups / merge barrier" module-doc section for the exact boundary.
+
 ### Merge strategies per report type
 
 | Report type | Where merged | Default command |
