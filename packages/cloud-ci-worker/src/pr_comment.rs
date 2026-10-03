@@ -166,6 +166,7 @@
 //! scope items (context struct, built-in template, byte budget).
 
 use crate::ai_insight;
+use crate::ai_redact;
 use base64::Engine;
 use minijinja::Environment;
 use serde::Serialize;
@@ -642,14 +643,18 @@ pub fn attach_ai_summaries(
     insights: &[(String, ai_insight::FailureSummary)],
 ) {
     for failure in failures.iter_mut() {
-        let frames: Vec<&str> = failure
+        let redacted_message = ai_redact::redact(&failure.message);
+        let redacted_stack: Option<Vec<String>> = failure
             .stack
             .as_deref()
-            .map(|stack| stack.lines().collect())
+            .map(|stack| stack.lines().map(ai_redact::redact).collect());
+        let frames: Vec<&str> = redacted_stack
+            .as_ref()
+            .map(|lines| lines.iter().map(String::as_str).collect())
             .unwrap_or_default();
         let fingerprint = ai_insight::failure_fingerprint(
             &failure.test,
-            &failure.message,
+            &redacted_message,
             &frames,
             ai_insight::DEFAULT_LIBRARY_PATTERNS,
         );
@@ -1476,5 +1481,42 @@ Base `main` @ `abc1234` · [Dashboard](https://ci.example.com/acme/web/pull/412)
         assert_eq!(failures[0].ai_summary, Some(render_ai_summary(&summary_a)));
         assert_eq!(failures[1].ai_summary, Some(render_ai_summary(&summary_b)));
         assert_ne!(failures[0].ai_summary, failures[1].ai_summary);
+    }
+
+    #[test]
+    fn attach_ai_summaries_matches_failure_whose_message_and_stack_contain_a_secret() {
+        // The stored insight row's fingerprint (what `ai_queue::assemble_failure_context`
+        // actually persists) is computed on *redacted* content: `ai_redact::redact`
+        // runs first, then `ai_insight::failure_fingerprint`. A secret-shaped
+        // substring in the raw failure must not prevent the match.
+        let raw_message =
+            "request failed: Authorization: Bearer ghp_1234567890abcdef1234567890abcdef1234";
+        let raw_stack =
+            "at auth.ts:10\nAuthorization: Bearer ghp_1234567890abcdef1234567890abcdef1234";
+        let mut failures = vec![bare_failure(
+            "src/auth/login.test.ts › rejects bad token",
+            raw_message,
+            Some(raw_stack),
+        )];
+
+        // Mirror `ai_queue::assemble_failure_context`'s exact order: redact
+        // each field first, then fingerprint the redacted copies.
+        let redacted_message = ai_redact::redact(raw_message);
+        let redacted_frames: Vec<String> = raw_stack.lines().map(ai_redact::redact).collect();
+        let frames: Vec<&str> = redacted_frames.iter().map(String::as_str).collect();
+        let stored_fingerprint = ai_insight::failure_fingerprint(
+            "src/auth/login.test.ts › rejects bad token",
+            &redacted_message,
+            &frames,
+            ai_insight::DEFAULT_LIBRARY_PATTERNS,
+        );
+
+        // Sanity: the secret really did change the raw vs. redacted text,
+        // so a naive raw-content fingerprint would have differed.
+        assert_ne!(redacted_message, raw_message);
+
+        let summary = sample_summary("leaked bearer token", "rotate the token");
+        attach_ai_summaries(&mut failures, &[(stored_fingerprint, summary.clone())]);
+        assert_eq!(failures[0].ai_summary, Some(render_ai_summary(&summary)));
     }
 }
