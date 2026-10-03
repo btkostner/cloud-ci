@@ -1,3 +1,4 @@
+pub mod ai_insight;
 pub mod api_tokens;
 pub mod connect;
 pub mod container_probe;
