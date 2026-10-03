@@ -1,0 +1,26 @@
+{
+  "name": "@cloud-ci/pipeline-sdk",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "lint": "biome check .",
+    "fix": "biome check --write ."
+  },
+  "dependencies": {
+    "@cloudflare/dynamic-workflows": "0.1.1"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.15",
+    "@cloudflare/workers-types": "5.20261002.1",
+    "typescript": "7.0.2",
+    "vitest": "5.0.3"
+  },
+  "allowScripts": {
+    "fsevents@2.3.3": true
+  }
+}
