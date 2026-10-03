@@ -85,9 +85,28 @@ function loadScript(env: Env, metadata: ScriptMetadata) {
 // Entrypoint name must match `class_name` in wrangler.toml's `[[workflows]]`.
 // Reloads the right Dynamic Worker whenever the Workflows engine needs to
 // run a step, including after an isolate recycle (see module doc comment).
+//
+// `getEntrypoint()` with no argument returns the script's *default* export
+// — same entrypoint `POST /scripts` already calls `.fetch()` on below.
+// `@cloudflare/dynamic-workflows`'s `WorkflowRunner` contract only requires
+// a `run(event, step): Promise<R>` method (developers.cloudflare.com/
+// dynamic-workers/usage/dynamic-workflows, checked 2026-10-02): nothing in
+// that library's types or runtime requires the returned value to be a
+// `WorkflowEntrypoint` subclass — `getEntrypoint()`'s return type is
+// `Rpc.Stub<unknown>` reflecting the default export's own shape, and this
+// cast to `WorkflowRunner` is the same structural assertion the previous
+// `getEntrypoint("PipelineWorkflow")` line already made for the named
+// export. A plain object satisfying `{ fetch, run }` (what
+// `@cloud-ci/pipeline-sdk`'s `workflow()` returns, see
+// `pipeline-script-sdk.js`) is therefore an acceptable default export,
+// alongside the two raw-JS fixtures' `WorkflowEntrypoint` subclasses
+// (`getEntrypoint("PipelineWorkflow")` would still work for those too,
+// since they also declare a plain `export default { fetch }` — but this
+// single `getEntrypoint()` call now serves every fixture uniformly,
+// matching what `POST /scripts` already does for `fetch`).
 export const DynamicWorkflow = createDynamicWorkflowEntrypoint<Env>(async ({ env, metadata }) => {
   const stub = loadScript(env, metadata as ScriptMetadata);
-  return stub.getEntrypoint("PipelineWorkflow") as unknown as WorkflowRunner;
+  return stub.getEntrypoint() as unknown as WorkflowRunner;
 });
 
 export default {
