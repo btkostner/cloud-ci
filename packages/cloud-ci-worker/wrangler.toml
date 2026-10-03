@@ -19,6 +19,12 @@ GITHUB_ALLOWED_ORGS = ""
 # Placeholder until `cloud-ci setup` (a later round) writes this
 # deployment's real exchange URL here.
 CLOUD_CI_INGEST_AUDIENCE = ""
+# Cloudflare account id the Analytics Engine SQL API's URL path needs
+# (src/rollup.rs's `query_analytics_engine`, docs/design/analytics.md §
+# "Querying for rollups uses the SQL API") — not secret, same
+# public-identifier category as GITHUB_APP_ID above. Placeholder until
+# `cloud-ci setup` writes this deployment's real account id here.
+CLOUDFLARE_ACCOUNT_ID = ""
 
 [build]
 # Relative `cwd` values resolve against the invoking `wrangler` process's
@@ -183,5 +189,13 @@ new_sqlite_classes = ["NodeContainer"]
 # the `GET /app/installations` call volume (and the D1 reads/writes per
 # pass) low for a job whose entire purpose is catching the rare case, not
 # driving normal operation.
+# Analytics rollup cron (docs/design/analytics.md § "Data flow"'s
+# `Cron: */15 rollup` node, src/rollup.rs): every 15 minutes, queries the
+# Analytics Engine SQL API for terminal runs with no `run_rollups` row
+# yet and upserts one. 15 minutes matches analytics.md's own stated
+# cadence for this cron (distinct from the 20-minute installation
+# reconcile cron above) — `src/lib.rs`'s single `#[event(scheduled)]`
+# handler tells the two schedules apart by comparing `event.cron()`
+# against each literal string below.
 [triggers]
-crons = ["*/20 * * * *"]
+crons = ["*/15 * * * *", "*/20 * * * *"]

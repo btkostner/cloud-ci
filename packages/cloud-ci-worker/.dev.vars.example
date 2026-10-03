@@ -63,3 +63,24 @@ GITHUB_APP_CLIENT_ID=Iv1.localdevclientid
 # this becomes a Secrets Store binding once `cloud-ci setup github-app`
 # exists.
 GITHUB_APP_CLIENT_SECRET=local-dev-oauth-client-secret
+
+# Same [vars]-but-overridable-via-.dev.vars pattern as GITHUB_APP_ID
+# above: not secret — the Analytics Engine SQL API's URL path needs the
+# account id, src/rollup.rs's `query_analytics_engine`. Any value works
+# for local dev; `src/rollup.rs`'s live AE SQL API call cannot be
+# exercised without a real Cloudflare account id and `ANALYTICS_SQL_TOKEN`
+# below anyway (same not-live-verified posture as GITHUB_APP_CLIENT_SECRET
+# above), so this only needs to be non-empty to exercise the "which cron
+# fired" dispatch and candidate-selection D1 query locally.
+CLOUDFLARE_ACCOUNT_ID=0000000000000000000000000000000
+
+# Required secret, same fail-loudly-if-unset pattern as
+# GITHUB_WEBHOOK_SECRET above: src/rollup.rs's `*/15` cron refuses to
+# query the Analytics Engine SQL API (and logs, not panics — see
+# `rollup::run`'s doc comment) when this is unset. In production this is
+# a Cloudflare API token scoped to *Account Analytics Read* only
+# (docs/design/analytics.md § "Querying for rollups uses the SQL API"),
+# `wrangler secret put ANALYTICS_SQL_TOKEN`. Any non-empty value works for
+# local dev; the real HTTP call to Cloudflare's SQL API cannot be
+# exercised without a real token and account id.
+ANALYTICS_SQL_TOKEN=local-dev-analytics-sql-token

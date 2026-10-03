@@ -17,6 +17,7 @@ pub mod pull_request_webhook;
 pub mod reconcile;
 pub mod repo_state;
 pub mod roles;
+pub mod rollup;
 pub mod session;
 pub mod template_spike;
 pub mod test_stats;
@@ -112,9 +113,14 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
 }
 
 /// Cron Trigger entry point (`wrangler.toml`'s `[triggers]` `crons`):
-/// runs one full installation-reconcile pass ([`reconcile::run`]; see
-/// that module's docs and docs/design/auth.md's "Multiple orgs and
-/// installations" "Discovery" paragraph).
+/// `wrangler.toml` declares two schedules bound to this single handler
+/// (`*/20 * * * *` for the installation reconcile pass, `*/15 * * * *`
+/// for the analytics rollup cron, docs/design/analytics.md § "Data
+/// flow"'s `Cron: */15 rollup` node) — `event.cron()` is the exact cron
+/// string that fired this invocation (confirmed against worker-0.8.7's
+/// `schedule.rs`: `ScheduledEvent::cron` returns the triggering
+/// schedule's own string, not a Worker-wide constant), so matching on it
+/// is how one `#[event(scheduled)]` handler tells the two triggers apart.
 ///
 /// `worker`'s `#[event(scheduled)]` macro requires this exact
 /// three-argument `(ScheduledEvent, Env, ScheduleContext)` signature
@@ -122,14 +128,27 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
 /// (`validate_event_fn(&input_fn, Scheduled, 3, true)`, and the crate's
 /// own `tests/ui/scheduled-wrong-return-type.rs`/`scheduled-wrong-argument-types.rs`
 /// compile-fail fixtures for a `-> String` return or a wrong parameter
-/// list). A failed pass is logged, not propagated: a transient GitHub API
-/// or D1 error here must not crash the Worker, and the next scheduled run
-/// (same reasoning as `uninstall_disallowed_installation`'s webhook-path
-/// best-effort retry) tries again.
+/// list). A failed pass is logged, not propagated: a transient GitHub API,
+/// D1, or Analytics Engine SQL API error here must not crash the Worker,
+/// and the next scheduled run (same reasoning as
+/// `uninstall_disallowed_installation`'s webhook-path best-effort retry)
+/// tries again.
 #[event(scheduled)]
-async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::ScheduleContext) {
-    if let Err(e) = reconcile::run(&env).await {
-        worker::console_log!("installation reconcile pass failed: {e}");
+async fn scheduled(event: worker::ScheduledEvent, env: Env, _ctx: worker::ScheduleContext) {
+    match event.cron().as_str() {
+        "*/15 * * * *" => {
+            if let Err(e) = rollup::run(&env).await {
+                worker::console_log!("analytics rollup pass failed: {e}");
+            }
+        }
+        "*/20 * * * *" => {
+            if let Err(e) = reconcile::run(&env).await {
+                worker::console_log!("installation reconcile pass failed: {e}");
+            }
+        }
+        other => {
+            worker::console_log!("scheduled: no handler registered for cron {other:?}");
+        }
     }
 }
 
