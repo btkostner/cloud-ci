@@ -165,6 +165,7 @@
 //! in settings.yml) — neither is named in this round's three numbered
 //! scope items (context struct, built-in template, byte budget).
 
+use crate::ai_insight;
 use base64::Engine;
 use minijinja::Environment;
 use serde::Serialize;
@@ -554,6 +555,109 @@ pub fn render_pr_report(ctx: &PrReport) -> Result<RenderedReport, PrCommentError
         .map_err(|err| PrCommentError(err.to_string()))?;
 
     Ok(truncate_markdown(rendered, ctx))
+}
+
+// --- AI summary attachment -----------------------------------------------
+//
+// ai.md's "Failure summaries" feature produces a validated
+// `ai_insight::FailureSummary` per failure-cluster fingerprint, stored on an
+// `ai_insight` D1 row (not wired to any live caller yet — see that module's
+// own scope-boundary doc comment). This section is the pure glue between
+// that output shape and this module's `Failure::ai_summary` field: render a
+// `FailureSummary` into the mockup's prose line
+// (`render_ai_summary`), then match failures to insights by recomputing
+// each failure's own fingerprint the same way `ai_insight::failure_fingerprint`
+// is computed and looking it up (`attach_ai_summaries`). Per pr-comment.md's
+// "Failures" bullet: "AI summaries are attached when `ai.summaries` has a
+// row for the failure cluster ... The comment never waits on AI and never
+// shows a placeholder" — a failure with no matching fingerprint simply keeps
+// `ai_summary: None`, not an error.
+
+/// pr-comment.md's "Size budget and truncation" per-failure cap table: "AI
+/// summary 800 bytes" (also restated in the "Untrusted content escaping /
+/// labelling" section: "capped at 800 bytes per failure").
+pub const AI_SUMMARY_MAX_BYTES: usize = 800;
+
+/// Same trimmed-field marker pr-comment.md's "Size budget and truncation"
+/// section specifies for every per-failure cap (message/stack/AI summary):
+/// "A trimmed field ends with `… (truncated, see log)`, and the cut always
+/// falls on a UTF-8 character boundary."
+const TRUNCATION_MARKER: &str = "… (truncated, see log)";
+
+/// UTF-8-boundary-safe byte-cap truncation with pr-comment.md's documented
+/// `… (truncated, see log)` marker — the one convention this file's doc
+/// comments describe for every per-failure byte cap, reused here rather
+/// than invented a second time. `text` already under `max_bytes` is
+/// returned unchanged (no marker appended to a field that never needed
+/// trimming).
+fn truncate_with_marker(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let marker_bytes = TRUNCATION_MARKER.len();
+    let budget = max_bytes.saturating_sub(marker_bytes);
+    let mut end = budget.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    if marker_bytes >= max_bytes {
+        // Degenerate cap smaller than the marker itself: still never split
+        // a multi-byte char, just drop the marker rather than overflow.
+        return text[..end].to_string();
+    }
+    format!("{}{}", &text[..end], TRUNCATION_MARKER)
+}
+
+/// Renders a validated [`ai_insight::FailureSummary`] into the value this
+/// module's [`Failure::ai_summary`] field carries — [`DEFAULT_TEMPLATE`]
+/// already supplies the mockup's literal `**AI summary** (may be wrong): `
+/// prefix around `{{ f.ai_summary }}`, so this function's output is the
+/// sentence *after* that prefix, not the whole line (prepending the prefix
+/// here too would double it in the rendered comment).
+///
+/// Composed as one flowing sentence from `likely_cause` and `next_step`
+/// (matching the mockup's single-sentence style more closely than a
+/// field-by-field dump of `headline`/`evidence`/`confidence`/`category`,
+/// none of which the mockup's one AI-summary line shows), then capped to
+/// [`AI_SUMMARY_MAX_BYTES`] via [`truncate_with_marker`].
+pub fn render_ai_summary(summary: &ai_insight::FailureSummary) -> String {
+    let composed = if summary.next_step.trim().is_empty() {
+        summary.likely_cause.clone()
+    } else {
+        format!("{} Next: {}", summary.likely_cause, summary.next_step)
+    };
+    truncate_with_marker(&composed, AI_SUMMARY_MAX_BYTES)
+}
+
+/// Matches each of `failures` to the insight in `insights` (fingerprint,
+/// validated summary pairs) whose fingerprint equals the failure's own —
+/// recomputed via [`ai_insight::failure_fingerprint`] from the same inputs
+/// that function takes (`test`/`message`/stack split into frame lines),
+/// using [`ai_insight::DEFAULT_LIBRARY_PATTERNS`] since no scope exists yet
+/// to carry a caller-supplied override. A failure whose fingerprint matches
+/// no row in `insights` is left with `ai_summary: None` — not an error, per
+/// pr-comment.md's "Failures" bullet (quoted in this section's module doc).
+pub fn attach_ai_summaries(
+    failures: &mut [Failure],
+    insights: &[(String, ai_insight::FailureSummary)],
+) {
+    for failure in failures.iter_mut() {
+        let frames: Vec<&str> = failure
+            .stack
+            .as_deref()
+            .map(|stack| stack.lines().collect())
+            .unwrap_or_default();
+        let fingerprint = ai_insight::failure_fingerprint(
+            &failure.test,
+            &failure.message,
+            &frames,
+            ai_insight::DEFAULT_LIBRARY_PATTERNS,
+        );
+        failure.ai_summary = insights
+            .iter()
+            .find(|(fp, _)| *fp == fingerprint)
+            .map(|(_, summary)| render_ai_summary(summary));
+    }
 }
 
 // --- Truncation ------------------------------------------------------
@@ -1239,5 +1343,138 @@ Base `main` @ `abc1234` · [Dashboard](https://ci.example.com/acme/web/pull/412)
         let b64 = base64::engine::general_purpose::STANDARD.encode(line);
         let open_tag = format!("<!--cc:f idx=0 line={b64}-->");
         assert_eq!(decode_oneline(&open_tag), line);
+    }
+
+    // -- AI summary attachment --------------------------------------------
+
+    fn bare_failure(test: &str, message: &str, stack: Option<&str>) -> Failure {
+        Failure {
+            job: "ci / unit".to_string(),
+            external: false,
+            test: test.to_string(),
+            ai_summary: None,
+            message: message.to_string(),
+            stack: stack.map(str::to_string),
+            shard: None,
+            attempt: 1,
+            first_failure_on_pr: true,
+            log_url: None,
+            history_url: None,
+        }
+    }
+
+    fn sample_summary(likely_cause: &str, next_step: &str) -> ai_insight::FailureSummary {
+        ai_insight::FailureSummary {
+            headline: "headline".to_string(),
+            likely_cause: likely_cause.to_string(),
+            evidence: vec![],
+            next_step: next_step.to_string(),
+            confidence: ai_insight::Confidence::Medium,
+            category: ai_insight::Category::TestAssertion,
+        }
+    }
+
+    #[test]
+    fn render_ai_summary_composes_likely_cause_and_next_step_under_cap() {
+        let summary = sample_summary(
+            "`roundHalfEven` now gets the pre-tax subtotal.",
+            "Fix the reorder in `src/cart/total.ts:41`.",
+        );
+        let rendered = render_ai_summary(&summary);
+        assert_eq!(
+            rendered,
+            "`roundHalfEven` now gets the pre-tax subtotal. Next: Fix the reorder in \
+             `src/cart/total.ts:41`."
+        );
+        assert!(rendered.len() <= AI_SUMMARY_MAX_BYTES);
+        // The caller's template supplies the "**AI summary** (may be
+        // wrong): " prefix itself; this function must not double it.
+        assert!(!rendered.contains("AI summary"));
+    }
+
+    #[test]
+    fn render_ai_summary_truncates_utf8_safely_at_the_byte_cap() {
+        // café (4 bytes, 5 chars) repeated past 800 bytes.
+        let long_cause = "café ".repeat(300);
+        let summary = sample_summary(&long_cause, "");
+        let rendered = render_ai_summary(&summary);
+        assert!(rendered.len() <= AI_SUMMARY_MAX_BYTES);
+        assert!(rendered.ends_with(TRUNCATION_MARKER));
+        // No byte-split multibyte char: the whole string re-parses as UTF-8.
+        assert!(std::str::from_utf8(rendered.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn attach_ai_summaries_matches_failure_to_its_own_fingerprint() {
+        let mut failures = vec![bare_failure(
+            "src/cart/total.test.ts › rounds half-even",
+            "expected 12.30 got 12.31",
+            Some("src/cart/total.ts:41\nsrc/cart/index.ts:9"),
+        )];
+        let frames = ["src/cart/total.ts:41", "src/cart/index.ts:9"];
+        let fp = ai_insight::failure_fingerprint(
+            &failures[0].test,
+            &failures[0].message,
+            &frames,
+            ai_insight::DEFAULT_LIBRARY_PATTERNS,
+        );
+        let summary = sample_summary("rounding bug", "fix the reorder");
+        attach_ai_summaries(&mut failures, &[(fp, summary.clone())]);
+        assert_eq!(failures[0].ai_summary, Some(render_ai_summary(&summary)));
+    }
+
+    #[test]
+    fn attach_ai_summaries_leaves_unmatched_failure_as_none() {
+        let mut failures = vec![bare_failure("some test", "boom", None)];
+        let summary = sample_summary("unrelated cause", "unrelated step");
+        attach_ai_summaries(
+            &mut failures,
+            &[("not-a-real-fingerprint".to_string(), summary)],
+        );
+        assert_eq!(failures[0].ai_summary, None);
+    }
+
+    #[test]
+    fn attach_ai_summaries_with_empty_insights_leaves_every_failure_none() {
+        let mut failures = vec![
+            bare_failure("test a", "message a", None),
+            bare_failure("test b", "message b", Some("frame 1")),
+        ];
+        attach_ai_summaries(&mut failures, &[]);
+        assert!(failures.iter().all(|f| f.ai_summary.is_none()));
+    }
+
+    #[test]
+    fn attach_ai_summaries_matches_multiple_failures_to_their_own_distinct_insight() {
+        let mut failures = vec![
+            bare_failure("test a", "message a", Some("frame a1\nframe a2")),
+            bare_failure("test b", "message b", Some("frame b1\nframe b2")),
+        ];
+        let frames_a = ["frame a1", "frame a2"];
+        let frames_b = ["frame b1", "frame b2"];
+        let fp_a = ai_insight::failure_fingerprint(
+            "test a",
+            "message a",
+            &frames_a,
+            ai_insight::DEFAULT_LIBRARY_PATTERNS,
+        );
+        let fp_b = ai_insight::failure_fingerprint(
+            "test b",
+            "message b",
+            &frames_b,
+            ai_insight::DEFAULT_LIBRARY_PATTERNS,
+        );
+        let summary_a = sample_summary("cause a", "step a");
+        let summary_b = sample_summary("cause b", "step b");
+        attach_ai_summaries(
+            &mut failures,
+            &[
+                (fp_b.clone(), summary_b.clone()),
+                (fp_a.clone(), summary_a.clone()),
+            ],
+        );
+        assert_eq!(failures[0].ai_summary, Some(render_ai_summary(&summary_a)));
+        assert_eq!(failures[1].ai_summary, Some(render_ai_summary(&summary_b)));
+        assert_ne!(failures[0].ai_summary, failures[1].ai_summary);
     }
 }
