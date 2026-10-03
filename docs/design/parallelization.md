@@ -279,30 +279,120 @@ Merge: real for `junit`/`lcov`. The Queue consumer (`src/lib.rs`'s `handle_shard
 `src/shard_merge.rs`, `cloud_ci_reports::merge`) reads the included shards' canonical reports from
 D1/R2, merges them, and writes the result to R2 plus a `shard_merges` row. Not built: a generated
 `<id>/merge` container node for `playwright-blob`/`vitest-blob`. `ci.shard` itself exists
-(`cloud-ci-pipeline-sdk`'s `src/shard.ts`: split/count/files/run/check) but its `reports`/merge
-options — the ones that would drive generating that node — are not implemented
-(`ShardOptions`/`ShardResult` in `src/types.ts` carry no `reports`/merge field yet). A
+(`cloud-ci-pipeline-sdk`'s `src/shard.ts`: split/count/files/run/check) and `ShardOptions.reports`
+is now a typed field (`ShardReportSpec[]`, matching this doc's worked example), but giving it a
+non-empty value throws `ShardReportsNotSupportedError` rather than taking effect: no public
+`cloud_ci.ingest.v1.IngestService` RPC lets a managed run's `ci.shard` register a shard group's
+merge configuration (`expected_total`/`fail_fast`/`merge_on_failure`) — `/register-shard-group`
+(`coordinator::mod`'s `RegisterShardGroupRequest`) is an internal Durable Object HTTP route, not
+an `IngestService` procedure a service-binding `Fetcher` can reach, and `StartJob`/`CompleteShard`/
+`SubmitReport` carry no such fields either. That public RPC (or equivalent `StartJobRequest`
+fields) is the missing proto addition, not SDK wiring — see
+`packages/cloud-ci-pipeline-sdk/README.md`'s `ci.shard` section for the full detail. A
 `playwright-blob`/`vitest-blob` report reaching the consumer today is logged and skipped, not
 merged.
 
-Cancellation: real for `fail_fast`. A dispatched shard is a `node` row, registered via the
-existing `startNode` RPC under id `shard:{job_name}:{idx}:{attempt}`. `handle_shard_terminal`'s
-`FailFastTriggered` branch calls `stop_node_container` then `mark_node_cancelled` for each
-cancelled index's node — same path `handle_cancel_run` uses for whole-run cancellation. Selection
-is exact: `(job_name, idx)` plus a canonical decimal attempt suffix, not a bare string prefix — a
-job name containing `:` cannot match another job's node (job `build` idx 1 never selects job
-`build:1` idx 2's node). A node already terminal (succeeded, failed, or already cancelled) is left
-untouched. Only this selection is verified; `stop_node_container`/`mark_node_cancelled`'s own
-reliability is not (see Known gap below).
+Cancellation: real for `fail_fast`, and for whole-run cancellation. A dispatched shard is a
+`node` row, registered via the existing `startNode` RPC under id `shard:{job_name}:{idx}:{attempt}`.
+On a `FailFastTriggered` decision, the cancelled indices' node ids are frozen once into the
+`shard_terminal_effect` row (`resolve_shard_cancel_node_ids`) and replayed from that same frozen
+list on every retry, never re-resolved against then-current state. `cancel_shard_nodes` marks
+each node `Cancelled` *before* attempting its real stop (`ensure_sibling_cancelled`), then stops
+it — a destroy-induced completion racing in behind the stop lands on an already-terminal node
+and is dropped, never recorded over. The stop always runs regardless of the node's current
+status, so a retry of an already-`Cancelled`-but-unconfirmed node still attempts its stop again.
+A failed stop propagates as a real error: the `shard_terminal_effect` row stays incomplete and
+is replayed on the next duplicate contact or by `alarm()`'s own background sweep, never silently
+swallowed. Whole-run cancellation (`handle_cancel_run`) follows the same mark-then-stop
+discipline per node but has no frozen list to replay from — it recomputes candidates fresh from
+current node state every call via `logic::nodes_to_retry_cancel`, which (unlike a plain
+non-terminal filter) still includes an already-`Cancelled` node whose stop never confirmed, so a
+redelivered `cancel-run` retries it instead of leaking its container forever. Selection for the
+fail-fast path is exact: `(job_name, idx)` plus a canonical decimal attempt suffix, not a bare
+string prefix — a job name containing `:` cannot match another job's node (job `build` idx 1
+never selects job `build:1` idx 2's node). A node already terminal with its stop already
+confirmed is left untouched by either path.
 
-**Known gap.** Two effects are not retried on failure:
-- `stop_node_container` swallows its own error (logs, does not propagate). A cancel call can mark
-  a node `Cancelled` even if the real container failed to stop.
-- A shard-terminal call whose D1 projection or own-node completion fails after its `shard_state`
-  row already committed is not retried: a redelivered call with the same terminal status is
-  treated as an already-applied duplicate and skips both those writes and barrier re-evaluation.
+**Known limitation (2026-10-03), unfixed.** `shard_terminal_effect` rows that are still pending
+retry every 5 seconds via `RunCoordinator::alarm()`'s shared alarm slot, with no backoff and no
+attempt cap. Three causes keep an effect pending indefinitely: a real container's stop keeps
+failing; a merge enqueue keeps failing; or a shard merge's job row has not started yet ("shard
+merge pending: job not started yet"). This continues even after the run itself has already gone
+terminal through another path (`alarm()`'s own terminal-run check still calls
+`release_alarm_if_idle`, which re-arms the short retry whenever `has_pending_background_work` is
+true, regardless of the run's own status) — each 5s fire is a separate Durable Object alarm
+invocation, which is billed `[unverified]`. Fixing this needs an attempt-count (or similar)
+column on `shard_terminal_effect` plus an operator-visible failure state once a cap is reached,
+so a permanently-stuck effect eventually stops being retried without silently leaking the
+container it could never stop. Not built this round: adding a cap without that visible failure
+state would leak containers silently instead of noisily.
 
-Neither is fixed yet.
+### `runner: "auto"` OOM recovery: pure logic only, not wired (2026-10-03)
+
+`coordinator::logic` keeps a reviewed, tested, pure decision layer for real-time OOM retry
+(`decide_oom_recovery`, `OomDecisionRecord`, `OomObservation`, `resolve_oom_node_id`,
+`oom_retry_node_id`, `oom_event_admissible`, `resolve_auto_start`, and the
+`OomEffect`/`OomEffectFlags` state machine). The Durable-Object wiring that would call it
+(`maybe_decide_oom_recovery`, `drain_oom_lineage`, the `oom_lineage_decision` table, and the
+`node_container.rs`/`executor.rs` size-override plumbing) was built, reviewed twice, and then
+removed: two review rounds found concrete correctness bugs in the wiring itself -- a
+shard-terminal lookup that could resolve to (and so kill) a retried node regardless of which
+attempt actually reported, and a wrong assumption that `CLOUD_CI_ATTEMPT` (the *run* attempt
+`cloud-ci upload`/`split` use) carries a shard's own attempt number, which the agent does not
+read for that purpose at all. Rather than patch the wiring a third time, it was isolated out
+entirely; only the pure logic remains, with no caller anywhere.
+
+**Prerequisites before this can be wired again**, all open:
+- A `node_id` field on `SubmitResourceSamplesRequest` (`cloud-ci-proto`), added
+  backward-compatibly (`optional`/new field number) -- the decision layer can key a second OOM
+  on which real node reported it, rather than inferring identity from the reported attempt
+  number alone.
+- A real, verified mechanism for an agent to learn and report the *shard* attempt it is
+  running as (not `CLOUD_CI_ATTEMPT`, which is the run attempt) -- a new env var or CLI flag,
+  actually read by `cloud-ci agent`/`cloud-ci-cli`, not merely assumed.
+- A multi-size executor ladder: `ContainersExecutor::capabilities()` reports a single
+  `standard-4` rung today, so `RetryAt` can never occur against the real executor -- every real
+  OOM is an immediate `FailedAtMax`, making the retry path untestable outside a fake executor.
+- Lineage-aware shard-terminal resolution that is correct by both `attempt` and lineage, not
+  lineage alone -- the removed wiring's shard-terminal lookup ignored the reporting attempt
+  entirely once any OOM decision existed for a shard, which could apply a stale node's own
+  completion to the wrong (already-superseded) node.
+- A live runtime smoke test (`mise run //packages/cloud-ci-worker:dev`, a real Durable Object,
+  a real container) exercising a duplicate delivery, a genuine second OOM, and a late delivery
+  after the run closed -- none of this has ever been runtime-verified, only unit-tested against
+  the pure layer.
+
+**What the removal itself took away**, distinct from the prerequisites above (these were built
+and reviewed, before the wiring was pulled back out -- two review rounds found concrete
+defects in the wiring itself, including a shard-terminal lookup that resolved a node by
+lineage regardless of which attempt actually reported, and a wrong assumption about which
+identity carried a retried container's attempt; none of it was ever runtime-verified, only
+unit-tested against the pure layer. Rebuilding these pieces is necessary but, on its own, not
+sufficient; the prerequisites above still apply):
+1. A `runner_auto` marker on `StartNodeRequest`, and persisted size and bounds on the node row
+   at `startNode` time, resolved from `Settings.runners.auto` against the executor's ladder.
+2. A per-call container size override in `node_container.rs` and `executor.rs`. The earlier
+   wiring's claim that the Cloudflare Containers runtime rejects the named size `"basic"` for
+   a `durable_object`-policy per-call start is unverified -- it was never confirmed against a
+   real deployment, only inferred from the pinned `workers-rs` fork's own doc comment.
+3. A `sizing_decisions` table and a forward-only migration, with `RunCoordinator` as the single
+   writer.
+4. Teaching `shard_node_matches` the `:oom-retry:<n>` id shape, so fail-fast sibling
+   cancellation can find (and so cancel) a retried container. This was built and then reverted
+   with the rest of the wiring -- re-adding it needs the same scrutiny the rest of this wiring
+   would get, not a quick restore.
+5. An attempt-and-lineage-aware shard-terminal resolver (a node lookup usable from both
+   `complete_own_shard_node` and `drain_shard_terminal_effects`) -- see the lineage-aware
+   shard-terminal resolution prerequisite above; this is the same gap, named here again because
+   it is also one of the concrete pieces of code the removal deleted, not only a capability
+   that was never built.
+6. A retry attempt cap or backoff, plus an operator-visible failure state, for pending OOM
+   effects. Without it, a stuck effect (a stop that keeps failing, a D1 write that keeps
+   failing) retries every ~5 seconds via the shared alarm slot with no cap, even after the run
+   itself has already gone terminal -- the same unbounded-retry shape `shard_terminal_effect`
+   has, and unfixed for the same reason: adding a cap without that visible failure state would
+   leave a stuck lineage (and the container it could never stop) silently abandoned instead of
+   noisily so.
 
 See `coordinator::mod`'s "Shard groups / merge barrier" module-doc section for the exact boundary.
 

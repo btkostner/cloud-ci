@@ -18,6 +18,8 @@ the signed-in user's permission per repo. Setup is `wrangler deploy` (or a Deplo
 button) followed by a GitHub App manifest flow that creates the App owned by the deployer, then
 installing that App on each org.
 
+Details in [deployment](../design/deployment.md).
+
 ## Consequences
 
 - No tenant id in the data model; isolation is the Cloudflare account boundary. Multiple orgs

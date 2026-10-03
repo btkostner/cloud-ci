@@ -1,0 +1,29 @@
+{
+  "name": "cloud-ci-docs",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "postinstall": "node scripts/link-docs.mjs",
+    "dev": "vitepress dev",
+    "build": "vitepress build",
+    "preview": "vitepress preview --outDir dist",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
+    "fix": "biome check --write .",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.15",
+    "@types/node": "26.6.4",
+    "typescript": "7.0.2",
+    "vitepress": "1.6.4",
+    "wrangler": "4.147.0"
+  },
+  "allowScripts": {
+    "esbuild@0.21.5": true,
+    "esbuild@0.28.1": true,
+    "fsevents@2.3.3": true,
+    "workerd@1.20261001.1": true
+  }
+}

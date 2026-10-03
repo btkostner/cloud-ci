@@ -1,0 +1,9 @@
+name = "cloud-ci-docs"
+compatibility_date = "2026-10-03"
+
+# Pure static site: no Worker script, no bindings. `npm run build` renders
+# docs/ (see .vitepress/config.mts) into ./dist, then `wrangler deploy`
+# uploads it as Workers Static Assets.
+[assets]
+directory = "./dist"
+not_found_handling = "404-page"

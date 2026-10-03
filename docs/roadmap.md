@@ -48,6 +48,21 @@ Packages: `cloud-ci-web`.
 
 - Resource sampling, rollups, dashboard, flaky detection, `runner: auto`.
 
+Status (2026-10-03), from reading the code, not from a live run:
+
+- **Exists:** the `SubmitResourceSamples` RPC; Analytics Engine `test` and `sample` data-point
+  writes from `RunCoordinator`; `rollup.rs` and the `*/15` rollup cron (`scheduled` in `lib.rs`),
+  which writes `run_rollups` and a `run_test_failures` insight from `test` rows only;
+  `test_stats` with an inline `flakiness_score` (`finalize_test_stats`/`refresh_flakiness_scores`).
+- **Not built:** the dashboard (no `cloud-ci-web` package); the `step` and `cache` Analytics
+  Engine events, so `queue_ms`, `critical_path_ms` and `cache_hit_rate` stay `NULL`; the nightly
+  rightsizing cron that feeds real Analytics Engine data into the pure recommendation functions
+  (`reduce_run`, `recommend_naive` and `apply_hysteresis` have no callers outside
+  `rightsizing.rs`; only the unwired OOM logic calls `rightsizing::oom_retry` and
+  `ladder_range`).
+- **Not wired:** the OOM-retry decision logic in `coordinator/logic.rs` is pure and unit-tested,
+  but nothing calls it, so no OOM retry happens at runtime.
+
 ## Phase 5 — AI
 
 - Failure summaries in the PR comment, performance suggestions, opt-in autofix.
@@ -69,3 +84,36 @@ Packages: `cloud-ci-web`.
 ## Phase 7 — Distribution
 
 - Deploy-to-Cloudflare button, setup wizard, upgrade/migration story, public docs site.
+
+Status (2026-10-03): partly built. `packages/cloud-ci-docs` (a VitePress docs site, not
+deployed anywhere) and the `cloud-ci setup allowed-orgs` and `cloud-ci setup github-app`
+subcommands exist. Not built: the one-step setup wizard, the upgrade/migration story, and the
+button, which is blocked by Cloudflare's isolated-subdirectory rule, see
+[deployment](./design/deployment.md#deploy-to-cloudflare).
+
+## Next steps
+
+Ordered by dependency; nothing below is done. Each item unblocks the ones after it.
+
+1. **Proto and contract work first** (backward compatible, `buf breaking` against `main`):
+   - A `node_id` on `SubmitResourceSamplesRequest`, so a sample is tied to a node, not inferred.
+   - A public RPC to register a shard group's merge settings, which unblocks
+     `ShardOptions.reports`.
+   - An agent-side way to carry the shard attempt.
+2. **OOM recovery wiring**, once the contract exists: a multi-size executor ladder,
+   lineage- and attempt-aware shard-terminal resolution, and a live smoke test. The pure logic
+   already exists; only the wiring and the live proof are missing.
+3. **NodeContainer isolation live proof.** Run-scoped addressing is unit-tested only; proving it
+   needs `wrangler dev` with a `CLOUDFLARE_API_TOKEN`, which this environment lacks.
+4. **Phase 7.** The Deploy-to-Cloudflare button is blocked by Cloudflare's isolated-subdirectory
+   rule: the worker has path dependencies outside its directory
+   (developers.cloudflare.com/workers/platform/deploy-buttons/, "Last updated Jul 22, 2026",
+   as cited in [deployment](./design/deployment.md#deploy-to-cloudflare); not re-fetched for
+   this entry). Partial setup subcommands already exist (`cloud-ci setup github-app` and
+   `cloud-ci setup allowed-orgs`); the wizard needs an orchestrating subcommand on top of them.
+5. **Then:** the `step` and `cache` Analytics Engine events, the nightly rightsizing cron that
+   calls the pure rightsizing functions with real Analytics Engine data, the Phase 5 AI context
+   builder, and the dashboard.
+6. **Blocked on credentials or tooling:** real AWS and Kubernetes executors, the forced-recycle
+   test, the live cold-start measurement, and a live GitHub SHA lookup for the frozen settings
+   SHA. Until then these are `[unverified]` at runtime.

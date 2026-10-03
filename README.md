@@ -3,8 +3,12 @@
 CI that runs on **your own Cloudflare account**, with first-class GitHub support. Written in
 Rust as a Cloudflare Worker.
 
-> Status: design phase. Nothing is implemented yet; start with
-> [docs/architecture.md](docs/architecture.md).
+> Status: under active development, not yet released. Several packages have real, tested code
+> (protobuf contract, Rust Worker ingest, core splitter/reports, CLI, pipeline SDK, dynamic
+> workflow host); most product surface is still design. See [docs/roadmap.md](docs/roadmap.md)
+> for what each phase has actually proven, and [docs/architecture.md](docs/architecture.md) for
+> the intended shape. Browsable docs (this tree plus search): `packages/cloud-ci-docs` — not
+> deployed anywhere public yet.
 
 ## Features (planned)
 

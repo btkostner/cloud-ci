@@ -35,3 +35,18 @@ unpinned tool: local and CI runs will disagree.
   fails a request with no typed error; in the coordinator it can strand a run.
 - **Generated `generated/` directories are never edited.** They are wiped on every `generate`.
 - **Facts about Cloudflare/GitHub in docs are dated and sourced, or marked `[unverified]`.**
+
+## Working with multiple agents
+
+- **Commit verified work promptly, in small commits, on a branch.** An uncommitted pile is not
+  a backup.
+- **Each agent works in its own worktree and branch:**
+  `git worktree add ../cloud-ci-<name> -b <name>`. Never edit another agent's worktree or the
+  main checkout.
+- **One designated integrator** merges or rebases finished branches into `main` and runs
+  `mise run check` after each merge.
+- **Allowed git writes:** `add`, `commit`, `switch`, and `worktree` operations on your own
+  branch.
+- **Forbidden:** `reset --hard`, `checkout -- <path>`, `restore`, `clean`, `stash drop`,
+  force-push, and rewriting a branch someone else owns. A blanket checkout once wiped another
+  agent's uncommitted work.

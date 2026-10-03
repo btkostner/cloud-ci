@@ -1,0 +1,50 @@
+#:schema https://mise.jdx.dev/schema/mise.json
+#
+# Public documentation site: VitePress renders the canonical docs/ tree
+# (architecture, roadmap, design docs, ADRs) at the repo root — this package
+# owns only the build tooling and deployment config, not the content. Tool
+# pinning follows the npm-package convention (`node` here in `[tools]`,
+# everything else — vitepress, wrangler, biome, typescript — as a
+# `package.json` devDependency resolved through `package-lock.json`, invoked
+# via `npm run` against this package's own `node_modules`).
+
+[tools]
+node = "24"
+
+[tasks.install]
+description = "Install npm dependencies"
+run = "npm install"
+
+[tasks.lint]
+description = "Run biome checks"
+depends = ["install"]
+run = "npm run lint"
+
+[tasks.typecheck]
+description = "Type-check the VitePress config"
+depends = ["install"]
+run = "npm run typecheck"
+
+[tasks.build]
+description = "Build the static docs site from docs/ into ./dist"
+depends = ["install"]
+run = "npm run build"
+
+[tasks.check]
+description = "Run every check (lint, typecheck, and a real build, which is this package's own correctness test: a broken internal link or a missing outbound-link target fails it)"
+depends = ["lint", "typecheck", "build"]
+
+[tasks.fix]
+description = "Fix formatting/lint issues"
+depends = ["install"]
+run = "npm run fix"
+
+[tasks.dev]
+description = "Run the VitePress dev server locally"
+depends = ["install"]
+run = "npm run dev"
+
+[tasks.deploy]
+description = "Deploy the built site to Cloudflare Workers Static Assets"
+depends = ["build"]
+run = "npm run deploy"
