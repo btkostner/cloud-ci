@@ -426,8 +426,8 @@ pub enum Conclusion {
 /// this CLI's documented surface.
 #[derive(Debug, Parser)]
 pub struct SplitArgs {
-    /// Split strategy. `timing` currently degrades to `file` order for
-    /// every run — see `crate::split`'s module docs for why.
+    /// Split strategy. `timing` looks up real historical durations from
+    /// `test_stats` (`GetTestTimings`); see `crate::split`'s module docs.
     #[arg(long)]
     pub strategy: SplitStrategy,
 
@@ -449,10 +449,22 @@ pub struct SplitArgs {
     #[arg(long, value_enum, default_value = "file")]
     pub granularity: Granularity,
 
+    /// GitHub's numeric repository id. Required for `--strategy timing`
+    /// (`CLOUD_CI_REPO_ID`); `file`/`count` need no historical data, so
+    /// this is unused for those strategies.
+    #[arg(long = "repo-id")]
+    pub repo_id: Option<u64>,
+
+    /// Base URL of the cloud-ci deployment to read historical timing from
+    /// (`CLOUD_CI_SERVER_URL`). Required for `--strategy timing`; unused
+    /// for `file`/`count`.
+    #[arg(long = "server-url")]
+    pub server_url: Option<String>,
+
     /// Scoped API token. GitHub Actions auto-detects an OIDC token instead
-    /// when this is unset (`CLOUD_CI_TOKEN`). Accepted and resolved for a
-    /// future `test_stats` lookup; unused by this round's `timing` fallback
-    /// — see `crate::split`'s module docs.
+    /// when this is unset (`CLOUD_CI_TOKEN`). Required for `--strategy
+    /// timing`'s `GetTestTimings` call (same precedence as `cloud-ci
+    /// upload`); unused for `file`/`count`.
     #[arg(long)]
     pub token: Option<String>,
 }

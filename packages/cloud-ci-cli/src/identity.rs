@@ -99,22 +99,12 @@ pub fn resolve_run_identity(
         })
         .unwrap_or(1);
 
-    let repo_id = flags
-        .repo_id
-        .or_else(|| non_empty(env.var("CLOUD_CI_REPO_ID")).and_then(|v| v.parse().ok()))
-        .or_else(|| {
-            in_github_actions
-                .then(|| env.var("GITHUB_REPOSITORY_ID").and_then(|v| v.parse().ok()))
-                .flatten()
-        });
+    let repo_id = resolve_repo_id(flags.repo_id, env);
     if repo_id.is_none() {
         missing.push("--repo-id (or CLOUD_CI_REPO_ID)".to_string());
     }
 
-    let server_url = flags
-        .server_url
-        .clone()
-        .or_else(|| non_empty(env.var("CLOUD_CI_SERVER_URL")));
+    let server_url = resolve_server_url(flags.server_url.clone(), env);
     if server_url.is_none() {
         missing.push("--server-url (or CLOUD_CI_SERVER_URL)".to_string());
     }
@@ -133,6 +123,29 @@ pub fn resolve_run_identity(
         repo_id: repo_id.unwrap_or_default(),
         server_url: server_url.unwrap_or_default(),
     })
+}
+
+/// Resolves `repo_id`: explicit flag > `CLOUD_CI_REPO_ID` env var >
+/// GitHub Actions `GITHUB_REPOSITORY_ID` auto-detection. Factored out of
+/// [`resolve_run_identity`] so `cloud-ci split --strategy timing`
+/// (`crate::split`'s `RemoteHistoryLookup`) can resolve just this field
+/// without needing the full `(sha, run_key, attempt)` run identity it has
+/// no use for.
+pub(crate) fn resolve_repo_id(explicit: Option<u64>, env: &dyn EnvSource) -> Option<u64> {
+    let in_github_actions = env.var("GITHUB_ACTIONS").as_deref() == Some("true");
+    explicit
+        .or_else(|| non_empty(env.var("CLOUD_CI_REPO_ID")).and_then(|v| v.parse().ok()))
+        .or_else(|| {
+            in_github_actions
+                .then(|| env.var("GITHUB_REPOSITORY_ID").and_then(|v| v.parse().ok()))
+                .flatten()
+        })
+}
+
+/// Resolves the deployment base URL: explicit flag > `CLOUD_CI_SERVER_URL`
+/// env var. Same factoring reason as [`resolve_repo_id`].
+pub(crate) fn resolve_server_url(explicit: Option<String>, env: &dyn EnvSource) -> Option<String> {
+    explicit.or_else(|| non_empty(env.var("CLOUD_CI_SERVER_URL")))
 }
 
 /// Resolves the job name: explicit `--job` flag > `CLOUD_CI_JOB` env var >

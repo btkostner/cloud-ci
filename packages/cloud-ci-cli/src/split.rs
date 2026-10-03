@@ -4,23 +4,25 @@
 //! stdout. Per `docs/design/parallelization.md`'s "`cloud-ci split` (also
 //! usable from BYO CI)".
 //!
-//! # `--strategy timing` this round
+//! # `--strategy timing`
 //!
 //! `timing`'s real data source is the `test_stats` D1 table
-//! (`docs/design/analytics.md`), read via a point lookup per matched item.
-//! That table has no migration yet, and `cloud-ci-worker` has no query
-//! endpoint to serve it — both are out of scope for this round (they depend
-//! on the full analytics/Analytics-Engine/rollup pipeline named in
-//! parallelization.md's Non-goals). This command therefore always looks up
-//! duration history through `cloud_ci_core::split::NoHistoryLookup`, which
-//! reports every item as unknown. Per that crate's "Fallback when no
-//! history exists" documentation, when *no* item has a known duration
-//! `timing` degrades fully to `file` round-robin order — which is exactly
-//! what happens on every invocation this round, since no real lookup is
-//! wired in yet. This is temporary: once the `test_stats` query endpoint
-//! exists, swapping `NoHistoryLookup` for a real `HistoryLookup`
-//! implementation (reusing the same `--token`/OIDC credential this command
-//! already resolves below) requires no change to the algorithm itself.
+//! (`docs/design/analytics.md`), read via the `GetTestTimings` RPC
+//! (`cloud_ci_proto::ingest::v1`), one point lookup per invocation
+//! covering every matched file. [`RemoteHistoryLookup`] below implements
+//! `cloud_ci_core::split::HistoryLookup` by calling that RPC once (via
+//! `crate::connect_client::Client`, the same Connect client
+//! `cloud-ci upload` uses) and serving every later [`HistoryLookup::duration_ms`]
+//! call from the response already in memory. Per that crate's "Fallback
+//! when no history exists" documentation, a file `GetTestTimings` has no
+//! entry for (new repo, or a file never seen before) is treated as
+//! "unknown duration", not zero — `cloud_ci_core::split`'s median
+//! imputation (or, if *no* matched file has any history, a full degrade
+//! to `file` round-robin order) handles it from there with no change to
+//! this module. `--strategy file`/`--strategy count` never call
+//! `GetTestTimings` at all: they have no use for historical data, so
+//! [`run`] only resolves `--repo-id`/`--server-url`/credential and builds
+//! a [`RemoteHistoryLookup`] when `--strategy timing` is selected.
 //!
 //! # `--granularity test`
 //!
@@ -34,23 +36,72 @@
 //! codebase. `--granularity test` is rejected with a clear "not yet
 //! implemented" error rather than silently behaving like `file`.
 //!
-//! # `--token`/OIDC credential flags
+//! # `--token`/`--repo-id`/`--server-url`/OIDC credential flags
 //!
-//! Accepted and resolved via the same precedence `cloud-ci upload` uses
-//! (`crate::upload::resolve_credential`: explicit `--token` >
-//! `CLOUD_CI_TOKEN` > GitHub Actions OIDC > none), matching this command's
-//! documented CLI surface (`docs/design/parallelization.md`: "`cloud-ci
-//! split` authenticates with the same machine credentials as `cloud-ci
-//! upload`... to read historical timing"). The resolved credential is
-//! intentionally unused this round — there is nothing to call with it yet
-//! (see above) — but it is accepted-but-currently-unused plumbing for the
-//! future `test_stats` lookup, not dead code to delete.
+//! Resolved via the same precedence `cloud-ci upload` uses
+//! (`crate::upload::resolve_credential` for the bearer credential;
+//! `crate::identity::resolve_repo_id`/`resolve_server_url` for the other
+//! two, factored out of `crate::identity::resolve_run_identity` since
+//! `cloud-ci split` has no use for the rest of the run-identity tuple
+//! `sha`/`run_key`/`attempt`), matching this command's documented CLI
+//! surface (`docs/design/parallelization.md`: "`cloud-ci split`
+//! authenticates with the same machine credentials as `cloud-ci
+//! upload`... to read historical timing"). Required only for `--strategy
+//! timing`; `file`/`count` never touch any of the three.
 
-use cloud_ci_core::split::{self, Item, NoHistoryLookup, ShardCountSpec, Strategy};
+use std::collections::HashMap;
+
+use cloud_ci_core::split::{self, HistoryLookup, Item, NoHistoryLookup, ShardCountSpec, Strategy};
+use cloud_ci_proto::ingest::v1::GetTestTimingsRequest;
 
 use crate::cli::{Granularity, SplitArgs, SplitStrategy};
-use crate::identity::EnvSource;
+use crate::connect_client::{Client, Codec};
+use crate::identity::{EnvSource, resolve_repo_id, resolve_server_url};
 use crate::upload::{UploadError, expand_glob, resolve_credential};
+
+/// A [`HistoryLookup`] backed by one `GetTestTimings` RPC call
+/// (`cloud_ci_proto::ingest::v1`), per this module's "`--strategy timing`"
+/// doc section. The call happens once, eagerly, in [`RemoteHistoryLookup::fetch`];
+/// [`HistoryLookup::duration_ms`] itself is a synchronous in-memory map
+/// lookup, matching the trait's synchronous signature
+/// (`cloud_ci_core::split::HistoryLookup` has no `async` variant, by
+/// design — see that crate's docs on why the algorithm itself stays pure
+/// I/O-free).
+pub(crate) struct RemoteHistoryLookup {
+    durations_ms: HashMap<String, u64>,
+}
+
+impl RemoteHistoryLookup {
+    /// Calls `GetTestTimings` for `repo_id`/`file_paths` and buffers the
+    /// response. Files absent from the response (no `test_stats` history)
+    /// simply have no entry in `durations_ms`, matching
+    /// `cloud_ci_core::split::HistoryLookup`'s "unknown duration" contract.
+    fn fetch(
+        client: &Client,
+        repo_id: u64,
+        file_paths: &[String],
+    ) -> Result<Self, crate::connect_client::CallError> {
+        let request = GetTestTimingsRequest {
+            repo_id,
+            file_paths: file_paths.to_vec(),
+            ..Default::default()
+        };
+        let response: cloud_ci_proto::ingest::v1::GetTestTimingsResponse =
+            client.call("GetTestTimings", &request)?;
+        let durations_ms = response
+            .timings
+            .into_iter()
+            .map(|timing| (timing.file_path, timing.duration_ms))
+            .collect();
+        Ok(Self { durations_ms })
+    }
+}
+
+impl HistoryLookup for RemoteHistoryLookup {
+    fn duration_ms(&self, item_name: &str) -> Option<u64> {
+        self.durations_ms.get(item_name).copied()
+    }
+}
 
 pub fn run(args: &SplitArgs, env: &dyn EnvSource) -> Result<(), UploadError> {
     if args.granularity == Granularity::Test {
@@ -62,9 +113,7 @@ pub fn run(args: &SplitArgs, env: &dyn EnvSource) -> Result<(), UploadError> {
         ));
     }
 
-    // Resolved but unused this round — see module docs' "`--token`/OIDC
-    // credential flags" section.
-    let _credential = resolve_credential(args.token.as_deref(), env)
+    let credential = resolve_credential(args.token.as_deref(), env)
         .map_err(|message| UploadError::new("resolve credential", message))?;
 
     let matched = expand_glob(&args.files, "--files")?;
@@ -73,13 +122,31 @@ pub fn run(args: &SplitArgs, env: &dyn EnvSource) -> Result<(), UploadError> {
         .map(|file| file.path.to_string_lossy().into_owned())
         .collect();
 
-    let lookup = NoHistoryLookup;
-    let items: Vec<Item> = split::items_from_names(&names, &lookup);
-
     let strategy = match args.strategy {
         SplitStrategy::Timing => Strategy::Timing,
         SplitStrategy::File => Strategy::File,
         SplitStrategy::Count => Strategy::Count,
+    };
+
+    let items: Vec<Item> = if strategy == Strategy::Timing {
+        let repo_id = resolve_repo_id(args.repo_id, env).ok_or_else(|| {
+            UploadError::new(
+                "--repo-id",
+                "required for --strategy timing (or CLOUD_CI_REPO_ID)",
+            )
+        })?;
+        let server_url = resolve_server_url(args.server_url.clone(), env).ok_or_else(|| {
+            UploadError::new(
+                "--server-url",
+                "required for --strategy timing (or CLOUD_CI_SERVER_URL)",
+            )
+        })?;
+        let client = Client::new(server_url, Codec::Json, credential);
+        let lookup = RemoteHistoryLookup::fetch(&client, repo_id, &names)
+            .map_err(|err| UploadError::new("GetTestTimings", err.to_string()))?;
+        split::items_from_names(&names, &lookup)
+    } else {
+        split::items_from_names(&names, &NoHistoryLookup)
     };
 
     let shard_count =
@@ -109,11 +176,14 @@ pub fn run(args: &SplitArgs, env: &dyn EnvSource) -> Result<(), UploadError> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
 
     use super::*;
     use crate::cli::{Cli, Command};
     use crate::identity::MapEnv;
     use clap::Parser;
+    use cloud_ci_proto::ingest::v1::{FileTiming, GetTestTimingsResponse};
 
     fn scratch_dir(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -273,6 +343,121 @@ mod tests {
         );
         // position % 2: a->0, b->1, c->0, d->1 -> shard 1 (index 1) gets a, c
         run(&args, &MapEnv::new(&[]))?;
+
+        let _ = fs::remove_dir_all(&tmp);
+        Ok(())
+    }
+
+    /// Starts a one-shot fixture server that accepts one `GetTestTimings`
+    /// POST and replies with `response` as JSON — same minimal raw-socket
+    /// approach as `connect_client.rs`'s own `serve_once` and
+    /// `upload.rs`'s fixture server, kept local to this module rather than
+    /// reused across crates since each caller's response shape differs.
+    fn serve_test_timings(response: &GetTestTimingsResponse) -> std::io::Result<String> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let body = serde_json::to_vec(response).unwrap_or_default();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf);
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+            }
+        });
+        Ok(format!("http://{addr}"))
+    }
+
+    /// Proves `RemoteHistoryLookup` fetches real durations for known files
+    /// (served by a real HTTP fixture, not an in-process stub) and reports
+    /// `None` — not zero — for files `GetTestTimings` has no row for, and
+    /// that feeding that lookup into `cloud_ci_core::split`'s real
+    /// algorithm produces LPT-bin-packed, timing-aware groupings a plain
+    /// `file` round-robin split would never produce for the same input.
+    #[test]
+    fn timing_strategy_uses_remote_history_with_median_imputation_for_unknown_files()
+    -> Result<(), String> {
+        let tmp = scratch_dir("timing-remote");
+        let _ = fs::create_dir_all(&tmp);
+        for name in ["a.spec.ts", "b.spec.ts", "c.spec.ts", "d.spec.ts"] {
+            let _ = fs::write(tmp.join(name), "");
+        }
+        let a = tmp.join("a.spec.ts").to_string_lossy().into_owned();
+        let b = tmp.join("b.spec.ts").to_string_lossy().into_owned();
+        let c = tmp.join("c.spec.ts").to_string_lossy().into_owned();
+        let d = tmp.join("d.spec.ts").to_string_lossy().into_owned();
+
+        // `a` is light, `b` is heavy; `c`/`d` have no `test_stats` history
+        // at all, so they are omitted from the fixture response entirely.
+        let response = GetTestTimingsResponse {
+            timings: vec![
+                FileTiming {
+                    file_path: a.clone(),
+                    duration_ms: 100,
+                    ..Default::default()
+                },
+                FileTiming {
+                    file_path: b.clone(),
+                    duration_ms: 9000,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let base_url = serve_test_timings(&response).map_err(|e| e.to_string())?;
+
+        let names = vec![a.clone(), b.clone(), c.clone(), d.clone()];
+        let client = Client::new(base_url, Codec::Json, None);
+        let lookup = RemoteHistoryLookup::fetch(&client, 42, &names).map_err(|e| e.to_string())?;
+
+        assert_eq!(lookup.duration_ms(&a), Some(100));
+        assert_eq!(lookup.duration_ms(&b), Some(9000));
+        assert_eq!(
+            lookup.duration_ms(&c),
+            None,
+            "a file with no test_stats row must be unknown, not zero"
+        );
+        assert_eq!(lookup.duration_ms(&d), None);
+
+        let items = split::items_from_names(&names, &lookup);
+        let shard_count =
+            split::resolve_shard_count(Strategy::Timing, ShardCountSpec::Fixed(2), &items)
+                .map_err(|e| e.to_string())?;
+        let assignment = split::assign(Strategy::Timing, &items, shard_count);
+        assert_eq!(assignment.len(), 2);
+
+        // Median imputation gives both unknown files (c, d) the median of
+        // the known durations (100, 9000 -> 4550 each); LPT then keeps the
+        // heaviest file (b, 9000ms) with the lightest (a, 100ms) in one
+        // shard and both imputed-median files (c, d) together in the
+        // other. Plain `file` round-robin on this same four-item input
+        // would instead alternate by path (a,c | b,d) -- a different,
+        // non-timing-aware grouping -- so this assertion only passes when
+        // the real timing data actually drove bin-packing.
+        let mut shard_with_b = assignment
+            .iter()
+            .find(|s| s.contains(&b))
+            .ok_or_else(|| "b must be assigned somewhere".to_string())?
+            .clone();
+        shard_with_b.sort();
+        let mut expected_with_b = vec![a.clone(), b.clone()];
+        expected_with_b.sort();
+        assert_eq!(shard_with_b, expected_with_b);
+
+        let mut other_shard = assignment
+            .iter()
+            .find(|s| !s.contains(&b))
+            .ok_or_else(|| "the other shard must exist".to_string())?
+            .clone();
+        other_shard.sort();
+        let mut expected_other = vec![c.clone(), d.clone()];
+        expected_other.sort();
+        assert_eq!(other_shard, expected_other);
 
         let _ = fs::remove_dir_all(&tmp);
         Ok(())
