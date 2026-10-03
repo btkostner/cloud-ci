@@ -109,3 +109,75 @@ export class DuplicateGroupMemberError extends Error {
     this.name = "DuplicateGroupMemberError";
   }
 }
+
+/** Thrown when a script calls `ci.limit(n, thunks)` with `n < 1`. A
+ * concurrency limit below 1 would never start any thunk — same "fail
+ * loudly on a meaningless call" posture as `EmptyGroupError`. */
+export class InvalidConcurrencyError extends Error {
+  constructor(n: number) {
+    super(`ci.limit(n, ...) called with n=${n}; n must be an integer >= 1`);
+    this.name = "InvalidConcurrencyError";
+  }
+}
+
+/** Thrown by `graph.fromJson(nodes)` when two nodes in the input array
+ * share the same `id`. A graph's `id` is its lookup key (`graph.node(id)`/
+ * `graph.deps(id)`); a duplicate makes that lookup ambiguous. */
+export class DuplicateGraphNodeIdError extends Error {
+  constructor(id: string) {
+    super(`graph.fromJson(nodes) was given duplicate node id "${id}"`);
+    this.name = "DuplicateGraphNodeIdError";
+  }
+}
+
+/** Thrown by `graph.node(id)`/`graph.deps(id)` when `id` is not in the
+ * graph. */
+export class UnknownGraphNodeError extends Error {
+  constructor(id: string) {
+    super(`graph has no node with id "${id}"`);
+    this.name = "UnknownGraphNodeError";
+  }
+}
+
+/** Thrown by `graph.fromJson(nodes)` when a node's `dependencies` entry
+ * names an id that is not itself a node in the same array. A graph whose
+ * edges point outside its own node set cannot be walked
+ * (`graph.deps(id)` would hand back a dangling id). */
+export class UnknownGraphDependencyError extends Error {
+  constructor(nodeId: string, dependencyId: string) {
+    super(`graph node "${nodeId}" depends on unknown node id "${dependencyId}"`);
+    this.name = "UnknownGraphDependencyError";
+  }
+}
+
+/** Thrown by `turbo.plan(ci, opts)` when the injected `ContainerExecutor`
+ * returns a `ContainerResult` with no `stdout` — `turbo.plan` cannot parse
+ * `turbo run --dry=json`'s output out of a result that never captured any
+ * output. Fails loudly rather than silently returning an empty graph. */
+export class TurboPlanOutputMissingError extends Error {
+  constructor(id: string) {
+    super(
+      `turbo.plan's container "${id}" finished with no stdout to parse; ` +
+        `the injected ContainerExecutor must populate ContainerResult.stdout`,
+    );
+    this.name = "TurboPlanOutputMissingError";
+  }
+}
+
+/** Thrown by `mise.plan(ci, opts)`. mise has no documented per-task
+ * dependency-graph JSON command equivalent to turbo's `--dry=json` — see
+ * `src/mise.ts`'s doc comment and this package's README for the exact,
+ * sourced investigation. Fails loudly rather than guessing a command or
+ * JSON shape. */
+export class MisePlanNotImplementedError extends Error {
+  constructor() {
+    super(
+      "mise.plan is not implemented: mise has no documented, machine-readable " +
+        "per-task dependency-graph command with hash/outputs fields equivalent to " +
+        "`turbo run --dry=json` — see src/mise.ts and README for the sourced " +
+        "investigation (`mise tasks graph --json`'s undocumented project-graph " +
+        "shape vs. `mise tasks deps`'s lack of a --json flag)",
+    );
+    this.name = "MisePlanNotImplementedError";
+  }
+}

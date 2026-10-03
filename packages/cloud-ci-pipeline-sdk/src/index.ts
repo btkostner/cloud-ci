@@ -3,9 +3,12 @@
  *
  * Implements the subset of `docs/design/dynamic-pipelines.md`'s `ci` API
  * this round builds: `workflow()`, `ci.check`, `ci.container`, `ci.shard`,
- * `ci.group`. See this package's README for the full, explicit scope
- * boundary (what is and is not implemented this round) before relying on
- * anything not re-exported here.
+ * `ci.group`, `ci.limit`, `graph.fromJson`/`graph.fromGraph`. See this
+ * package's README for the full, explicit scope boundary (what is and is
+ * not implemented this round) before relying on anything not re-exported
+ * here. `@cloud-ci/pipeline-sdk/turbo` and `@cloud-ci/pipeline-sdk/mise`
+ * are separate entry points (`./turbo.js`, `./mise.js`), not re-exported
+ * from here — see those files' own doc comments.
  */
 export { CheckRegistry } from "./check.js";
 export { CiContext } from "./context.js";
@@ -15,11 +18,18 @@ export {
   ContainerExecutorNotConfiguredError,
   DuplicateCheckNameError,
   DuplicateContainerIdError,
+  DuplicateGraphNodeIdError,
   DuplicateGroupMemberError,
   DuplicateShardIdError,
   EmptyGroupError,
+  InvalidConcurrencyError,
   ShardPlannerNotConfiguredError,
+  UnknownGraphDependencyError,
+  UnknownGraphNodeError,
 } from "./errors.js";
+export type { Graph, GraphNode } from "./graph.js";
+export { graph } from "./graph.js";
+export { limit } from "./limit.js";
 export type {
   Check,
   CheckConclusion,

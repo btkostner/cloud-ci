@@ -123,12 +123,22 @@ export interface ContainerOptions {
  * returns a plain result object (status, exit code, durations, report and
  * artifact ids), never a live handle." This round implements the subset a
  * `ContainerExecutor` can actually report (see README): no report/artifact
- * ids yet, since those require the real `RunCoordinator` upload path. */
+ * ids yet, since those require the real `RunCoordinator` upload path.
+ *
+ * `stdout` is `undefined` unless the injected `ContainerExecutor` chooses
+ * to populate it — this round's plain `ci.container`/`ci.shard`/`ci.group`
+ * callers never read it. `@cloud-ci/pipeline-sdk/turbo`'s `turbo.plan`
+ * (`src/turbo.ts`) is the one caller that needs it: it runs
+ * `turbo run <tasks> --dry=json` via `ci.container` and parses the dry-run
+ * JSON back out of this field, same as any other `ci.container` caller
+ * reads whatever a real `ContainerExecutor` captured — not a second,
+ * parallel output-capture mechanism. */
 export interface ContainerResult {
   readonly ok: boolean;
   readonly exitCode: number;
   readonly startedAt: number;
   readonly finishedAt: number;
+  readonly stdout?: string;
 }
 
 /** A single container-start request `ci.container` hands to the injected

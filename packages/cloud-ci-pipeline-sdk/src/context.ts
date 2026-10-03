@@ -1,6 +1,7 @@
 import { CheckRegistry } from "./check.js";
 import { runContainer } from "./container.js";
 import { runGroup } from "./group.js";
+import { limit } from "./limit.js";
 import { runShard } from "./shard.js";
 import type {
   Check,
@@ -31,7 +32,7 @@ export interface CiContextOptions {
  * The `ci` object a script's `run(ci)` receives. Implements the subset of
  * `docs/design/dynamic-pipelines.md`'s full `ci` API this round builds:
  * `ci.event`, `ci.changedFiles`, `ci.check`, `ci.container`, `ci.shard`,
- * `ci.group`. Every other documented member (`ci.snapshot`, `ci.limit`,
+ * `ci.group`, `ci.limit`. Every other documented member (`ci.snapshot`,
  * `ci.skip`, `ci.cached`, `ci.turboCache`, `ci.readFile`) is intentionally
  * absent this round — see README's scope boundary list.
  */
@@ -90,5 +91,11 @@ export class CiContext {
       ids,
       opts,
     );
+  }
+
+  /** Backs `ci.limit(n, thunks)` — see `src/limit.ts`'s doc comment for
+   * the full "ordering is by call, not completion" reasoning. */
+  limit<T>(n: number, thunks: readonly (() => Promise<T>)[]): Promise<T[]> {
+    return limit(n, thunks);
   }
 }
