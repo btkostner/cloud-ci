@@ -5,6 +5,20 @@
   "type": "module",
   "main": "./src/index.ts",
   "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts"
+    },
+    "./turbo": {
+      "types": "./src/turbo.ts",
+      "import": "./src/turbo.ts"
+    },
+    "./mise": {
+      "types": "./src/mise.ts",
+      "import": "./src/mise.ts"
+    }
+  },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
