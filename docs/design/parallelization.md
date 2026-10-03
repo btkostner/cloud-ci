@@ -342,14 +342,20 @@ attempt actually reported, and a wrong assumption that `CLOUD_CI_ATTEMPT` (the *
 read for that purpose at all. Rather than patch the wiring a third time, it was isolated out
 entirely; only the pure logic remains, with no caller anywhere.
 
-**Prerequisites before this can be wired again**, all open:
-- A `node_id` field on `SubmitResourceSamplesRequest` (`cloud-ci-proto`), added
-  backward-compatibly (`optional`/new field number) -- the decision layer can key a second OOM
-  on which real node reported it, rather than inferring identity from the reported attempt
-  number alone.
-- A real, verified mechanism for an agent to learn and report the *shard* attempt it is
-  running as (not `CLOUD_CI_ATTEMPT`, which is the run attempt) -- a new env var or CLI flag,
-  actually read by `cloud-ci agent`/`cloud-ci-cli`, not merely assumed.
+**Prerequisites before this can be wired again:**
+- ~~A `node_id` field on `SubmitResourceSamplesRequest` (`cloud-ci-proto`)~~ **Done (2026-10-03).**
+  `optional string node_id = 8` -- additive, no renumbering, `buf breaking` passes against
+  `main`. An absent or empty value hashes identically to the pre-`node_id` content-hash shape
+  (`coordinator::logic::resource_sample_batch_content_hash`), so an old agent's idempotency is
+  unchanged. The decision layer above still has no caller wiring it in.
+- ~~A real, verified mechanism for an agent to learn and report the *shard* attempt it is
+  running as~~ **Done (2026-10-03).** `cloud-ci agent --attempt` falls back to
+  `CLOUD_CI_SHARD_ATTEMPT`, then `1` (`cloud-ci-cli::identity::resolve_shard_attempt`) --
+  deliberately a different env var than `CLOUD_CI_ATTEMPT` (the run attempt). `--node-id` /
+  `CLOUD_CI_NODE_ID` (`cloud-ci-cli::agent::resolve_node_id`) is the matching carrier for the
+  `node_id` field above. Neither is yet *set* by any real dispatcher (`node_container.rs`
+  starts a container today with no knowledge of a retried attempt number or a chosen
+  `node_id` to pass in) -- that wiring is still open, see the OOM-retry dispatch items below.
 - A multi-size executor ladder: `ContainersExecutor::capabilities()` reports a single
   `standard-4` rung today, so `RetryAt` can never occur against the real executor -- every real
   OOM is an immediate `FailedAtMax`, making the retry path untestable outside a fake executor.

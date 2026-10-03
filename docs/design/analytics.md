@@ -90,10 +90,17 @@ size) is this doc's concern, below.
 ### CLI
 
 ```
-$ cloud-ci agent --job-id <id> --shard <n> --attempt <n> --instance-type standard-2 ...
+$ cloud-ci agent --job-id <id> --shard <n> --attempt <n> --instance-type standard-2 \
+    [--node-id <id>] ...
 # agent samples /sys/fs/cgroup/{memory.current,memory.peak,cpu.stat} every 2s,
 # submits the complete batch once via SubmitResourceSamples on exit (its own
 # typed RPC, not embedded in the job's Report — see "Data flow", below).
+# --attempt is the *shard* attempt (falls back to CLOUD_CI_SHARD_ATTEMPT, then
+# 1) -- deliberately a different env var than cloud-ci upload/split's own
+# CLOUD_CI_ATTEMPT (the *run* attempt; see parallelization.md's "not wired"
+# section for why conflating the two was a documented mistake). --node-id
+# (falls back to CLOUD_CI_NODE_ID) is optional and currently unset by any
+# real dispatcher -- see SubmitResourceSamplesRequest.node_id below.
 
 $ cloud-ci upload --report junit:./target/junit.xml --report timing:./target/step-timings.json
 # BYO-CI path (same binary, no agent/cgroup sampling since there's no container we control).

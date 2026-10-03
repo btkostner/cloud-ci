@@ -333,9 +333,25 @@ pub struct AgentArgs {
     #[arg(long, default_value_t = 0)]
     pub shard: u32,
 
-    /// 1-based execution attempt. `0` is invalid.
-    #[arg(long, default_value_t = 1)]
-    pub attempt: u32,
+    /// 1-based shard execution attempt. `0` is invalid. Falls back to
+    /// `CLOUD_CI_SHARD_ATTEMPT`, then `1` — deliberately *not*
+    /// `CLOUD_CI_ATTEMPT`, which is the *run* attempt `cloud-ci upload`/
+    /// `cloud-ci split` use (`UploadArgs::attempt`); see
+    /// `crate::identity::resolve_shard_attempt`'s own doc comment for why
+    /// conflating the two is a documented mistake this deliberately avoids.
+    #[arg(long)]
+    pub attempt: Option<u32>,
+
+    /// The exact node (container) this agent is running as, so an OOM
+    /// report can name it directly rather than the server inferring it
+    /// from `(job_id, shard_index, attempt)` alone. Falls back to
+    /// `CLOUD_CI_NODE_ID`. Unset by default — most dispatchers don't set
+    /// this yet (docs/design/parallelization.md's "not wired"
+    /// prerequisites); an agent that never resolves one simply omits
+    /// `node_id` from its `SubmitResourceSamples` call, exactly as before
+    /// this flag existed.
+    #[arg(long = "node-id")]
+    pub node_id: Option<String>,
 
     /// This job's runner/instance size label.
     #[arg(long = "instance-type")]

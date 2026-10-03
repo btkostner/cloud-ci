@@ -32,7 +32,7 @@ use cloud_ci_proto::ingest::v1::{
 
 use crate::cli::AgentArgs;
 use crate::connect_client::{Client, Codec};
-use crate::identity::{EnvSource, resolve_server_url};
+use crate::identity::{EnvSource, resolve_server_url, resolve_shard_attempt};
 use crate::upload::resolve_credential;
 
 /// Sampling cadence, per `docs/design/analytics.md`: "The agent samples
@@ -76,6 +76,22 @@ pub(crate) fn resolve_job_token(
     resolve_credential(job_token.as_deref(), env)
 }
 
+/// Resolves this agent's own `node_id` to report on its
+/// `SubmitResourceSamples` call: explicit `--node-id` flag >
+/// `CLOUD_CI_NODE_ID` env var > `None`. Unlike [`resolve_shard_attempt`],
+/// there is deliberately no fallback default here -- an unset value is a
+/// legitimate, common case (most dispatchers don't set this yet; see
+/// docs/design/parallelization.md's "not wired" prerequisites), not an
+/// error, and `SubmitResourceSamplesRequest.node_id` is `optional`
+/// precisely so an agent that never resolves one omits it entirely
+/// rather than send a fabricated placeholder.
+pub(crate) fn resolve_node_id(explicit: Option<&str>, env: &dyn EnvSource) -> Option<String> {
+    explicit
+        .map(str::to_string)
+        .filter(|v| !v.is_empty())
+        .or_else(|| env.var("CLOUD_CI_NODE_ID").filter(|v| !v.is_empty()))
+}
+
 /// Runs the bounded sampling loop, then submits the resulting
 /// [`JobSummary`] as one `SubmitResourceSamples` call.
 pub fn run(args: &AgentArgs, env: &dyn EnvSource) -> Result<(), AgentError> {
@@ -97,10 +113,11 @@ pub fn run(args: &AgentArgs, env: &dyn EnvSource) -> Result<(), AgentError> {
             "--instance-type is required",
         ));
     };
-    if args.attempt == 0 {
+    let attempt = resolve_shard_attempt(args.attempt, env);
+    if attempt == 0 {
         return Err(AgentError::new(
             "validate attempt",
-            "--attempt must be 1 or greater",
+            "--attempt (or CLOUD_CI_SHARD_ATTEMPT) must be 1 or greater",
         ));
     }
     let Some(server_url) = resolve_server_url(args.server_url.clone(), env) else {
@@ -113,10 +130,11 @@ pub fn run(args: &AgentArgs, env: &dyn EnvSource) -> Result<(), AgentError> {
     let reader = CgroupReader::new(&args.cgroup_path);
     let summary = sample_for(&reader, args.duration_secs, SAMPLE_INTERVAL, thread::sleep)?;
 
+    let node_id = resolve_node_id(args.node_id.as_deref(), env);
     let request = SubmitResourceSamplesRequest {
         job_id,
         shard_index: args.shard,
-        attempt: args.attempt,
+        attempt,
         instance_type,
         samples: summary
             .samples
@@ -126,6 +144,7 @@ pub fn run(args: &AgentArgs, env: &dyn EnvSource) -> Result<(), AgentError> {
             .collect(),
         memory_peak_bytes: summary.memory_peak_bytes,
         oom_detected: summary.oom_detected,
+        node_id,
         ..Default::default()
     };
 
@@ -249,21 +268,87 @@ mod tests {
         assert_eq!(args.duration_secs, 30);
         assert_eq!(args.job_id.as_deref(), Some("job-abc"));
         assert_eq!(args.shard, 2);
-        assert_eq!(args.attempt, 3);
+        assert_eq!(args.attempt, Some(3));
         assert_eq!(args.instance_type.as_deref(), Some("standard-2"));
         assert_eq!(args.server_url.as_deref(), Some("https://example.test"));
         assert_eq!(args.token.as_deref(), Some("tok"));
     }
 
     #[test]
-    fn defaults_to_real_cgroupfs_mount_sixty_seconds_shard_zero_attempt_one() {
+    fn defaults_to_real_cgroupfs_mount_sixty_seconds_shard_zero_no_attempt_flag() {
+        // `--attempt` itself now has no clap-level default (`None` when
+        // omitted) -- the flag > `CLOUD_CI_SHARD_ATTEMPT` > `1` fallback
+        // chain lives in `resolve_shard_attempt`, exercised separately
+        // below, so this only asserts what `clap` itself produces.
         let args = parse(&["cloud-ci", "agent"]);
         assert_eq!(args.cgroup_path, std::path::PathBuf::from("/sys/fs/cgroup"));
         assert_eq!(args.duration_secs, 60);
         assert_eq!(args.shard, 0);
-        assert_eq!(args.attempt, 1);
+        assert_eq!(args.attempt, None);
         assert_eq!(args.job_id, None);
         assert_eq!(args.instance_type, None);
+        assert_eq!(args.node_id, None);
+    }
+
+    #[test]
+    fn resolve_shard_attempt_explicit_flag_wins_over_everything() {
+        let env = MapEnv::new(&[("CLOUD_CI_SHARD_ATTEMPT", "9")]);
+        assert_eq!(resolve_shard_attempt(Some(3), &env), 3);
+    }
+
+    #[test]
+    fn resolve_shard_attempt_falls_back_to_its_own_env_var() {
+        let env = MapEnv::new(&[("CLOUD_CI_SHARD_ATTEMPT", "4")]);
+        assert_eq!(resolve_shard_attempt(None, &env), 4);
+    }
+
+    #[test]
+    fn resolve_shard_attempt_ignores_the_run_attempt_env_var() {
+        // `CLOUD_CI_ATTEMPT` is the *run* attempt (`identity::resolve_run_identity`,
+        // `cloud-ci upload`/`cloud-ci split`) -- it must never leak into the shard
+        // attempt an agent reports, which is the exact bug
+        // `coordinator::logic::decide_oom_recovery`'s doc comment documents.
+        let env = MapEnv::new(&[("CLOUD_CI_ATTEMPT", "7")]);
+        assert_eq!(resolve_shard_attempt(None, &env), 1);
+    }
+
+    #[test]
+    fn resolve_shard_attempt_defaults_to_one_when_nothing_resolves() {
+        let env = MapEnv::new(&[]);
+        assert_eq!(resolve_shard_attempt(None, &env), 1);
+    }
+
+    #[test]
+    fn resolve_node_id_explicit_flag_wins_over_env_var() {
+        let env = MapEnv::new(&[("CLOUD_CI_NODE_ID", "shard:job:0:1")]);
+        assert_eq!(
+            resolve_node_id(Some("explicit-node"), &env),
+            Some("explicit-node".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_node_id_falls_back_to_its_env_var() {
+        let env = MapEnv::new(&[("CLOUD_CI_NODE_ID", "shard:job:0:1")]);
+        assert_eq!(
+            resolve_node_id(None, &env),
+            Some("shard:job:0:1".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_node_id_is_none_when_nothing_resolves() {
+        // The old-client / not-yet-wired-dispatcher case: no flag, no env
+        // var -- `node_id` stays unset exactly as it was before this field
+        // existed, never a fabricated placeholder.
+        let env = MapEnv::new(&[]);
+        assert_eq!(resolve_node_id(None, &env), None);
+    }
+
+    #[test]
+    fn resolve_node_id_treats_an_empty_flag_and_env_var_as_absent() {
+        let env = MapEnv::new(&[("CLOUD_CI_NODE_ID", "")]);
+        assert_eq!(resolve_node_id(Some(""), &env), None);
     }
 
     #[test]
@@ -411,10 +496,11 @@ mod tests {
             duration_secs: 0,
             job_id: Some("job-abc".to_string()),
             shard: 0,
-            attempt: 1,
+            attempt: Some(1),
             instance_type: Some("standard-2".to_string()),
             server_url: Some("https://example.test".to_string()),
             token: None,
+            node_id: None,
         }
     }
 
@@ -470,7 +556,7 @@ mod tests {
         let dir = scratch_dir("run-zero-attempt");
         write_fixture(&dir, 0, 0);
         let mut args = base_args(&dir);
-        args.attempt = 0;
+        args.attempt = Some(0);
         let env = MapEnv::new(&[("CLOUD_CI_TOKEN", "tok")]);
         let Err(err) = run(&args, &env) else {
             let _ = std::fs::remove_dir_all(&dir);

@@ -167,6 +167,26 @@ pub fn resolve_job_name(flag: Option<&str>, env: &dyn EnvSource) -> Result<Strin
         .ok_or_else(|| "--job (or CLOUD_CI_JOB)".to_string())
 }
 
+/// Resolves `cloud-ci agent`'s shard *attempt*: explicit `--attempt` flag >
+/// `CLOUD_CI_SHARD_ATTEMPT` env var > `1`. Deliberately a *different* env
+/// var than `CLOUD_CI_ATTEMPT` above (`resolve_run_identity`'s own
+/// `attempt` field, the *run* attempt `cloud-ci upload`/`cloud-ci split`
+/// use): an agent process sampling inside one dispatched shard container
+/// has no business reading the run attempt for this purpose, and an
+/// earlier, documented attempt at this feature wrongly assumed
+/// `CLOUD_CI_ATTEMPT` already carried it
+/// (`coordinator::logic::decide_oom_recovery`'s doc comment,
+/// `cloud-ci-worker`; docs/design/parallelization.md's "not wired"
+/// prerequisites). `0` from either the flag or the env var is left
+/// unvalidated here — [`crate::agent::run`] rejects it the same way it
+/// already rejects a `0` default, so there is exactly one place that
+/// check happens regardless of source.
+pub(crate) fn resolve_shard_attempt(explicit: Option<u32>, env: &dyn EnvSource) -> u32 {
+    explicit
+        .or_else(|| non_empty(env.var("CLOUD_CI_SHARD_ATTEMPT")).and_then(|v| v.parse().ok()))
+        .unwrap_or(1)
+}
+
 fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|v| !v.is_empty())
 }
