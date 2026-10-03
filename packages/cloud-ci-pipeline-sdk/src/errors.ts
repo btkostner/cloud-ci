@@ -87,3 +87,25 @@ export class ShardPlannerNotConfiguredError extends Error {
     this.name = "ShardPlannerNotConfiguredError";
   }
 }
+
+/** Thrown when a script calls `ci.group` with an empty `ids` array.
+ * Grouping zero nodes into one container dispatches nothing and names no
+ * node — same "fail loudly on a meaningless call" posture as
+ * `ContainerExecutorNotConfiguredError`. */
+export class EmptyGroupError extends Error {
+  constructor() {
+    super("ci.group(ids, ...) called with an empty ids array");
+    this.name = "EmptyGroupError";
+  }
+}
+
+/** Thrown when a script calls `ci.group` with the same id twice in one
+ * `ids` array. Same "node ids are the replay key and must be unique"
+ * rule `DuplicateContainerIdError` enforces across calls, applied within
+ * a single `ci.group` call's own member list. */
+export class DuplicateGroupMemberError extends Error {
+  constructor(id: string) {
+    super(`ci.group(ids, ...) was given duplicate id "${id}" within one call`);
+    this.name = "DuplicateGroupMemberError";
+  }
+}

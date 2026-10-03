@@ -4,8 +4,8 @@
  * Field names and shapes follow `docs/design/dynamic-pipelines.md`'s "User
  * experience" and "Design" sections as closely as this round's scope
  * allows; fields that section documents but this round does not implement
- * (`sidecars`, `snapshot`, multi-`steps`, `ci.shard`, `ci.group`, …) are
- * intentionally absent — see README's scope boundary list.
+ * (`sidecars`, `snapshot`, multi-`steps`, …) are intentionally absent —
+ * see README's scope boundary list.
  */
 
 /** The event kind a pipeline run was triggered by. The design doc's
@@ -269,4 +269,47 @@ export interface ShardPlan {
  */
 export interface ShardPlanner {
   resolve(request: ShardPlanRequest): Promise<ShardPlan>;
+}
+
+/** Options accepted by `ci.group(ids, opts)`. The design doc's only text
+ * on `ci.group` is a single "Graph helpers" table row: `` `ci.group(ids,
+ * spec)` `` — "Run several nodes in one container to save startup cost"
+ * (`docs/design/dynamic-pipelines.md:381`). There is no worked example, no
+ * prose section, and no further mention anywhere else in that document —
+ * unlike every other primitive (`ci.container`, `ci.shard`, `ci.check`),
+ * which each get a full "User experience" code sample plus a "Design"
+ * section spelling out their contract. This SDK therefore implements the
+ * narrowest shape that single row actually states, matching
+ * `ContainerOptions`'s own fields exactly (this round never invented a
+ * second container-spec shape): `ids` names the several graph-node ids
+ * being batched into one container dispatch; `opts.run` is the single,
+ * already-combined shell command that single container runs to produce
+ * every named node's result (composing that command — e.g. one `turbo
+ * run` invocation covering several packages — is the caller's job, same
+ * division of labor `ci.shard`'s `run` callback uses for per-shard
+ * commands). This is a batch-dispatch primitive, not a logical/UI
+ * label or a callback scope for nested `ci.check`/`ci.container` calls —
+ * the doc's signature takes an id array and a spec object, never a
+ * callback. */
+export interface GroupOptions {
+  /** Runner size hint, forwarded to the `ContainerExecutor` as-is — same
+   * field and meaning as `ContainerOptions.runner`. */
+  readonly runner?: string;
+  /** Shell command the one shared container runs, covering every id in
+   * `ids`. */
+  readonly run: string;
+  /** Check every id in `ids` attaches to, or `null`/omitted to report no
+   * check run — same semantics as `ContainerOptions.check`, applied to
+   * each grouped id individually (mirrors `ci.shard`'s per-shard attach,
+   * `src/shard.ts`). */
+  readonly check?: Check | null;
+}
+
+/** Result of one finished `ci.group` call: every id in the call's `ids`
+ * maps to the same single container's `ContainerResult`, since all of them
+ * ran inside that one container. Keyed by id (not a `Map`, to stay
+ * RPC-serializable — see `ContainerResult`'s own doc comment on that
+ * constraint). */
+export interface GroupResult {
+  readonly results: Readonly<Record<string, ContainerResult>>;
 }
