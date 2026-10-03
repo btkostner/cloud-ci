@@ -59,6 +59,24 @@ snapshots), every other backend becomes a rewrite.
 - Only Containers ships in the managed-runs phase; other executors are a later
   [roadmap](../roadmap.md) phase.
 
+**Status note, 2026-10-02.** The `Executor` trait, `CapabilityDescriptor`, and the pull/callback
+data shapes (`JobSpec`, `Bootstrap`, `ExecutorHandle`, `ExecutorStatus`) above are now real code
+(`packages/cloud-ci-worker/src/executor.rs`), with two conformers: `ContainersExecutor` (a thin
+wrapper delegating every real call to `node_container.rs`'s existing DO-to-DO logic — extracted
+into shared `start_container`/`stop_container`/`container_status` free functions so
+`RunCoordinator` and `ContainersExecutor` call the same code, never two copies of it) and
+`FakeExecutor` (a pure, in-memory conformer proving the trait is implementable by something
+other than Containers, unit-tested for its full `started -> running -> stopped` lifecycle
+including double-start and already-stopped/never-started edge cases). `RunCoordinator` itself
+still calls `node_container::start_container`/`stop_container` directly rather than through a
+`ContainersExecutor` value: a real trait-level `start` call needs a real `Bootstrap`, and no
+bootstrap-token-issuance path exists yet, so constructing a placeholder one just to satisfy the
+trait's signature would thread fake data through a real code path. **Not built this round, and
+blocked on real cloud credentials this environment does not have:** AWS EC2, AWS Lambda,
+Kubernetes Jobs, and self-hosted conformers — every one of the table above still marked
+"Possible" — plus the real bootstrap-token-issuance path and the real `cloud-ci agent` pull-loop
+wiring that would consume it. See [roadmap](../roadmap.md)'s Phase 6 bullet.
+
 ## What would reverse this
 
 Agent pull latency (job spec fetch, log streaming over HTTPS) making Containers jobs measurably

@@ -55,7 +55,16 @@ Packages: `cloud-ci-web`.
 ## Phase 6 — Executors beyond Containers
 
 - Additional `Executor` implementations per [ADR 0010](./adr/0010-pluggable-executors.md): AWS
-  EC2, AWS Lambda, Kubernetes Jobs, self-hosted machines.
+  EC2, AWS Lambda, Kubernetes Jobs, self-hosted machines. **Trait boundary proven 2026-10-02**:
+  the `Executor` trait, `CapabilityDescriptor`, and pull/callback data shapes are real
+  (`packages/cloud-ci-worker/src/executor.rs`), with two conformers — `ContainersExecutor`
+  (delegates to `node_container.rs`'s existing real Cloudflare Containers logic, never
+  duplicates it) and `FakeExecutor` (a pure in-memory conformer, unit-tested lifecycle, proving
+  the trait is implementable by something other than Containers). **Still not built, blocked on
+  real cloud credentials this environment does not have:** real AWS EC2/Lambda/Kubernetes
+  Jobs/self-hosted conformers (every one still "Possible" in ADR 0010's own table), and the real
+  bootstrap-token-issuance path + `cloud-ci agent` pull-loop wiring those conformers (and a real
+  `RunCoordinator`-to-`ContainersExecutor` rewiring) would need.
 
 ## Phase 7 — Distribution
 
