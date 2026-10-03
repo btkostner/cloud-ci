@@ -1388,6 +1388,53 @@ pub fn shard_nodes_to_cancel(
         .collect()
 }
 
+/// Maps a shard's own reported terminal outcome to the terminal
+/// [`NodeState`] its registered node (if any) should be completed
+/// with — [`shard_self_completion_target`]'s only caller. Deliberately
+/// distinct from [`shard_nodes_to_cancel`]'s blanket `Cancelled`: a
+/// shard reporting its own terminal status here was never cancelled by
+/// anyone, it genuinely concluded with this outcome, so its node must
+/// record the real conclusion, not a cancellation. `ShardTerminalStatus`
+/// has only these two values (`from_db_str`), so this mapping is total.
+pub fn shard_terminal_node_state(status: ShardTerminalStatus) -> NodeState {
+    match status {
+        ShardTerminalStatus::Passed => NodeState::Succeeded,
+        ShardTerminalStatus::Failed => NodeState::Failed,
+    }
+}
+
+/// Whether a shard's own terminal ingest call should bring its own
+/// registered node ([`shard_node_id`]) to a real terminal state —
+/// `handle_shard_terminal`'s self-completion gap: a shard was
+/// dispatched as a real running node via `startNode`, but its own
+/// `completeNode` call either hasn't landed yet or never will (this
+/// report-ingest path is itself the only completion signal this shard
+/// gets). `current` is that node's current state, if a node was ever
+/// registered for this `(job_name, idx, attempt)` at all.
+///
+/// Returns `Some(target)` — the real terminal state to record, via
+/// [`shard_terminal_node_state`] — only when `current` is
+/// `Some(non-terminal)`: a node row exists and is still
+/// `Pending`/`Running`. Returns `None`, a documented no-op, in both
+/// other cases: no node was ever registered for this shard (never
+/// dispatched as a real node — this file's module docs' "still not
+/// built: any real caller that dispatches ordinary shards" gap), or the
+/// node already reached a terminal state of its own (it legitimately
+/// called `completeNode` itself already, or an unrelated cancellation
+/// already settled it) — never re-stop an already-stopped container or
+/// overwrite an already-recorded status, same "already concluded, never
+/// relabel" discipline [`shard_nodes_to_cancel`]/[`nodes_to_cancel`]
+/// already apply to sibling-cancellation.
+pub fn shard_self_completion_target(
+    current: Option<NodeState>,
+    outcome: ShardTerminalStatus,
+) -> Option<NodeState> {
+    match current {
+        Some(state) if !state.is_terminal() => Some(shard_terminal_node_state(outcome)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2608,7 +2655,6 @@ mod tests {
             Vec::<String>::new()
         );
     }
-
     #[test]
     fn shard_nodes_to_cancel_is_empty_when_the_shard_was_never_dispatched_as_a_node() {
         // No node was ever registered for this index — a documented
@@ -2617,6 +2663,58 @@ mod tests {
         assert_eq!(
             shard_nodes_to_cancel("e2e", 0, &nodes),
             Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn shard_terminal_node_state_maps_passed_and_failed() {
+        assert_eq!(
+            shard_terminal_node_state(ShardTerminalStatus::Passed),
+            NodeState::Succeeded
+        );
+        assert_eq!(
+            shard_terminal_node_state(ShardTerminalStatus::Failed),
+            NodeState::Failed
+        );
+    }
+
+    #[test]
+    fn shard_self_completion_target_completes_a_still_running_own_node() {
+        // The shard's own node was dispatched and is still `running`
+        // when its own terminal report arrives — complete it for real
+        // with the shard's actual outcome, not `Cancelled`.
+        assert_eq!(
+            shard_self_completion_target(Some(NodeState::Running), ShardTerminalStatus::Failed),
+            Some(NodeState::Failed)
+        );
+        assert_eq!(
+            shard_self_completion_target(Some(NodeState::Pending), ShardTerminalStatus::Passed),
+            Some(NodeState::Succeeded)
+        );
+    }
+
+    #[test]
+    fn shard_self_completion_target_is_a_noop_when_no_node_was_ever_registered() {
+        assert_eq!(
+            shard_self_completion_target(None, ShardTerminalStatus::Passed),
+            None
+        );
+    }
+
+    #[test]
+    fn shard_self_completion_target_is_a_noop_for_an_already_terminal_node() {
+        // The node already called `completeNode` itself (a real
+        // container that already exited) — never re-stop it or
+        // overwrite its already-recorded status.
+        assert_eq!(
+            shard_self_completion_target(Some(NodeState::Succeeded), ShardTerminalStatus::Failed),
+            None
+        );
+        // Already `Cancelled` by some other mechanism — never relabel
+        // it with the shard's own outcome either.
+        assert_eq!(
+            shard_self_completion_target(Some(NodeState::Cancelled), ShardTerminalStatus::Passed),
+            None
         );
     }
 }

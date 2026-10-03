@@ -2368,6 +2368,48 @@ impl RunCoordinator {
         Ok(())
     }
 
+    /// Brings the *reporting* shard's own registered node to a real
+    /// terminal state consistent with its own terminal report —
+    /// [`Self::handle_shard_terminal`]'s self-completion gap (that
+    /// function's own doc comment): a shard reports terminal via this
+    /// call, but if it was ever dispatched as a real node via
+    /// `startNode` ([`logic::shard_node_id`]), nothing before this round
+    /// ever touched *that* node — only `FailFastTriggered`'s *sibling*
+    /// nodes got stopped/marked via [`Self::cancel_shards`]. Unlike
+    /// `cancel_shards`, this never records `Cancelled`: the reporting
+    /// shard was not cancelled, it genuinely concluded with
+    /// `outcome` ([`logic::shard_terminal_node_state`]). A no-op,
+    /// decided entirely by [`logic::shard_self_completion_target`], when
+    /// no node was ever registered for this `(job_name, idx, attempt)`,
+    /// or it already reached a terminal state of its own (it already
+    /// called `completeNode` for real, or was already cancelled by some
+    /// other mechanism) — never re-stops an already-stopped container or
+    /// overwrites an already-recorded status.
+    async fn complete_own_shard_node(
+        &self,
+        sql: &SqlStorage,
+        run_row: &RunRow,
+        job_name: &str,
+        idx: u32,
+        attempt: u32,
+        outcome: logic::ShardTerminalStatus,
+    ) -> worker::Result<()> {
+        let node_id = logic::shard_node_id(job_name, idx, attempt);
+        let current = match read_node(sql, &node_id)? {
+            Some(row) => Some(node_state_of(&row)?),
+            None => None,
+        };
+        let Some(target) = logic::shard_self_completion_target(current, outcome) else {
+            return Ok(());
+        };
+        self.stop_node_container(&node_id).await;
+        let now_ms = worker::Date::now().as_millis() as i64;
+        update_node_status(sql, &node_id, target.as_db_str(), None, now_ms)?;
+        let row = require_node(sql, &node_id)?;
+        self.project_node_to_d1(&run_row.id, &row).await?;
+        Ok(())
+    }
+
     async fn project_run_to_d1(&self, row: &RunRow) -> worker::Result<()> {
         let db = self.env.d1("DB")?;
         db.prepare(
@@ -2756,6 +2798,15 @@ impl RunCoordinator {
                     req.report_key.as_deref(),
                     req.duration_ms,
                     now_ms,
+                )
+                .await?;
+                self.complete_own_shard_node(
+                    sql,
+                    &run_row,
+                    &req.job_name,
+                    req.idx,
+                    req.attempt,
+                    incoming_status,
                 )
                 .await?;
 
