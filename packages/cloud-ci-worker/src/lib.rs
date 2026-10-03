@@ -24,6 +24,7 @@ pub mod roles;
 pub mod rollup;
 pub mod session;
 pub mod shard_merge;
+pub mod shard_plan;
 pub mod template_spike;
 pub mod test_stats;
 pub mod token_issuance;
@@ -35,7 +36,8 @@ use cloud_ci_proto::ingest::v1::{
     BeginRunRequest, BeginRunResponse, CompleteShardRequest, CompleteShardResponse,
     CompleteUploadRequest, CompleteUploadResponse, CreateUploadRequest, CreateUploadResponse,
     FileTiming, GetRunRequest, GetRunResponse, GetTestTimingsRequest, GetTestTimingsResponse,
-    StartJobRequest, StartJobResponse, SubmitReportRequest, SubmitReportResponse,
+    ResolveShardPlanRequest, StartJobRequest, StartJobResponse, SubmitReportRequest,
+    SubmitReportResponse,
 };
 use connect::{Code, Codec, ConnectError, NegotiationError, negotiate};
 use coordinator::{CoordinatorError, RunCoordinatorStore};
@@ -922,6 +924,9 @@ async fn route(
         "/cloud_ci.ingest.v1.IngestService/GetTestTimings" => {
             handle_get_test_timings(codec, body, env, bearer).await
         }
+        "/cloud_ci.ingest.v1.IngestService/ResolveShardPlan" => {
+            handle_resolve_shard_plan(codec, body, env, bearer).await
+        }
         "/cloud_ci.ingest.v1.IngestService/CreateUpload" => {
             handle_create_upload(codec, body, env).await
         }
@@ -1247,6 +1252,75 @@ async fn handle_get_test_timings(
             .collect(),
         ..Default::default()
     };
+    codec.encode(&resp)
+}
+
+/// `ResolveShardPlan` backs `ci.shard`'s `ShardPlanner` injection point
+/// (`packages/cloud-ci-pipeline-sdk`), per docs/design/parallelization.md's
+/// "### Deterministic assignment, end to end" step 2: "For managed runs,
+/// `RunCoordinator` computes the assignment once ... when `ci.shard`'s
+/// `step.do("split:" + id)` runs". This handler is a thin shell —
+/// `shard_plan::resolve_plan` does the actual (pure, `cargo test`-covered)
+/// request-to-response work, reusing `cloud_ci_core::split`'s real
+/// LPT-bin-packing/round-robin/median-imputation functions directly
+/// (the same ones `cloud-ci-cli`'s `cloud-ci split` calls), never
+/// reimplementing them — see that module's docs for why a second,
+/// independent implementation would risk drifting from the Rust original.
+///
+/// Auth mirrors [`handle_get_test_timings`]'s own credential model exactly
+/// (same rationale: see that function's doc comment) rather than the
+/// run-scoped ingest token every post-`BeginRun` call uses. This is a
+/// scope decision, not an oversight: wiring this call to the real
+/// `RunCoordinator`/ingest-token flow (so a managed run's `ci.shard`
+/// authenticates the same way its `ci.container` calls eventually will)
+/// is explicit follow-up, matching `ci.container`'s own documented
+/// "no `RunCoordinator` wiring this round" scope boundary
+/// (`packages/cloud-ci-pipeline-sdk/README.md`'s "Explicitly out of scope
+/// this round").
+///
+/// Only queries `test_stats` when `strategy` is `timing` — `file`/`count`
+/// have no use for historical duration data (same "only resolve what the
+/// strategy needs" precedent `cloud-ci-cli::split::run` already
+/// establishes for the BYO CI side of this same algorithm).
+async fn handle_resolve_shard_plan(
+    codec: Codec,
+    body: &[u8],
+    env: &Env,
+    bearer: Option<&str>,
+) -> std::result::Result<Vec<u8>, ConnectError> {
+    let req: ResolveShardPlanRequest = codec.decode(body)?;
+
+    match bearer {
+        Some(bearer) if oidc::looks_like_jwt(bearer) => {
+            verify_oidc_begin_run_credential(env, bearer, req.repo_id).await?;
+        }
+        Some(bearer) => {
+            verify_scoped_api_token_begin_run_credential(env, bearer, req.repo_id).await?;
+        }
+        None => {
+            return Err(ConnectError::new(
+                Code::Unauthenticated,
+                "ResolveShardPlan requires a credential: GitHub Actions OIDC JWT or a scoped API token",
+            ));
+        }
+    }
+
+    let durations_ms =
+        if req.strategy == cloud_ci_proto::ingest::v1::SplitStrategy::SPLIT_STRATEGY_TIMING {
+            let rows = test_stats::lookup_file_timings(env, req.repo_id, &req.file_paths)
+                .await
+                .map_err(|e| {
+                    ConnectError::new(Code::Internal, format!("test_stats lookup failed: {e}"))
+                })?;
+            rows.into_iter()
+                .map(|row| (row.file_path, row.duration_ms))
+                .collect()
+        } else {
+            std::collections::HashMap::new()
+        };
+
+    let resp = shard_plan::resolve_plan(&req, &durations_ms)
+        .map_err(|e| ConnectError::new(Code::InvalidArgument, e.to_string()))?;
     codec.encode(&resp)
 }
 

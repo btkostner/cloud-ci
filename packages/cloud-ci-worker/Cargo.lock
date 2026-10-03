@@ -138,6 +138,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "buffa",
+ "buffa-types",
  "chrono",
  "cloud-ci-core",
  "cloud-ci-proto",

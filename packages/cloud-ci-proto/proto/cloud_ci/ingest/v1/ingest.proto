@@ -15,6 +15,7 @@ service IngestService {
   rpc CompleteShard(CompleteShardRequest) returns (CompleteShardResponse);
   rpc GetRun(GetRunRequest) returns (GetRunResponse);
   rpc GetTestTimings(GetTestTimingsRequest) returns (GetTestTimingsResponse);
+  rpc ResolveShardPlan(ResolveShardPlanRequest) returns (ResolveShardPlanResponse);
 }
 
 enum Trigger {
@@ -175,4 +176,71 @@ message FileTiming {
 
 message GetTestTimingsResponse {
   repeated FileTiming timings = 1;
+}
+
+// `ci.shard`'s split-resolution strategy, matching
+// `cloud_ci_core::split::Strategy` and `docs/design/parallelization.md`'s
+// "### Split strategies" table 1:1 (`UNSPECIFIED` is invalid, never
+// resolved by a real caller).
+enum SplitStrategy {
+  SPLIT_STRATEGY_UNSPECIFIED = 0;
+  SPLIT_STRATEGY_TIMING = 1;
+  SPLIT_STRATEGY_FILE = 2;
+  SPLIT_STRATEGY_COUNT = 3;
+}
+
+// `{ min, max, target }` shard-count auto-sizing, matching
+// `cloud_ci_core::split::ShardCountSpec::Auto` and parallelization.md's
+// "### Shard count resolution" table's object form. Only meaningful with
+// `SPLIT_STRATEGY_TIMING` — the handler rejects this with any other
+// strategy, same as the pure `cloud_ci_core::split::resolve_shard_count`
+// it calls.
+message ShardCountRange {
+  uint32 min = 1;
+  uint32 max = 2;
+  google.protobuf.Duration target = 3;
+}
+
+// How `ci.shard`'s `count` option specifies shard count, matching
+// `cloud_ci_core::split::ShardCountSpec` exactly: a fixed integer used
+// as-is (after the platform's `1..64` clamp), or a `{min, max, target}`
+// duration-budget auto-sizing spec.
+message ShardCountSpec {
+  oneof spec {
+    uint32 fixed = 1;
+    ShardCountRange range = 2;
+  }
+}
+
+// Resolves a shard count and per-shard file assignment for one `ci.shard`
+// call, per docs/design/parallelization.md's "### Deterministic
+// assignment, end to end" step 2: "For managed runs, `RunCoordinator`
+// computes the assignment once ... and stores it as `shard_plan` rows
+// before dispatching any shard container." `file_paths` is the shard's
+// `files` glob already expanded and sorted by the caller (dynamic-
+// pipelines.md's "### Splitting tests across shards": the engine resolves
+// the actual shard count and per-shard file assignment from this input
+// list), at `file` granularity — the only granularity
+// `cloud_ci_core::split` implements today (see that crate's module docs).
+// Read-only against `test_stats`; never writes `shard_plan` itself — this
+// RPC resolves the plan, a future `RunCoordinator` integration persists
+// it (see `cloud-ci-worker`'s handler doc comment for the exact scope
+// line).
+message ResolveShardPlanRequest {
+  uint64 repo_id = 1;
+  repeated string file_paths = 2;
+  SplitStrategy strategy = 3;
+  ShardCountSpec count = 4;
+}
+
+// One shard's assigned file list, index 0 = shard 1 (matching
+// `cloud_ci_core::split::assign`'s own "index 0 = shard 1" convention).
+message ShardFiles {
+  repeated string files = 1;
+}
+
+message ResolveShardPlanResponse {
+  uint32 shard_count = 1;
+  // Always exactly `shard_count` entries, in shard-index order.
+  repeated ShardFiles shards = 2;
 }
