@@ -61,3 +61,29 @@ export class ContainerExecutorNotConfiguredError extends Error {
     this.name = "ContainerExecutorNotConfiguredError";
   }
 }
+
+/** Thrown when a script calls `ci.shard` twice with the same id in one
+ * execution — same "node ids are the replay key" rule
+ * `DuplicateContainerIdError` enforces for `ci.container`, applied to
+ * shard-group ids instead of single-container ids. */
+export class DuplicateShardIdError extends Error {
+  constructor(id: string) {
+    super(`shard id "${id}" was already used in this run`);
+    this.name = "DuplicateShardIdError";
+  }
+}
+
+/** Thrown when `ci.shard` is called without a `ShardPlanner` injected into
+ * `workflow()`. Same posture as `ContainerExecutorNotConfiguredError`:
+ * there is no real `ResolveShardPlan` RPC wiring yet (see README's scope
+ * boundary list), so a script run with no planner configured fails loudly
+ * instead of silently no-opping. */
+export class ShardPlannerNotConfiguredError extends Error {
+  constructor(id: string) {
+    super(
+      `ci.shard("${id}", ...) called but no ShardPlanner was configured; ` +
+        `pass one via workflow(opts, { planner }) — see README's "ShardPlanner" section`,
+    );
+    this.name = "ShardPlannerNotConfiguredError";
+  }
+}

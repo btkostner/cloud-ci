@@ -27,6 +27,17 @@ package, the same way any other script dependency would be.
   `WorkflowStepLike.do` persistence — not an invented parallel mechanism.
   Rejects a duplicate id within one execution, and attaches the node to its
   `check` (throwing if that check is already sealed) before the step runs.
+- **`ci.shard(id, { split, count, files, run, check })`** — resolves a
+  shard count and per-shard file assignment via the injected
+  `ShardPlanner.resolve()` call, wrapped in one real
+  `step.do("split:" + id, ...)` (`src/shard.ts`), then dispatches one real
+  `ci.container` call per shard (reusing `runContainer` directly — not a
+  duplicated step-durability mechanism), id `` `${id}#${shardIndex}` ``,
+  with `opts.run({ shard, shards, files })`'s returned command string.
+  Rejects a duplicate shard id within one execution, and attaches every
+  resolved shard to `check` via each per-shard `ci.container` call's own
+  attach logic. See "`ci.shard`: shard-plan resolution and per-shard
+  dispatch" below for the full split-algorithm-reuse rationale.
 
 ## The step-durability contract, and what is and isn't proven this round
 
@@ -95,6 +106,84 @@ succeeding or no-opping.
 Ordinary `.cloud-ci/pipelines/*.ts` scripts never see or pass this — they
 only ever call `workflow({ on, run })`. `WorkflowDependencies` (the second,
 optional argument) exists purely as a test/integration seam.
+
+
+## `ci.shard`: shard-plan resolution and per-shard dispatch
+
+`ci.shard(id, { split, count, files, run, check })` implements
+`docs/design/dynamic-pipelines.md`'s "### Splitting tests across shards"
+and `docs/design/parallelization.md`'s "### Split strategies"/"### Shard
+count resolution"/"### Deterministic assignment, end to end" — with one
+architectural constraint those docs make explicit and this package takes
+seriously: parallelization.md's "### Deterministic assignment, end to end"
+goal is "the same binary and the same split algorithm ... used in both
+places, so a BYO CI matrix and a cloud-ci-managed shard group produce
+byte-identical assignments for the same inputs." The real split algorithm
+(LPT bin-packing, round-robin, median-fallback imputation) lives in
+`cloud_ci_core::split` (Rust) — the same pure crate `cloud-ci-cli`'s own
+`cloud-ci split` command calls. **This package never reimplements that
+algorithm in TypeScript.** `cloud-ci-pipeline-sdk` runs inside a Dynamic
+Worker, a separate runtime from `cloud-ci-worker`'s Rust/wasm32 code,
+reached only via a service binding — the same architectural shape
+`ci.container`'s own `ContainerExecutor` injection point already uses for
+the real container-start mechanism.
+
+`ci.shard` resolves the plan through an injected `ShardPlanner` (`src/
+types.ts`'s `ShardPlanner` interface — one `resolve(request)` method,
+mirroring `ContainerExecutor.start()`'s shape exactly), wrapped in one real
+`step.do("split:" + id, ...)` (`src/shard.ts`). That matches
+parallelization.md's "### Deterministic assignment, end to end" step 2
+precisely: "For managed runs, `RunCoordinator` computes the assignment
+once ... when `ci.shard`'s `step.do("split:" + id)` runs, and stores it as
+`shard_plan` rows before dispatching any shard container" — a real
+`ShardPlanner` reaching `cloud-ci-worker`'s `ResolveShardPlan` RPC
+(`packages/cloud-ci-worker/src/shard_plan.rs`, see that module's docs for
+its own reuse of `cloud_ci_core::split`) is exactly the RPC step this
+`step.do` wraps. Once the plan resolves, `ci.shard` dispatches one real
+`ci.container` call per shard — `runShard` imports and calls
+`runContainer` directly (`src/container.ts`'s already-proven function, not
+a second, duplicated step-durability mechanism), id ``
+`${id}#${shardIndex}` `` (1-based), each with `opts.run({ shard, shards,
+files })`'s returned command string. Every per-shard container id lives in
+the same `seenIds` set a script's own `ci.container` calls use, so a shard
+id and a plain container id can never collide.
+
+This round does NOT build the real network call to `ResolveShardPlan` —
+same posture as `ContainerExecutor` (see above): `ci.shard`'s dispatch
+contract is proven against the `ShardPlanner` interface and a fake,
+in-memory implementation (`test/shard.test.ts`'s `FakeShardPlanner`), not
+the real RPC. Calling `ci.shard` with no planner configured throws
+`ShardPlannerNotConfiguredError` rather than silently succeeding or
+no-opping — same "fail loudly, not silently" rule
+`ContainerExecutorNotConfiguredError` already follows.
+
+**Scope lines this round draws, precisely:**
+
+- **`sidecars`** — `ShardOptions` has no `sidecars` field, matching
+  `ContainerOptions`'s own "Sidecars" scope boundary below. The worked
+  example in dynamic-pipelines.md's "### Splitting tests across shards"
+  (a per-shard `postgres` sidecar restored from a migration snapshot) is
+  not implemented.
+- **`reports`/merge barrier** — `ShardOptions` has no `reports` field.
+  dynamic-pipelines.md describes `ci.shard` as also running "the generated
+  merge step once every shard reaches a terminal state"; `ShardResult`
+  only returns the resolved shard count and each shard's raw
+  `ContainerResult`, no merged-report id. The server-side merge logic this
+  would eventually trigger already exists
+  (`packages/cloud-ci-worker/src/shard_merge.rs`, from an earlier round) —
+  wiring `ci.shard`'s `reports`/`merge` options to call it is separate,
+  not-yet-scheduled follow-up work, not a missing dependency.
+- **Real `--granularity test` per-test splitting** — `SplitStrategy`'s
+  `"count"` value round-robins at whole-file granularity, identical to
+  `"file"`. `cloud_ci_core::split` (the Rust crate `ResolveShardPlan`
+  reuses) only supports file granularity today — per-test enumeration
+  needs a framework-aware static parser
+  (`packages/cloud-ci-cli/src/split.rs`'s own module docs) that does not
+  exist in this codebase. This package does not promise more than the
+  underlying algorithm actually provides.
+- **`snapshot`** — `ShardOptions` has no `snapshot` field, matching
+  `ci.snapshot`'s own absence from this round (see "Explicitly out of
+  scope this round" below).
 
 ## `workflow()`'s adapter shape, and the host-side load path (confirmed 2026-10-02)
 
@@ -182,9 +271,11 @@ proven).
 
 Each of these is a real, named gap — not a silent omission:
 
-- **`ci.shard`** — deterministic test sharding and the merge barrier
-  (`docs/design/parallelization.md`). Not implemented; no sharding helper
-  exists in this package.
+- **`ci.shard`'s `sidecars`, `reports`/merge barrier, and real `--granularity
+  test` per-test splitting** — `ci.shard` itself IS implemented this round
+  (`split`/`count`/`files`/`run`/`check`); see "`ci.shard`: shard-plan
+  resolution and per-shard dispatch" above for exactly what is and isn't
+  built, including the `ResolveShardPlan` RPC's own scope boundary.
 - **`ci.snapshot`** — layered filesystem snapshots (`toolchain`/`deps`
   layers, sidecar-volume capture). Not implemented; `ContainerOptions` has
   no `snapshot` field.
@@ -208,12 +299,16 @@ Each of these is a real, named gap — not a silent omission:
 - **Real `RunCoordinator`/`cloud-ci-worker` wiring** — `ci.container`
   never reaches the real `ContainerProbe` Durable Object or
   `RunCoordinator`; it calls whatever `ContainerExecutor` is injected (see
-  above). No Rust or `wrangler.toml` changes were made anywhere in this
-  round.
+  above). `ci.shard` likewise never reaches the real `ResolveShardPlan` RPC
+  this round — it calls whatever `ShardPlanner` is injected (see "`ci.shard`"
+  above). The Rust `ResolveShardPlan` RPC and its `cloud-ci-worker` handler
+  DO exist as of this round (`packages/cloud-ci-worker/src/shard_plan.rs`);
+  what doesn't exist yet is the TypeScript-side network call reaching it —
+  no `wrangler.toml` changes were made anywhere in this round.
 - **`ci.limit`, `ci.skip`, `ci.cached`, `ci.turboCache`, `ci.readFile`** —
   none of the design doc's other `ci` surface members exist on `CiContext`
   yet; only `ci.event`, `ci.changedFiles`, `ci.branch`, `ci.labels`,
-  `ci.check`, `ci.container`.
+  `ci.check`, `ci.container`, `ci.shard`.
 
 ## Testing
 
@@ -227,6 +322,15 @@ Each of these is a real, named gap — not a silent omission:
   `WorkflowStepLike` (real `step.do` cache semantics) and a fake
   `ContainerExecutor` (call-count assertion), plus duplicate-id rejection,
   check attachment, and the no-executor-configured error.
+- `test/shard.test.ts` — `ci.shard`'s dispatch logic against a fake
+  `ShardPlanner` and the real `runContainer` dispatched per shard (via a
+  fake `ContainerExecutor`, same convention as `container.test.ts`):
+  shard-plan resolution feeding `run({shard, shards, files})` per shard,
+  request passthrough to the planner, replay reusing the recorded plan
+  without re-dispatching containers, check attachment across every
+  resolved shard, the shared container-id namespace with plain
+  `ci.container` calls, duplicate shard-id rejection, and the
+  no-planner-configured error.
 - `test/workflow.test.ts` — `workflow()`'s adapter shape: `on` passthrough,
   `fetch()`'s `env.WORKFLOWS.create()` call and id response, `run()`
   building a `CiContext` and auto-sealing checks, and an end-to-end replay

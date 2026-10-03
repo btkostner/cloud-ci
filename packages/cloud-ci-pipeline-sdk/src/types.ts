@@ -153,3 +153,120 @@ export interface ContainerStartRequest {
 export interface ContainerExecutor {
   start(request: ContainerStartRequest): Promise<ContainerResult>;
 }
+
+/** `ci.shard`'s split strategy, per `docs/design/parallelization.md`'s
+ * "### Split strategies" table: `"timing"` (LPT bin-packing against
+ * `test_stats` history, median-fallback-imputed for unmeasured items,
+ * degrading all the way to `"file"` if no item in the matched set has any
+ * history), `"file"` (round-robin by path, whole-file granularity), or
+ * `"count"` (round-robin, same as `"file"` — this round's underlying
+ * `cloud_ci_core::split` crate only supports file granularity, so
+ * `"count"`'s documented "whole test, if discoverable" distinction from
+ * `"file"` is not implemented; see README's scope boundary list). */
+export type SplitStrategy = "timing" | "file" | "count";
+
+/** `{ min, max, target }` shard-count auto-sizing, matching
+ * parallelization.md's "### Shard count resolution" table's object form
+ * exactly: `shard_count = clamp(ceil(historical_total_duration / target),
+ * min, max)`. `target` is a plain duration string (`"5m"`, `"30s"`,
+ * `"1h"`) — this SDK never computes the clamp itself; it is forwarded
+ * as-is to the injected `ShardPlanner`, which resolves it against real
+ * `cloud_ci_core::split` logic (see `ShardPlanner`'s doc comment). */
+export interface ShardCountRange {
+  readonly min: number;
+  readonly max: number;
+  readonly target: string;
+}
+
+/** `ci.shard`'s `count` option: a fixed integer shard count, or a
+ * `{ min, max, target }` auto-sizing spec (only meaningful with
+ * `split: "timing"` — the injected `ShardPlanner`'s real resolver rejects
+ * the combination of an auto-sizing spec with `"file"`/`"count"`, per
+ * `cloud_ci_core::split::SplitError::AutoSizingNeedsTiming`). */
+export type ShardCountOption = number | ShardCountRange;
+
+/** Arguments `ci.shard`'s `run` function receives for one resolved shard —
+ * dynamic-pipelines.md's "### Splitting tests across shards": "calls the
+ * `run` function once per shard with `{ shard, shards, files }` — no shell
+ * glue and no template syntax in `run`, just a TypeScript function that
+ * returns the command." `shard` is 1-based (shard 1 of `shards`). */
+export interface ShardRunArgs {
+  readonly shard: number;
+  readonly shards: number;
+  readonly files: readonly string[];
+}
+
+/** Options accepted by `ci.shard(id, opts)`. This round implements
+ * `split`/`count`/`files`/`run`/`check` — the design doc's full shape also
+ * documents `snapshot`, `sidecars`, and `reports`/merge-barrier options
+ * (dynamic-pipelines.md's "### Splitting tests across shards" worked
+ * example), none of which this round implements; see README's scope
+ * boundary list for why. */
+export interface ShardOptions {
+  readonly split: SplitStrategy;
+  readonly count: ShardCountOption;
+  /** The shard's already-expanded, already-sorted file list —
+   * parallelization.md's "### Deterministic assignment, end to end" step
+   * 1: "The shard's `files` glob is expanded against the checked-out
+   * worktree at dispatch time, sorted by path, and hashed into a run
+   * manifest." Glob expansion itself is the caller's job (or a future
+   * round's), not this SDK's — `ci.shard` takes the already-resolved list. */
+  readonly files: readonly string[];
+  readonly run: (args: ShardRunArgs) => string;
+  /** Check to attach every resolved shard to, or `null`/omitted to report
+   * no check run — same `ContainerOptions.check` convention `ci.container`
+   * already uses, since each shard is dispatched as one `ci.container`
+   * call under the hood. */
+  readonly check?: Check | null;
+}
+
+/** Result of one finished `ci.shard` call: the resolved shard count and
+ * each shard's `ci.container` result, in shard-index order (index 0 =
+ * shard 1). No merged-report id — merging per-shard reports
+ * (`cloud-ci-worker/src/shard_merge.rs`) is not wired to `ci.shard` this
+ * round; see README's scope boundary list. */
+export interface ShardResult {
+  readonly shardCount: number;
+  readonly results: readonly ContainerResult[];
+}
+
+/** Request `ci.shard` hands to the injected `ShardPlanner` to resolve a
+ * shard count and per-shard file assignment. */
+export interface ShardPlanRequest {
+  readonly filePaths: readonly string[];
+  readonly strategy: SplitStrategy;
+  readonly count: ShardCountOption;
+}
+
+/** A resolved shard plan: the final shard count and each shard's assigned
+ * file list, in shard-index order (index 0 = shard 1) — matching
+ * `cloud_ci_core::split::assign`'s own "index 0 = shard 1" convention and
+ * the `ResolveShardPlanResponse` proto message's `shards` field. */
+export interface ShardPlan {
+  readonly shardCount: number;
+  readonly files: readonly (readonly string[])[];
+}
+
+/**
+ * Injectable boundary to the real shard-plan resolution mechanism — the
+ * Rust `ResolveShardPlan` RPC `cloud-ci-worker` exposes
+ * (`packages/cloud-ci-worker/src/shard_plan.rs`), which calls
+ * `cloud_ci_core::split`'s real LPT-bin-packing/round-robin/median-
+ * imputation functions directly, the same ones `cloud-ci-cli`'s `cloud-ci
+ * split` (BYO CI) calls. This SDK does NOT reimplement that algorithm in
+ * TypeScript — doing so would risk silently drifting from the Rust
+ * original, which directly violates parallelization.md's "###
+ * Deterministic assignment, end to end" goal: "the same binary and the
+ * same split algorithm ... used in both places, so a BYO CI matrix and a
+ * cloud-ci-managed shard group produce byte-identical assignments for the
+ * same inputs." This round does NOT build the real network call to that
+ * RPC (see README's scope boundary list, same posture as
+ * `ContainerExecutor`): `ci.shard`'s plan-resolution contract is proven
+ * against this interface and a fake in-memory implementation instead. A
+ * future round supplies a real `ShardPlanner` that reaches
+ * `ResolveShardPlan` over the same `CONTAINER_WORKER`-style service
+ * binding `ContainerExecutor`'s own doc comment describes.
+ */
+export interface ShardPlanner {
+  resolve(request: ShardPlanRequest): Promise<ShardPlan>;
+}

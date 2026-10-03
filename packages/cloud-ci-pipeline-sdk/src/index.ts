@@ -2,10 +2,10 @@
  * `@cloud-ci/pipeline-sdk` — public entry point.
  *
  * Implements the subset of `docs/design/dynamic-pipelines.md`'s `ci` API
- * this round builds: `workflow()`, `ci.check`, `ci.container`. See this
- * package's README for the full, explicit scope boundary (what is and is
- * not implemented this round) before relying on anything not re-exported
- * here.
+ * this round builds: `workflow()`, `ci.check`, `ci.container`, `ci.shard`.
+ * See this package's README for the full, explicit scope boundary (what is
+ * and is not implemented this round) before relying on anything not
+ * re-exported here.
  */
 export { CheckRegistry } from "./check.js";
 export { CiContext } from "./context.js";
@@ -15,6 +15,8 @@ export {
   ContainerExecutorNotConfiguredError,
   DuplicateCheckNameError,
   DuplicateContainerIdError,
+  DuplicateShardIdError,
+  ShardPlannerNotConfiguredError,
 } from "./errors.js";
 export type {
   Check,
@@ -28,6 +30,15 @@ export type {
   ContainerStartRequest,
   OnTrigger,
   PipelineContext,
+  ShardCountOption,
+  ShardCountRange,
+  ShardOptions,
+  ShardPlan,
+  ShardPlanner,
+  ShardPlanRequest,
+  ShardResult,
+  ShardRunArgs,
+  SplitStrategy,
   WorkflowStepLike,
 } from "./types.js";
 export type {
