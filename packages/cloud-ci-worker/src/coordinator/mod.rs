@@ -133,12 +133,16 @@
 //! docs/design/parallelization.md's "### Merge barrier (RunCoordinator)"
 //! and "### Failed-shard retry semantics" describe `job_group`/
 //! `shard_state` and the barrier a shard group's terminal shard-ingest
-//! calls evaluate. This round builds the **state machine only** —
+//! calls evaluate. An earlier round built the **state machine only** —
 //! [`RunCoordinator::handle_register_shard_group`] and
 //! [`RunCoordinator::handle_shard_terminal`] (pure decisions in
-//! [`logic`]'s "Shard groups / merge barrier" section) plus, this round,
-//! real dispatch of the `Satisfied` merge decision for the two natively
-//! mergeable report kinds — still never real container cancellation:
+//! [`logic`]'s "Shard groups / merge barrier" section), plus real
+//! dispatch of the `Satisfied` merge decision for the two natively
+//! mergeable report kinds. This round closes the one gap that earlier
+//! round's own doc comment flagged — `fail_fast`'s
+//! [`ShardBarrierDecision::FailFastTriggered`] now actually stops a
+//! real container for each cancelled shard, not just computing the
+//! *set* of indices:
 //!
 //! - **Merge execution is real for `junit`/`lcov`, nothing else.**
 //!   [`ShardBarrierDecision::Satisfied`] with `merge: true`:
@@ -156,16 +160,33 @@
 //!   `playwright-blob`/`vitest-blob` generated `<id>/merge` container-node
 //!   path is still **not** built (it depends on `cloud-ci-pipeline-sdk`'s
 //!   `ci.shard`, which does not exist yet).
-//! - **No real cancellation wiring.** `fail_fast`'s
-//!   [`ShardBarrierDecision::FailFastTriggered`] only returns the *set*
-//!   of shard indices that should be cancelled
-//!   ([`logic::evaluate_barrier`]'s doc comment explains why: shards are
-//!   not yet modeled as `node` rows this round — there is no RPC to
-//!   register "shard N started running" — so there is no real container
-//!   handle for `handle_shard_terminal` to hand to
-//!   [`RunCoordinator::stop_node_container`]/[`RunCoordinator::handle_cancel_run`]
-//!   yet). A future round that dispatches shards as real nodes can wire
-//!   this decision straight into that existing cancellation path.
+//! - **Fail-fast cancellation is real, via the existing node machinery,
+//!   not a new one.** A shard is still not a first-class concept of its
+//!   own in storage — there is deliberately no new `shard_node`
+//!   table/RPC. Instead a running shard is registered as a `node` row by
+//!   calling the already-existing `startNode` RPC with a deterministic
+//!   id, [`logic::shard_node_id`]`(job_name, idx, attempt)` — reusing
+//!   `node`/`NodeRow`'s existing spec-hash idempotency and, critically,
+//!   the real container `node_container.rs`'s `start_container`/
+//!   `stop_container` already know how to start/stop given just that
+//!   id. [`RunCoordinator::handle_shard_terminal`]'s
+//!   `FailFastTriggered { cancel_idxs }` branch resolves each cancelled
+//!   index back to its node id(s) via
+//!   [`logic::shard_nodes_to_cancel`], then stops each one for real via
+//!   [`RunCoordinator::cancel_shards`] — the exact same
+//!   `stop_node_container`/`mark_node_cancelled` pair
+//!   [`RunCoordinator::handle_cancel_run`] already uses for whole-run
+//!   cancellation, just scoped to one shard group's cancelled indices.
+//!   A cancelled index that was never dispatched as a real node (or
+//!   already finished on its own) matches no node and is silently
+//!   skipped — see [`logic::shard_nodes_to_cancel`]'s own doc comment.
+//!   **Still not built:** any real caller that dispatches ordinary
+//!   (non-fail-fast) shards as containers in the first place — this
+//!   round only proves the DO-side mechanism (register a shard as a
+//!   node, stop it on fail-fast); wiring a production shard dispatcher
+//!   through this `startNode` call remains the larger
+//!   Dynamic-Pipelines-integration gap noted elsewhere in this file's
+//!   Nodes section.
 //! - **Idempotency** matches [`logic::resolve_complete_node`]'s exact
 //!   discipline, applied to shards: [`logic::resolve_shard_terminal`]
 //!   treats a redelivered call with the same terminal status as a no-op
@@ -417,10 +438,13 @@ pub struct ShardTerminalRequest {
 /// The barrier decision produced by a `shardTerminal` call, per
 /// [`logic::BarrierOutcome`] plus the duplicate-redelivery and
 /// already-terminal-group cases that never reach `evaluate_barrier` at
-/// all. **Decision only** — see `coordinator` module docs' "Shard groups
-/// / merge barrier" section for exactly what is and is not wired from
-/// here: `FailFastTriggered.cancel_idxs` is not stopped as a real
-/// container, and `Satisfied` does not dispatch any real merge.
+/// all. See `coordinator` module docs' "Shard groups / merge barrier"
+/// section for exactly what each variant triggers for real:
+/// `FailFastTriggered.cancel_idxs` is stopped as a real container for
+/// every cancelled index that was ever registered as a running node
+/// ([`RunCoordinator::handle_shard_terminal`]'s own doc comment), and
+/// `Satisfied { merge: true, .. }` dispatches a real merge for
+/// `junit`/`lcov` (nothing else yet).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ShardBarrierDecision {
@@ -2296,8 +2320,9 @@ impl RunCoordinator {
             .await
     }
 
-    /// Delegates to [`crate::node_container::stop_container`] — [`Self::handle_cancel_run`]'s
-    /// only caller. Best-effort, degrade-and-log on any failure (unreachable DO, container
+    /// Delegates to [`crate::node_container::stop_container`] —
+    /// [`Self::handle_cancel_run`]'s and [`Self::cancel_shards`]'s shared
+    /// call. Best-effort, degrade-and-log on any failure (unreachable DO, container
     /// already gone): blocking the whole run's cancellation on one node's container failing to
     /// stop would leave the run stuck cancelling forever, the same degrade-and-log posture
     /// `check_run_auth`'s callers already use for GitHub API failures.
@@ -2305,6 +2330,42 @@ impl RunCoordinator {
         if let Err(e) = crate::node_container::stop_container(&self.env, node_id).await {
             worker::console_log!("cancel_run: stop container for node {node_id} failed: {e}");
         }
+    }
+
+    /// Stops the real container for every still-running node that
+    /// shard group `job_name`'s fail-fast decision cancelled —
+    /// [`Self::handle_shard_terminal`]'s `FailFastTriggered { cancel_idxs
+    /// }` branch's real cancellation half (module docs' "Shard groups /
+    /// merge barrier" section). Mirrors [`Self::handle_cancel_run`]'s
+    /// own per-node loop exactly (`stop_node_container` then
+    /// `mark_node_cancelled` then re-project to D1), scoped down to just
+    /// the node(s) [`logic::shard_nodes_to_cancel`] resolves for each
+    /// cancelled index via [`logic::shard_node_id`]'s id scheme. A
+    /// cancelled index with no matching non-terminal node (never
+    /// dispatched as a real node, or it already finished on its own) is
+    /// a documented no-op for that index — see
+    /// [`logic::shard_nodes_to_cancel`]'s own doc comment.
+    async fn cancel_shards(
+        &self,
+        sql: &SqlStorage,
+        run_row: &RunRow,
+        job_name: &str,
+        cancel_idxs: &[u32],
+    ) -> worker::Result<()> {
+        let nodes: Vec<(String, logic::NodeState)> = read_all_nodes(sql)?
+            .iter()
+            .map(|row| Ok((row.node_id.clone(), node_state_of(row)?)))
+            .collect::<worker::Result<Vec<_>>>()?;
+        let now_ms = worker::Date::now().as_millis() as i64;
+        for &idx in cancel_idxs {
+            for node_id in logic::shard_nodes_to_cancel(job_name, idx, &nodes) {
+                self.stop_node_container(&node_id).await;
+                mark_node_cancelled(sql, &node_id, now_ms)?;
+                let row = require_node(sql, &node_id)?;
+                self.project_node_to_d1(&run_row.id, &row).await?;
+            }
+        }
+        Ok(())
     }
 
     async fn project_run_to_d1(&self, row: &RunRow) -> worker::Result<()> {
@@ -2631,15 +2692,16 @@ impl RunCoordinator {
 
     /// One shard's terminal ingest call — module docs' "Shard groups /
     /// merge barrier" section, parallelization.md bullets 2-4. Produces
-    /// [`ShardBarrierDecision`], and — on `Satisfied { merge: true, .. }`
-    /// only — dispatches it for real via
+    /// [`ShardBarrierDecision`], and dispatches two of its variants for
+    /// real: `Satisfied { merge: true, .. }` via
     /// [`RunCoordinator::enqueue_shard_merge`] (see this module's doc
     /// comment's "Merge execution is real for `junit`/`lcov`, nothing
-    /// else" bullet). `FailFastTriggered`'s cancellation half is still
-    /// decision-only this round: see [`logic::evaluate_barrier`]'s doc
-    /// comment for why there is no real `stop_node_container`/
-    /// `handle_cancel_run` call yet (shards are not modeled as `node`
-    /// rows this round).
+    /// else" bullet), and `FailFastTriggered { cancel_idxs }` via
+    /// [`Self::cancel_shards`], which stops the real container for each
+    /// cancelled index that was ever registered as a running node
+    /// (caller registers one by calling the existing `startNode` RPC
+    /// with [`logic::shard_node_id`]'s id — see that function's doc
+    /// comment for why there is no separate "register a shard" RPC).
     async fn handle_shard_terminal(
         &self,
         sql: &SqlStorage,
@@ -2724,6 +2786,8 @@ impl RunCoordinator {
                         logic::BarrierOutcome::Waiting => ShardBarrierDecision::Waiting,
                         logic::BarrierOutcome::FailFastTriggered { cancel_idxs } => {
                             update_job_group_status(sql, &req.job_name, "failed")?;
+                            self.cancel_shards(sql, &run_row, &req.job_name, &cancel_idxs)
+                                .await?;
                             ShardBarrierDecision::FailFastTriggered { cancel_idxs }
                         }
                         logic::BarrierOutcome::Satisfied {

@@ -1090,15 +1090,17 @@ pub fn dedupe_test_outcomes(rows: Vec<TestOutcomeRow>) -> Vec<TestOutcomeRow> {
 // merge and which shards' reports to include. It does **not** build real
 // merge execution (no JUnit/coverage parsing, no generated `<id>/merge`
 // node, no Queue consumer — docs/design/parallelization.md's "Merge
-// strategies per report type" table is entirely out of scope here) and it
-// does **not** itself stop any container: [`evaluate_barrier`]'s
-// `FailFastTriggered` arm only returns the *set* of shard indices a caller
-// should cancel. `coordinator::mod`'s `handle_shard_terminal` (this
-// round's only caller) records that decision but does not wire it to
-// `stop_node_container`/`handle_cancel_run` — shards are not yet modeled
-// as `node` rows this round (no RPC registers "shard N started running"),
-// so there is no real container handle to stop yet; that wiring is a
-// separate, later round once shards are dispatched as real nodes.
+// strategies per report type" table is entirely out of scope here).
+// [`evaluate_barrier`]'s `FailFastTriggered` arm itself still only
+// returns the *set* of shard indices a caller should cancel — it has no
+// `node` table dependency, same as every other function in this file —
+// but [`shard_node_id`]/[`shard_nodes_to_cancel`] (below) now give
+// `coordinator::mod`'s `handle_shard_terminal` a real id to look each
+// cancelled index up by and stop, via the same `stop_node_container`/
+// `mark_node_cancelled` calls `handle_cancel_run` already uses. See
+// those two functions' own doc comments for the id scheme and the
+// "register a shard" story (reusing the existing `startNode` RPC, not a
+// new parallel one).
 // ---------------------------------------------------------------------------
 
 /// `job_group.merge_on_failure`'s three documented values exactly
@@ -1328,6 +1330,62 @@ pub fn evaluate_barrier(
         merge,
         included_idxs,
     }
+}
+
+/// Deterministic `node` row id for one shard's running attempt —
+/// `(job_name, idx, attempt)`'s "node identity" for the real-container
+/// cancellation gap this round closes (see this section's module doc
+/// comment). A shard is registered as a running node by calling the
+/// *existing* `startNode` RPC with this id as `node_id`, rather than
+/// through a new, parallel "register a shard" RPC: the `node`/`NodeRow`
+/// table already has everything a running shard needs — spec-hash
+/// idempotency, a `status` a cancellation can flip, and (the whole
+/// reason this function exists) a real container
+/// `node_container.rs`'s `start_container`/`stop_container` already
+/// know how to start/stop given just this id.
+///
+/// Plain colon-joining `job_name`/`idx`/`attempt` — not `do_name`'s
+/// length-prefixed hashing — is safe here: unlike `do_name`, whose
+/// hashed tuple must stay injective across every repo/sha/run_key/attempt
+/// combination in a single, Worker-wide Durable Object namespace, this
+/// id only needs to be unique among *this one DO instance's* own `node`
+/// rows (one `RunCoordinator` instance is one run). `job_group` already
+/// uses `job_name` itself, unhashed, as a SQL primary key elsewhere in
+/// this same DO's storage, so reusing it raw inside a `node_id` is no
+/// weaker a guarantee than that existing key already relies on.
+pub fn shard_node_id(job_name: &str, idx: u32, attempt: u32) -> String {
+    format!("shard:{job_name}:{idx}:{attempt}")
+}
+
+fn shard_node_prefix(job_name: &str, idx: u32) -> String {
+    format!("shard:{job_name}:{idx}:")
+}
+
+/// Which of `nodes`' ids are shard `idx` of `job_name`'s own running
+/// node(s) — [`evaluate_barrier`]'s `FailFastTriggered { cancel_idxs }`
+/// decision names only shard *indices*, never node ids or attempts (it
+/// has no `node` table dependency at all, by design — see this
+/// section's module doc comment), so `handle_shard_terminal`'s real
+/// cancellation wiring maps each cancelled index back to a node id via
+/// [`shard_node_id`]'s own id scheme. Only non-terminal nodes are
+/// returned — the same "already concluded, never relabel" skip
+/// [`nodes_to_cancel`] applies to whole-run cancellation — so a shard
+/// that already finished (successfully or not) on its own before the
+/// fail-fast decision landed is never touched, and a `cancel_idxs` entry
+/// for a shard that was never dispatched as a real node at all simply
+/// matches nothing and is silently skipped. Order-preserving over
+/// `nodes`.
+pub fn shard_nodes_to_cancel(
+    job_name: &str,
+    idx: u32,
+    nodes: &[(String, NodeState)],
+) -> Vec<String> {
+    let prefix = shard_node_prefix(job_name, idx);
+    nodes
+        .iter()
+        .filter(|(id, status)| id.starts_with(&prefix) && !status.is_terminal())
+        .map(|(id, _)| id.clone())
+        .collect()
 }
 
 #[cfg(test)]
@@ -2507,6 +2565,58 @@ mod tests {
                 merge: true,
                 included_idxs: vec![0, 1],
             }
+        );
+    }
+
+    #[test]
+    fn shard_node_id_is_deterministic_and_distinct_per_attempt() {
+        assert_eq!(shard_node_id("e2e", 2, 1), "shard:e2e:2:1");
+        // A retried shard (OOM retry to attempt 2) gets a *different* id
+        // than its first attempt — the two are different real containers.
+        assert_ne!(shard_node_id("e2e", 2, 1), shard_node_id("e2e", 2, 2));
+        // Deterministic: the same inputs always produce the same id, so a
+        // redelivered `startNode` for the same shard attempt lands on the
+        // same `node_id` (and thus `startNode`'s own idempotency guard).
+        assert_eq!(shard_node_id("e2e", 2, 1), shard_node_id("e2e", 2, 1));
+    }
+
+    #[test]
+    fn shard_nodes_to_cancel_matches_only_the_named_indexes_running_node() {
+        let nodes = vec![
+            (shard_node_id("e2e", 0, 1), NodeState::Running),
+            (shard_node_id("e2e", 1, 1), NodeState::Running),
+            // A different job's shard 0 must never match "e2e"'s shard 0.
+            (shard_node_id("other-job", 0, 1), NodeState::Running),
+        ];
+        assert_eq!(
+            shard_nodes_to_cancel("e2e", 0, &nodes),
+            vec![shard_node_id("e2e", 0, 1)]
+        );
+        assert_eq!(
+            shard_nodes_to_cancel("e2e", 1, &nodes),
+            vec![shard_node_id("e2e", 1, 1)]
+        );
+    }
+
+    #[test]
+    fn shard_nodes_to_cancel_skips_already_terminal_nodes() {
+        // The shard finished (successfully) on its own before the
+        // fail-fast decision landed — never relabel it cancelled.
+        let nodes = vec![(shard_node_id("e2e", 0, 1), NodeState::Succeeded)];
+        assert_eq!(
+            shard_nodes_to_cancel("e2e", 0, &nodes),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn shard_nodes_to_cancel_is_empty_when_the_shard_was_never_dispatched_as_a_node() {
+        // No node was ever registered for this index — a documented
+        // no-op for that index, not a panic or an error.
+        let nodes = vec![(shard_node_id("e2e", 1, 1), NodeState::Running)];
+        assert_eq!(
+            shard_nodes_to_cancel("e2e", 0, &nodes),
+            Vec::<String>::new()
         );
     }
 }
