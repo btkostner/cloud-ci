@@ -908,6 +908,59 @@ pub struct TestOutcomeRow {
     pub outcome: TestOutcomeKind,
 }
 
+/// One `test`-kind Analytics Engine data point, in
+/// docs/design/analytics.md's "Analytics Engine schema" table's exact
+/// column order for that row kind: `blob1="test"`, `blob2=run_id`,
+/// `blob3=job_id`, `blob4=test_id`, `double1=duration_ms`,
+/// `double2=pass(1)/fail(0)/skip(-1)`, `double3` unused (the table's `—`
+/// cell), `index1=repo_id`. Pure data, no `worker`-crate dependency — the
+/// thin `write_test_events` caller in `coordinator::mod` turns this into
+/// the actual `AnalyticsEngineDataPointBuilder` calls.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TestEventPoint {
+    pub run_id: String,
+    pub job_id: String,
+    pub test_id: String,
+    pub duration_ms: i64,
+    pub outcome: TestOutcomeKind,
+    pub repo_id: i64,
+}
+
+impl TestOutcomeKind {
+    /// analytics.md's `test` row `double2`: `pass(1)/fail(0)/skip(-1)`.
+    pub fn as_test_double(self) -> f64 {
+        match self {
+            TestOutcomeKind::Passed => 1.0,
+            TestOutcomeKind::Failed => 0.0,
+            TestOutcomeKind::Skipped => -1.0,
+        }
+    }
+}
+
+/// Builds one `test` Analytics Engine data point per parsed test-case
+/// outcome ([`TestOutcomeRow`], from `coordinator::mod`'s
+/// `parse_test_outcomes` — the same per-test data `handle_submit_report`
+/// already produces while parsing an uploaded report). `run_id`/`job_id`/
+/// `repo_id` are shared across every row in one report; `rows` is
+/// whatever `parse_test_outcomes` returned for that report's bytes.
+pub fn build_test_events(
+    run_id: &str,
+    job_id: &str,
+    repo_id: i64,
+    rows: &[TestOutcomeRow],
+) -> Vec<TestEventPoint> {
+    rows.iter()
+        .map(|row| TestEventPoint {
+            run_id: run_id.to_string(),
+            job_id: job_id.to_string(),
+            test_id: row.test_id.clone(),
+            duration_ms: row.duration_ms,
+            outcome: row.outcome,
+            repo_id,
+        })
+        .collect()
+}
+
 /// `duration_ewma_ms = alpha * new + (1 - alpha) * old` (analytics.md).
 /// `existing` is `None` for a test's first-ever occurrence for a
 /// `(repo_id, test_id)` — analytics.md's upsert pattern's `INSERT` branch
@@ -1240,6 +1293,62 @@ mod tests {
             assert_eq!(RunState::from_db_str(state.as_db_str()), Some(state));
         }
         assert_eq!(RunState::from_db_str("bogus"), None);
+    }
+
+    #[test]
+    fn test_outcome_kind_maps_to_analytics_engine_double2() {
+        assert_eq!(TestOutcomeKind::Passed.as_test_double(), 1.0);
+        assert_eq!(TestOutcomeKind::Failed.as_test_double(), 0.0);
+        assert_eq!(TestOutcomeKind::Skipped.as_test_double(), -1.0);
+    }
+
+    #[test]
+    fn build_test_events_maps_every_row_in_order_with_shared_ids() {
+        let rows = vec![
+            TestOutcomeRow {
+                test_id: "abc123".to_string(),
+                file_path: "src/foo.rs".to_string(),
+                test_name: "it_works".to_string(),
+                duration_ms: 42,
+                outcome: TestOutcomeKind::Passed,
+            },
+            TestOutcomeRow {
+                test_id: "def456".to_string(),
+                file_path: "src/bar.rs".to_string(),
+                test_name: "it_fails".to_string(),
+                duration_ms: 17,
+                outcome: TestOutcomeKind::Failed,
+            },
+        ];
+
+        let events = build_test_events("run-1", "job-1", 99, &rows);
+
+        assert_eq!(
+            events,
+            vec![
+                TestEventPoint {
+                    run_id: "run-1".to_string(),
+                    job_id: "job-1".to_string(),
+                    test_id: "abc123".to_string(),
+                    duration_ms: 42,
+                    outcome: TestOutcomeKind::Passed,
+                    repo_id: 99,
+                },
+                TestEventPoint {
+                    run_id: "run-1".to_string(),
+                    job_id: "job-1".to_string(),
+                    test_id: "def456".to_string(),
+                    duration_ms: 17,
+                    outcome: TestOutcomeKind::Failed,
+                    repo_id: 99,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn build_test_events_on_empty_rows_is_empty() {
+        assert!(build_test_events("run-1", "job-1", 99, &[]).is_empty());
     }
 
     #[test]

@@ -189,8 +189,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use worker::wasm_bindgen::JsValue;
 use worker::{
-    DurableObject, Env, Method, Request, RequestInit, Response, SqlStorage, SqlStorageValue, State,
-    Stub, durable_object,
+    AnalyticsEngineDataPointBuilder, DurableObject, Env, Method, Request, RequestInit, Response,
+    SqlStorage, SqlStorageValue, State, Stub, durable_object,
 };
 
 /// Durable Object binding name; must match `durable_objects.bindings[].name`
@@ -1058,6 +1058,61 @@ impl RunCoordinator {
         Response::from_json(&CompleteUploadOutcome {})
     }
 
+    /// Thin Workers-runtime caller: turns [`logic::TestEventPoint`]s into
+    /// real `write_data_point` calls against the `METRICS` Analytics
+    /// Engine binding (`wrangler.toml`'s `[[analytics_engine_datasets]]`).
+    /// Row-building is pure and unit-tested in [`logic::build_test_events`]
+    /// — this method only does the Workers-runtime-dependent part, so it
+    /// is exercised by the live smoke test, same layering as every other
+    /// D1/R2 writer in this module (module docs' "thin, storage-wired
+    /// shell" paragraph).
+    ///
+    /// The real Workers Analytics Engine binding only exposes a
+    /// single-point `write_data_point` — there is no platform batch call —
+    /// so analytics.md's 250-`writeDataPoint`-calls-per-Worker-invocation
+    /// limit is enforced here as a hard cap on this loop, not as a single
+    /// batched wire call. Best-effort: a missing binding or an individual
+    /// write failure is logged and otherwise ignored — `SubmitReport`'s
+    /// own success must never depend on analytics telemetry succeeding.
+    fn write_test_events(&self, events: &[logic::TestEventPoint]) {
+        const MAX_DATA_POINTS_PER_INVOCATION: usize = 250;
+        let dataset = match self.env.analytics_engine("METRICS") {
+            Ok(dataset) => dataset,
+            Err(e) => {
+                worker::console_log!("analytics: METRICS binding unavailable: {e}");
+                return;
+            }
+        };
+        if events.len() > MAX_DATA_POINTS_PER_INVOCATION {
+            worker::console_log!(
+                "analytics: report has {} test outcomes, truncating to the {} \
+                 per-Worker-invocation writeDataPoint limit (analytics.md's \
+                 \"Analytics Engine schema\" section)",
+                events.len(),
+                MAX_DATA_POINTS_PER_INVOCATION
+            );
+        }
+        for event in events.iter().take(MAX_DATA_POINTS_PER_INVOCATION) {
+            let repo_id_str = event.repo_id.to_string();
+            let result = AnalyticsEngineDataPointBuilder::new()
+                .indexes([repo_id_str.as_str()])
+                .blobs([
+                    "test",
+                    event.run_id.as_str(),
+                    event.job_id.as_str(),
+                    event.test_id.as_str(),
+                ])
+                .doubles([event.duration_ms as f64, event.outcome.as_test_double()])
+                .write_to(&dataset);
+            if let Err(e) = result {
+                worker::console_log!(
+                    "analytics: write_data_point failed for test {}: {e}",
+                    event.test_id
+                );
+            }
+        }
+    }
+
     async fn handle_submit_report(
         &self,
         sql: &SqlStorage,
@@ -1175,6 +1230,20 @@ impl RunCoordinator {
             &req.name,
             &id,
         )?;
+
+        // Analytics Engine: one `test` data point per parsed test-case
+        // outcome (docs/design/analytics.md's "Analytics Engine schema"
+        // table), reusing `parse_test_outcomes`' richer per-test-case
+        // parse of the exact same `bytes` `parse_report` above already
+        // summarized — the per-test (run_id, job_id, test_id, duration_ms,
+        // pass/fail/skip, repo_id) data this report already carries.
+        // `lcov`/unrecognized kinds return `None` (no test-case concept),
+        // matching `parse_test_outcomes`'s own doc comment.
+        if let Some(outcomes) = parse_test_outcomes(&req.report_kind, &bytes) {
+            let events =
+                logic::build_test_events(&run_row.id, &req.job_id, run_row.repo_id, &outcomes);
+            self.write_test_events(&events);
+        }
 
         self.project_report_to_d1(&require_report(sql, &id)?)
             .await?;
