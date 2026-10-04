@@ -2,12 +2,21 @@
 
 **Status: DRAFT - not approved for implementation; blocked on decisions H1, H3, Q1, Q9, Q10.**
 
-Revision 2, 2026-10-03, after an independent review of revision 1 (34ef8c6). Revision 1 was
-found not ready to drive code. This revision fixes the factual errors (C1-C4), folds in the
-medium findings (M1-M6) as stated rules or open questions, and turns the three design holes
-(H1-H3) into explicit "Decision required" blocks. Where a hole is a design gap and not a policy
-choice (H2) it is specified concretely here; where it is a policy choice (H1, H3) no answer is
-invented, only options, trade-offs and a recommendation.
+Revision 3, 2026-10-03, after a second independent review of revision 2 (e4364ac). Revision 2
+was judged acceptable as a DRAFT but not ready to drive code: one defect in the second-decision
+persistence model (D1, plus D2) and two places where the H1/H3 "Decision required" blocks still
+leaked an assumed answer into their own supporting rules (L1-L3), plus five gaps (G1-G6) the
+first revision never addressed. This revision fixes D1/D2, rewrites every leaking rule so it is
+stated per H1/H3 option rather than assuming one (L1-L3), adds the missing OOM/NOT-OOM/UNKNOWN
+trigger classification with its exact evidence sourcing (G1), adds the release rule for a
+withheld shard failure (G2), bounds the "close cannot be starved" claim and closes its deadline
+gap (G3), gives Stage 0 a rollout gate and rollback (G4), notes `max_instances` is unsupported
+(G5), adds the missing test scenarios (G6), adds Q7's downside and Q9-Q16, dates two previously
+undated tooling facts, and records when each stale doc claim in §10 is corrected - one of them,
+`dynamic-pipelines.md`'s already-wrong per-call-sizing claim, is fixed now, in a separate small
+commit on this branch (`f9fa884`), independent of any pending decision here. **No owner
+decision (H1, H3, Q1, or any other) is made in this revision**: every fix states the rule
+correctly under each option, or marks the point as still open.
 
 It replaces the "remaining prerequisites" prose in
 [parallelization.md](./parallelization.md#runner-auto-oom-recovery-pure-logic-only-not-wired-2026-10-03)
@@ -559,10 +568,11 @@ terminal as `succeeded`/`cancelled`/`timed_out` is abandoned under option A; a n
 plain `failed` with matching OOM evidence is upgraded.
 
 `start()` returns before the container is ready, and later failures need `monitor()`
-(Cloudflare, "Durable Object Container API", `start`: "To catch later errors, including a
-container that fails to start, use `monitor()`"). A retry that fails after `start()` is
-surfaced like any node, through `run_and_report` posting `/complete-node`. A container that
-never starts posts nothing; see the weakened timeout statement in §3.6.
+(Cloudflare, "Durable Object Container API" page, "Last updated Sep 30, 2026", read
+2026-10-03, `start`: "To catch later errors, including a container that fails to start, use
+`monitor()`"). A retry that fails after `start()` is surfaced like any node, through
+`run_and_report` posting `/complete-node`. A container that never starts posts nothing; see
+the weakened timeout statement in §3.6.
 
 ### 3.3 `StartRetry` re-reads live state immediately before starting (M3)
 
@@ -573,8 +583,12 @@ because it is not running), a later drain would still call `start_container` and
 container for a cancelled node. **Rule:** immediately before `start_container`, in the same
 synchronous region as the check (no `await` between), re-read (a) the retry node row: it must
 exist and be non-terminal (`NodeState::Running`, as `insert_node` writes `'running'`); (b) the
-`job_group` row: `status = 'running'`; (c) the run: non-terminal. If any fails, do not start;
-mark the decision `abandoned` and set `retry_started` so the sweep does not loop.
+`job_group` row: `status = 'running'`; (c) the run: non-terminal **and `now < deadline`** (G3 -
+the OOM sweep now runs before the deadline check in `alarm()`, §3.6, so a run whose deadline
+has already passed but which has not yet been closed could otherwise still start a retry
+container moments before `handle_close_run` runs, which never stops it, C1). If any check
+fails, do not start; mark the decision `abandoned` and set `retry_started` so the sweep does
+not loop.
 
 ### 3.4 Retry cap, backoff and the operator-visible failure state
 
@@ -641,14 +655,18 @@ alarm():
           via logic::clamp_retry_delay_to_deadline  (existing)
 ```
 
-*Why the close cannot be starved:* every OOM effect does bounded work per call, errors are
-caught and recorded (`effect_attempts`, `next_attempt_at`) and never propagated with `?` (the
-existing shard-effect drain has the same shape), a decision not yet due (`next_attempt_at > now`)
-is skipped without I/O, at most `OOM_SWEEP_MAX_DECISIONS = 4` decisions are touched per fire,
-and the cap turns every failing decision into `stuck`/`degraded` after about 10 minutes, after
-which it never re-arms the alarm. `has_pending_background_work` (used by
-`release_alarm_if_idle`) gains `oom_decision WHERE state = 'pending'`;
-`stuck`/`degraded`/`abandoned`/`done` rows never hold the alarm slot.
+*Why the close is bounded, not starved outright (G3):* every OOM effect does bounded work per
+call, errors are caught and recorded (`effect_attempts`, `next_attempt_at`) and never
+propagated with `?` (the existing shard-effect drain has the same shape), a decision not yet
+due (`next_attempt_at > now`) is skipped without I/O, at most `OOM_SWEEP_MAX_DECISIONS = 4`
+decisions are touched per fire, and the cap turns every failing decision into
+`stuck`/`degraded` after about 10 minutes, after which it never re-arms the alarm.
+`has_pending_background_work` (used by `release_alarm_if_idle`) gains `oom_decision WHERE
+state = 'pending'`; `stuck`/`degraded`/`abandoned`/`done` rows never hold the alarm slot. This
+is a bound, not a guarantee: a single hung DO-to-DO `await` inside one `StopOld`/`StartRetry`
+call before the deadline check still delays that fire's close by however long the call takes
+to time out, exactly the same exposure the existing `shard_terminal_effect` drain already has
+today - this design does not introduce a new unbounded wait, it inherits the existing one.
 
 **C1 - `handle_close_run` stops no nodes.** Revision 1 claimed `handle_cancel_run` and
 `handle_close_run` "already stop every non-terminal node via `ensure_sibling_cancelled`". That
@@ -931,8 +949,12 @@ unreadable by the second `exec` classifies UNKNOWN, same outcome as NOT-OOM.
 
 ### 6.3 Live smoke (not runnable in this environment)
 
-Requires `CLOUDFLARE_API_TOKEN` (and account id) for `wrangler dev` against real Containers,
-Docker for the local image build of the `NodeContainer` image, and an image whose `cloud-ci
+Requires `CLOUDFLARE_API_TOKEN` (and account id) for `wrangler dev` against real Containers
+(a real local Docker-backed `wrangler dev` is this project's own established pattern for
+Containers testing - `docs/roadmap.md`'s "Containers from Rust" spike row, confirmed
+2026-10-02 - Docker is required to run the local Containers runtime `wrangler dev` shells out
+to, not a Cloudflare-hosted dependency), Docker for the local image build of the
+`NodeContainer` image, and an image whose `cloud-ci
 agent` can reach the ingest path (bootstrap token plumbing, Q3). Steps: start an auto shard at
 `standard-1`, run an allocation bomb exceeding 4 GiB, observe the OOM evidence, the seq 1
 `retry` at `standard-2`, the second container at `shard:J:I:2` with the right env, then a second
@@ -1011,7 +1033,14 @@ while off (§5.1).
   unbounded 5 s retry), in the same change or not?
 * **Q7.** Shard retry id `shard:J:I:{attempt+1}` (no matcher change) versus parallelization.md's
   `:oom-retry:` text. The review found the scheme injective and recommends yes; confirm, and
-  update parallelization.md prerequisite 4.
+  update parallelization.md prerequisite 4. **Downside to weigh:** reusing the plain `attempt`
+  slot means this is the *one* scheme for both an OOM retry and any future non-OOM retry
+  mechanism, so `attempt+1` can collide with a genuine re-dispatch under a different retry
+  reason (there is none today - OOM is the only automatic retry, §7's non-goals - but a future
+  feature that also bumps `attempt` would collide). This design handles that collision only
+  through the spec-hash conflict check (§1.2): a colliding insert goes to `stuck`, it is not
+  silently merged. If a future non-OOM retry mechanism is ever added, it must share this same
+  attempt-numbering space deliberately, not invent a second one.
 * **Q8.** Superseded by Q9 (trigger evidence).
 * **Q9 (blocking).** Trigger: agent-only evidence versus the Worker-side fallback analytics.md
   already specifies (a second `exec` reading `memory.events` plus exit 137), and what window
@@ -1045,33 +1074,52 @@ while off (§5.1).
   `CLOUD_CI_SHARD_ATTEMPT` carriers have nothing to carry them, that no dispatcher provides the
   agent's token/URL, that **nothing produces the barrier input for a retry** (H3), and that the
   dominant OOM outcome is excluded by the admissibility rule (H1). "Only the wiring and the
-  live proof are missing" understates this.
+  live proof are missing" understates this. **Corrected:** at Stage 6's live proof (§8), per
+  that stage's own rule of only updating these docs with that run's evidence - not before,
+  since the understatement is tied to decisions (H1, H3, Q1) that are not yet made.
 * **analytics.md specifies two triggers; this design cannot yet use both (C4a).** `analytics.md`
   lines 232-235 and 704-707 give the agent's `memory.events` `oom_kill` counter **and** a
   Worker-side fallback ("container exited non-zero with no final Report"). Revision 1 used only
-  the agent. H1 asks the owner to choose.
+  the agent. H1 asks the owner to choose. **Corrected:** when H1/Q9 is decided and Stage 4
+  (evidence capture) implements the chosen option - analytics.md's own wording does not need
+  to change regardless of which option is picked, since it already documents both.
 * **analytics.md "at job end" versus the shipped agent (C4b).** `analytics.md` says the agent
   reads/submits once "at job end" (lines 230-232 and the data-flow text). The shipped agent
   samples for a fixed `--duration-secs` window (default 60 s: `cloud-ci-cli/src/agent.rs`,
   `cloud-ci-cli/src/cli.rs`) and submits once after that window. A job shorter than the window
   is padded; a longer job is sampled only for its first minute. Any statement in this design
   that the agent reports "at job end" is wrong; it reports at the end of its window.
+  **Corrected:** this is wrong today, independent of any decision in this design - same shape
+  as the `dynamic-pipelines.md` fix below - but is not in this revision's scope; flag for a
+  separate small analytics.md docs commit, same pattern as `dynamic-pipelines.md` (below), at
+  the latest by Stage 6.
 * **analytics.md `sizing_decisions` shape (C3).** Line 395 lists a narrower table than this
   design needs (§2.3 lists the extra columns); analytics.md must be updated when the table is
-  built.
-* `docs/design/dynamic-pipelines.md` (around line 309) still says per-call `image`/`instance`
-  and `exec()` "are not reachable from Rust". ADR 0010, ADR 0011 and the roadmap spike row say
-  they are (via the fork); the fork source confirms it (§1.3). The doc is stale.
+  built. **Corrected:** when `sizing_decisions` is built (the cron work, Q5) - not part of this
+  design's staged delivery, which defers that table entirely (§2.3).
+* `docs/design/dynamic-pipelines.md` (around line 309) said per-call `image`/`instance` and
+  `exec()` "are not reachable from Rust". **Already corrected**, in a small docs-only commit on
+  this branch separate from this design (`f9fa884`, 2026-10-03): ADR 0010, ADR 0011 and the
+  roadmap spike row already say they are reachable (via the fork); the fork source confirms it
+  (§1.3). This fix did not wait for Stage 6, because - unlike the roadmap/parallelization entry
+  above - it was wrong independent of any pending decision in this design.
 * `parallelization.md` prerequisite 4 plans to teach `shard_node_matches` the
   `:oom-retry:<n>` shape; `oom_retry_node_id`'s own doc comment says shard nodes do not need
   it; `resolve_oom_node_id` uses it for shards anyway. This design uses
-  `shard_node_id(job, idx, attempt+1)` (Q7).
+  `shard_node_id(job, idx, attempt+1)` (Q7). **Corrected:** when Q7 is confirmed, since Q7's
+  answer is what Stage 1 implements; updating the doc before that would describe code that
+  does not yet exist either way.
 * `executor.rs` `ContainersExecutor::capabilities()` advertises one `standard-4` rung while the
-  real start path is `lite` (Stage 0).
+  real start path is `lite` (Stage 0). **Corrected:** by Stage 0 itself, once it ships (the
+  rung list and the real start path converge; see Stage 0's own rollout gate, G4, for why
+  shipping it does not itself fix every deployment's running size).
 * analytics.md: "becomes the new `current_instance_type` immediately (not just for the one
   retry)" implies a reader on later runs; no reader exists and none is planned here (Q5). Its
   sample CLI comment ("--node-id ... currently unset by any real dispatcher") stays true until
-  Stage 2.
+  Stage 2. **Corrected:** the `current_instance_type` reader claim, when `sizing_decisions` and
+  its reader are built (Q5, cron work, outside this design); the CLI comment, at Stage 2.
 * analytics.md/settings.md default `runners.auto.min = "basic"` versus the runtime's rejection
   of `basic` under `durable_object` (the roadmap spike row already records the rejection, dated
-  2026-10-02).
+  2026-10-02). **Corrected:** when Q2 is answered - an independent documentation edit, not
+  gated on any stage of this design, since the wrong default exists regardless of whether OOM
+  recovery is ever wired.
