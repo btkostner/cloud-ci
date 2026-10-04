@@ -14,8 +14,10 @@
 //!   github-app` subcommand (which needs a human in a browser) or prints
 //!   the exact command; it is only reported done after re-reading
 //!   `wrangler.toml` confirms `GITHUB_APP_ID` is set.
-//! - Print secrets. Command output is never echoed, and secret values are
-//!   never read; only secret *names* from `wrangler.toml` are shown.
+//! - Print secrets. Command output is only parsed, never echoed (a failed
+//!   `d1 migrations apply` prints just the database, a non-zero-exit note
+//!   and a fixed hint), and secret values are never read; only secret
+//!   *names* from `wrangler.toml` are shown.
 //! - Mutate anything in `--dry-run`: only read-only commands run
 //!   (`wrangler whoami`, `d1 migrations list`, `secrets-store secret list`).
 //!
@@ -31,7 +33,8 @@ use toml_edit::{DocumentMut, Item};
 use crate::cli::WizardArgs;
 
 /// Captured result of a finished command. Contents are used for
-/// parsing only and are never printed.
+/// parsing only and are never printed (no redaction is attempted, so none
+/// is relied on).
 pub struct CmdOutput {
     pub success: bool,
     pub stdout: String,
@@ -177,43 +180,6 @@ fn valid_free_text(v: &str) -> bool {
 fn valid_orgs_list(v: &str) -> bool {
     let l = logins(v);
     !l.is_empty() && l.iter().all(|x| valid_ident(x))
-}
-
-/// Best-effort redaction of one line of subprocess output before it is
-/// shown: PEM/authorization lines are dropped, and any long token-looking
-/// word (20+ chars of `[A-Za-z0-9_+=/-]` containing a digit or mixed case)
-/// is replaced. This is a heuristic, not a guarantee.
-fn redact(line: &str) -> String {
-    let lower = line.to_ascii_lowercase();
-    if line.contains("-----BEGIN") || lower.contains("authorization") || lower.contains("bearer ") {
-        return s("[redacted line]");
-    }
-    line.split_whitespace()
-        .map(|w| {
-            let tokenish = w.len() >= 20
-                && w.chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '+' | '=' | '/'))
-                && (w.chars().any(|c| c.is_ascii_digit())
-                    || (w.chars().any(|c| c.is_ascii_uppercase())
-                        && w.chars().any(|c| c.is_ascii_lowercase())));
-            if tokenish { "[redacted]" } else { w }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// The last ten non-empty lines of `text`, each redacted and truncated.
-fn summarize(text: &str) -> String {
-    let lines: Vec<String> = text
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(|l| redact(l).chars().take(200).collect::<String>())
-        .collect();
-    if lines.is_empty() {
-        return s("(no output)");
-    }
-    lines[lines.len().saturating_sub(10)..].join("\n")
 }
 
 fn load_doc(ctx: &Ctx<'_>) -> Result<DocumentMut, String> {
@@ -379,17 +345,16 @@ enum MigState {
 }
 
 /// Classifies `wrangler d1 migrations list` output. Only text that is
-/// positively recognized counts: "No migrations to apply" is clean, a
-/// listed `.sql` file (or the "Migrations to be applied" heading) is
-/// pending, and everything else, including any failed exit, is unknown.
+/// positively recognized counts: "No migrations to apply" is clean, the
+/// "Migrations to be applied" heading is pending, and everything else,
+/// including any failed exit, is unknown.
 fn classify_migrations(success: bool, text: &str) -> MigState {
     if !success {
         return MigState::Unknown;
     }
     if text.contains("No migrations to apply") {
         MigState::Clean
-    } else if text.contains("Migrations to be applied") || text.lines().any(|l| l.contains(".sql"))
-    {
+    } else if text.contains("Migrations to be applied") {
         MigState::Pending
     } else {
         MigState::Unknown
@@ -459,11 +424,10 @@ fn step_migrations(ctx: &mut Ctx<'_>) -> Outcome {
                         ),
                     ),
                 },
-                Ok(o) => out(
+                Ok(_) => out(
                     Status::Failed,
                     format!(
-                        "`wrangler d1 migrations apply {db} --remote` failed. Output (redacted, last lines):\n{}\nRun it by hand: {manual}",
-                        summarize(&o.stdout)
+                        "`wrangler d1 migrations apply {db} --remote` exited non-zero against remote database `{db}`. Its output is not shown here: run `wrangler d1 migrations apply {db} --remote` yourself to see the full output."
                     ),
                 ),
                 Err(e) => out(
@@ -492,6 +456,7 @@ fn secret_entries(doc: &DocumentMut) -> Vec<(String, String, String)> {
         .unwrap_or_default()
 }
 
+const SECRETS_PER_PAGE_N: usize = 100;
 const SECRETS_PER_PAGE: &str = "100";
 const SECRETS_MAX_PAGES: usize = 50;
 
@@ -510,10 +475,20 @@ fn name_tokens(text: &str) -> impl Iterator<Item = &str> {
 }
 
 /// Reads `wrangler secrets-store secret list` pages (`--page`/`--per-page`)
-/// until every wanted name has been seen, or a page adds no new token
-/// (empty or past-the-end page). Returns every token seen. Hitting the page
-/// cap while pages still add tokens is an error, so absence is never
-/// concluded from a truncated listing.
+/// and returns every token seen.
+///
+/// wrangler 4.145.0 fails (non-zero exit, "List request returned no
+/// secrets.") on an EMPTY page, so the loop ends in one of these ways:
+/// - a page with fewer than [`SECRETS_PER_PAGE_N`] non-empty output lines
+///   (header and border lines only inflate the count, which is the safe
+///   direction: it can only cause one more request);
+/// - a failed call after at least one successful page (end of listing);
+/// - a page that adds no new token;
+/// - every wanted name seen.
+///
+/// A failed FIRST page is [`ListError::Unavailable`]. Hitting the page cap
+/// while pages still add tokens is [`ListError::TooManyPages`], so absence
+/// is never concluded from a truncated listing.
 fn list_store_secrets(
     ctx: &Ctx<'_>,
     store: &str,
@@ -532,20 +507,19 @@ fn list_store_secrets(
             s("--page"),
             page.to_string(),
         ];
-        let o = ctx
-            .runner
-            .run("wrangler", &args, None)
-            .map_err(|_| ListError::Unavailable)?;
-        if !o.success {
-            return Err(ListError::Unavailable);
-        }
+        let o = match ctx.runner.run("wrangler", &args, None) {
+            Ok(o) if o.success => o,
+            _ if page > 1 => return Ok(seen),
+            _ => return Err(ListError::Unavailable),
+        };
         let mut grew = false;
         for t in name_tokens(&o.stdout) {
             if seen.insert(t.to_string()) {
                 grew = true;
             }
         }
-        if !grew || wanted.iter().all(|w| seen.contains(*w)) {
+        let rows = o.stdout.lines().filter(|l| !l.trim().is_empty()).count();
+        if rows < SECRETS_PER_PAGE_N || !grew || wanted.iter().all(|w| seen.contains(*w)) {
             return Ok(seen);
         }
     }
@@ -585,7 +559,7 @@ fn step_secrets(ctx: &mut Ctx<'_>) -> Outcome {
         .filter_map(|b| {
             entries
                 .iter()
-                .find(|(eb, _, _)| eb == b)
+                .find(|(eb, st, sn)| eb == b && !st.is_empty() && !sn.is_empty())
                 .map(|(_, st, sn)| (*b, st.as_str(), sn.as_str()))
         })
         .collect();
@@ -790,6 +764,12 @@ fn s_owned(v: &str) -> String {
 }
 
 fn step_allowed_orgs(ctx: &mut Ctx<'_>) -> Outcome {
+    if ctx.args.file.to_string_lossy().starts_with('-') {
+        return out(
+            Status::Failed,
+            "--file must not start with '-'; no command was run",
+        );
+    }
     let doc = match load_doc(ctx) {
         Ok(d) => d,
         Err(e) => return out(Status::Failed, e),
@@ -997,6 +977,11 @@ mod tests {
         calls: RefCell<Vec<String>>,
         /// prefix -> (success, stdout)
         replies: RefCell<HashMap<String, (bool, String)>>,
+        /// Every call and announce, in order, tagged; `calls`-only
+        /// consumers (`mutating`) are unaffected since this is separate.
+        timeline: RefCell<Vec<String>>,
+        /// Prefixes for which `run` returns `Err` instead of a reply.
+        err_prefixes: RefCell<Vec<String>>,
         announcements: RefCell<Vec<String>>,
         token: bool,
     }
@@ -1026,6 +1011,11 @@ mod tests {
                 .cloned()
                 .collect()
         }
+        /// After this call, `run` returns `Err` for any line starting with
+        /// `prefix`, instead of a reply.
+        fn err_on(&self, prefix: &str) {
+            self.err_prefixes.borrow_mut().push(prefix.to_string());
+        }
     }
     impl Runner for FakeRunner {
         fn run(
@@ -1036,12 +1026,22 @@ mod tests {
         ) -> Result<CmdOutput, String> {
             let line = format!("{program} {}", args.join(" "));
             self.calls.borrow_mut().push(line.clone());
+            self.timeline.borrow_mut().push(format!("CALL: {line}"));
+            if self
+                .err_prefixes
+                .borrow()
+                .iter()
+                .any(|p| line.starts_with(p.as_str()))
+            {
+                return Err("simulated transport error".to_string());
+            }
             let (success, stdout) = self.lookup(&line);
             Ok(CmdOutput { success, stdout })
         }
         fn run_inherit(&self, program: &str, args: &[String]) -> Result<bool, String> {
             let line = format!("{program} {}", args.join(" "));
             self.calls.borrow_mut().push(line.clone());
+            self.timeline.borrow_mut().push(format!("CALL: {line}"));
             Ok(self.lookup(&line).0)
         }
         fn env_is_set(&self, _: &str) -> bool {
@@ -1049,6 +1049,7 @@ mod tests {
         }
         fn announce(&self, msg: &str) {
             self.announcements.borrow_mut().push(msg.to_string());
+            self.timeline.borrow_mut().push(format!("ANNOUNCE: {msg}"));
         }
     }
 
@@ -1058,7 +1059,7 @@ mod tests {
     /// command delegates to `base`.
     struct PagedRunner<'a> {
         base: &'a FakeRunner,
-        page_stdout: fn(usize) -> String,
+        page_result: fn(usize) -> (bool, String),
     }
     impl Runner for PagedRunner<'_> {
         fn run(&self, p: &str, a: &[String], c: Option<&Path>) -> Result<CmdOutput, String> {
@@ -1069,14 +1070,14 @@ mod tests {
                     .and_then(|i| a.get(i + 1))
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(1);
+                let line = format!("{p} {}", a.join(" "));
+                self.base.calls.borrow_mut().push(line.clone());
                 self.base
-                    .calls
+                    .timeline
                     .borrow_mut()
-                    .push(format!("{p} {}", a.join(" ")));
-                return Ok(CmdOutput {
-                    success: true,
-                    stdout: (self.page_stdout)(page),
-                });
+                    .push(format!("CALL: {line}"));
+                let (success, stdout) = (self.page_result)(page);
+                return Ok(CmdOutput { success, stdout });
             }
             self.base.run(p, a, c)
         }
@@ -1242,7 +1243,11 @@ name = "NODE_CONTAINER"
     fn pending_migrations_are_applied_and_reverified() {
         let r = healthy_runner();
         let fs = FakeFs(RefCell::new(configured()));
-        r.reply("wrangler d1 migrations list", true, "0021_x.sql pending");
+        r.reply(
+            "wrangler d1 migrations list",
+            true,
+            "Migrations to be applied:\n0021_x.sql",
+        );
         // After apply the list must report clean; swap reply when apply is seen.
         struct Flip<'a>(&'a FakeRunner);
         impl Runner for Flip<'_> {
@@ -1278,6 +1283,16 @@ name = "NODE_CONTAINER"
             "{:?}",
             r.announcements.borrow()
         );
+        // L3: the announce happens strictly before the apply call, not after.
+        let timeline = r.timeline.borrow();
+        let announce_at = timeline.iter().position(|t| t.starts_with("ANNOUNCE:"));
+        let apply_at = timeline
+            .iter()
+            .position(|t| t.starts_with("CALL:") && t.contains("migrations apply"));
+        let (Some(announce_idx), Some(apply_idx)) = (announce_at, apply_at) else {
+            unreachable!("missing announce or apply call: {timeline:?}");
+        };
+        assert!(announce_idx < apply_idx, "{timeline:?}");
     }
 
     #[test]
@@ -1302,11 +1317,15 @@ name = "NODE_CONTAINER"
     }
 
     #[test]
-    fn failed_list_exit_never_triggers_apply_even_with_pending_looking_output() {
-        // Pins the `!o.success` check: pending-shaped text on a failed
-        // exit must still be Unknown, never Pending.
+    fn mentioning_sql_without_the_pending_heading_never_applies() {
+        // L1: a bare ".sql" substring is not a pending marker; only the
+        // real "Migrations to be applied" heading is.
         let r = healthy_runner();
-        r.reply("wrangler d1 migrations list", false, "0099_new.sql pending");
+        r.reply(
+            "wrangler d1 migrations list",
+            true,
+            "warning: unrecognized output mode, see notes.sql for details",
+        );
         let fs = FakeFs(RefCell::new(configured()));
         let rep = run_wizard(&r, &fs, &args(), "cloud-ci");
         assert_eq!(rep.steps[2].status, Status::Failed, "{:?}", rep.steps[2]);
@@ -1319,27 +1338,89 @@ name = "NODE_CONTAINER"
     }
 
     #[test]
-    fn migration_apply_failure_surfaces_redacted_summary_without_secrets() {
+    fn failed_list_exit_never_triggers_apply_even_with_pending_looking_output() {
+        // Pins the `!o.success` check: pending-shaped text on a failed
+        // exit must still be Unknown, never Pending.
         let r = healthy_runner();
-        r.reply("wrangler d1 migrations list", true, "0021_x.sql pending");
-        let token = "AbCdEf1234567890ZyXwVu9876543210";
         r.reply(
-            "wrangler d1 migrations apply",
+            "wrangler d1 migrations list",
             false,
-            &format!("Error: could not apply, token {token} rejected"),
+            "Migrations to be applied:\n0099_new.sql",
         );
         let fs = FakeFs(RefCell::new(configured()));
         let rep = run_wizard(&r, &fs, &args(), "cloud-ci");
         assert_eq!(rep.steps[2].status, Status::Failed, "{:?}", rep.steps[2]);
-        assert!(!rep.steps[2].detail.contains(token));
-        assert!(rep.steps[2].detail.contains("[redacted]"));
-        assert!(rep.steps[2].detail.contains("Run it by hand"));
+        assert!(
+            !r.calls
+                .borrow()
+                .iter()
+                .any(|c| c.contains("migrations apply"))
+        );
+    }
+
+    #[test]
+    fn list_transport_error_is_unknown_not_pending() {
+        // L3: pins `migrations_state`'s `Err(_) => MigState::Unknown` arm,
+        // which no other test exercises (the fakes only ever return `Ok`).
+        let r = healthy_runner();
+        r.err_on("wrangler d1 migrations list");
+        let fs = FakeFs(RefCell::new(configured()));
+        let rep = run_wizard(&r, &fs, &args(), "cloud-ci");
+        assert_eq!(rep.steps[2].status, Status::Failed, "{:?}", rep.steps[2]);
+        assert!(
+            !r.calls
+                .borrow()
+                .iter()
+                .any(|c| c.contains("migrations apply"))
+        );
+    }
+
+    #[test]
+    fn migration_apply_failure_prints_no_raw_output() {
+        // M2: the apply-failure message must never echo wrangler's own
+        // output, not even behind a heuristic redaction — only the
+        // database name, a non-zero-exit note, and a fixed hint.
+        let r = healthy_runner();
+        r.reply(
+            "wrangler d1 migrations list",
+            true,
+            "Migrations to be applied:\n0021_x.sql",
+        );
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
+        let json_quoted = "{\"token\":\"AbCdEfGhIjKlMnOpQrStUvWxYz123456\"}";
+        let trailing_comma = "token=AbCdEfGhIjKlMnOpQrStUvWxYz123456,";
+        let lowercase40 = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        r.reply(
+            "wrangler d1 migrations apply",
+            false,
+            &format!("Error: {jwt} {json_quoted} {trailing_comma} {lowercase40}"),
+        );
+        let fs = FakeFs(RefCell::new(configured()));
+        let rep = run_wizard(&r, &fs, &args(), "cloud-ci");
+        assert_eq!(rep.steps[2].status, Status::Failed, "{:?}", rep.steps[2]);
+        let detail = &rep.steps[2].detail;
+        assert!(!detail.contains(jwt), "{detail}");
+        assert!(
+            !detail.contains("AbCdEfGhIjKlMnOpQrStUvWxYz123456"),
+            "{detail}"
+        );
+        assert!(!detail.contains(lowercase40), "{detail}");
+        assert!(!detail.to_lowercase().contains("redacted"), "{detail}");
+        assert!(detail.contains("cloud-ci"), "{detail}");
+        assert!(
+            detail.contains("run `wrangler d1 migrations apply cloud-ci --remote` yourself"),
+            "{detail}"
+        );
     }
 
     #[test]
     fn dry_run_changes_nothing() {
         let r = healthy_runner();
-        r.reply("wrangler d1 migrations list", true, "0021_x.sql pending");
+        r.reply(
+            "wrangler d1 migrations list",
+            true,
+            "Migrations to be applied:\n0021_x.sql",
+        );
         let mut a = args();
         a.dry_run = true;
         a.allowed_orgs = Some("acme,newco".into());
@@ -1448,19 +1529,46 @@ name = "NODE_CONTAINER"
         );
     }
 
+    /// Builds one page of `wrangler secrets-store secret list` output:
+    /// one `name` per line, padded with unique filler lines up to
+    /// `total_rows` so the row-count short-page check does not fire
+    /// early for a test that wants a full (100-row) page.
+    fn page_with(names: &[&str], total_rows: usize, filler_prefix: &str) -> String {
+        let mut lines: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+        let mut i = 0;
+        while lines.len() < total_rows {
+            lines.push(format!("{filler_prefix}-{i}"));
+            i += 1;
+        }
+        lines.join("\n")
+    }
+
     #[test]
     fn secrets_store_pagination_reads_every_page_until_found() {
         let r = healthy_runner();
-        fn two_pages(page: usize) -> String {
+        fn two_pages(page: usize) -> (bool, String) {
             match page {
-                1 => s("github-app-private-key github-app-client-secret"),
-                2 => s("github-webhook-secret cloud-ci-master-key"),
-                _ => s(""),
+                1 => (
+                    true,
+                    page_with(
+                        &["github-app-private-key", "github-app-client-secret"],
+                        SECRETS_PER_PAGE_N,
+                        "filler1",
+                    ),
+                ),
+                _ => (
+                    true,
+                    page_with(
+                        &["github-webhook-secret", "cloud-ci-master-key"],
+                        2,
+                        "filler2",
+                    ),
+                ),
             }
         }
         let paged = PagedRunner {
             base: &r,
-            page_stdout: two_pages,
+            page_result: two_pages,
         };
         let fs = FakeFs(RefCell::new(configured()));
         let rep = run_wizard(&paged, &fs, &args(), "cloud-ci");
@@ -1477,6 +1585,9 @@ name = "NODE_CONTAINER"
 
     #[test]
     fn secrets_store_matching_is_exact_not_a_substring() {
+        // The single-line reply is one output row, under the per-page
+        // row count, so the real-wrangler short-page rule (M1) stops
+        // after page 1 without needing a second, failing call.
         let r = healthy_runner();
         let toml = configured().replace(
             "secret_name = \"github-app-private-key\"",
@@ -1491,17 +1602,96 @@ name = "NODE_CONTAINER"
         let rep = run_wizard(&r, &fs, &args(), "cloud-ci");
         assert_eq!(rep.steps[3].status, Status::Failed, "{:?}", rep.steps[3]);
         assert!(rep.steps[3].detail.contains("(FOO)"));
+        let calls = r.calls.borrow().clone();
+        let list_calls = calls.iter().filter(|c| c.contains("secrets-store")).count();
+        assert_eq!(list_calls, 1, "{calls:?}");
+    }
+
+    #[test]
+    fn absent_secret_on_a_full_page_followed_by_a_real_empty_page_failure_is_reported_failed() {
+        // M1: wrangler 4.145.0 throws a non-zero-exit FatalError on an
+        // EMPTY page ("List request returned no secrets."). A secret
+        // absent from a full (100-row) first page must still surface as
+        // Failed naming it, not as an unverifiable Manual step.
+        let r = healthy_runner();
+        fn full_then_empty_page_error(page: usize) -> (bool, String) {
+            if page == 1 {
+                (
+                    true,
+                    page_with(
+                        &[
+                            "github-app-private-key",
+                            "github-webhook-secret",
+                            "cloud-ci-master-key",
+                        ],
+                        SECRETS_PER_PAGE_N,
+                        "filler",
+                    ),
+                )
+            } else {
+                (false, s("List request returned no secrets."))
+            }
+        }
+        let paged = PagedRunner {
+            base: &r,
+            page_result: full_then_empty_page_error,
+        };
+        let fs = FakeFs(RefCell::new(configured()));
+        let rep = run_wizard(&paged, &fs, &args(), "cloud-ci");
+        assert_eq!(rep.steps[3].status, Status::Failed, "{:?}", rep.steps[3]);
+        assert!(
+            rep.steps[3].detail.contains("(github-app-client-secret)"),
+            "{:?}",
+            rep.steps[3]
+        );
+        let calls = r.calls.borrow().clone();
+        let list_calls = calls.iter().filter(|c| c.contains("secrets-store")).count();
+        assert_eq!(list_calls, 2, "{calls:?}");
+    }
+
+    #[test]
+    fn short_first_page_with_an_absent_secret_fails_naming_it_in_one_call() {
+        let r = healthy_runner();
+        r.reply(
+            "wrangler secrets-store secret list",
+            true,
+            "github-app-private-key\ngithub-app-client-secret\ngithub-webhook-secret",
+        );
+        let fs = FakeFs(RefCell::new(configured()));
+        let rep = run_wizard(&r, &fs, &args(), "cloud-ci");
+        assert_eq!(rep.steps[3].status, Status::Failed, "{:?}", rep.steps[3]);
+        assert!(
+            rep.steps[3].detail.contains("(cloud-ci-master-key)"),
+            "{:?}",
+            rep.steps[3]
+        );
+        let calls = r.calls.borrow().clone();
+        let list_calls = calls.iter().filter(|c| c.contains("secrets-store")).count();
+        assert_eq!(list_calls, 1, "{calls:?}");
+    }
+
+    #[test]
+    fn page_one_failure_is_unverified_not_a_false_absence() {
+        let r = healthy_runner();
+        r.reply("wrangler secrets-store secret list", false, "");
+        let fs = FakeFs(RefCell::new(configured()));
+        let rep = run_wizard(&r, &fs, &args(), "cloud-ci");
+        assert_eq!(rep.steps[3].status, Status::Manual, "{:?}", rep.steps[3]);
+        assert!(!rep.failed());
     }
 
     #[test]
     fn secrets_store_pagination_caps_and_fails_closed() {
         let r = healthy_runner();
-        fn always_new(page: usize) -> String {
-            format!("filler-token-{page}")
+        fn always_new(page: usize) -> (bool, String) {
+            (
+                true,
+                page_with(&[], SECRETS_PER_PAGE_N, &format!("filler-{page}")),
+            )
         }
         let paged = PagedRunner {
             base: &r,
-            page_stdout: always_new,
+            page_result: always_new,
         };
         let fs = FakeFs(RefCell::new(configured()));
         let rep = run_wizard(&paged, &fs, &args(), "cloud-ci");
