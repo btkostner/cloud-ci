@@ -89,7 +89,7 @@ Status (2026-10-03): partly built. `packages/cloud-ci-docs` (a VitePress docs si
 deployed anywhere), the `cloud-ci setup allowed-orgs`/`cloud-ci setup github-app` subcommands,
 and the one-step `cloud-ci setup` wizard (`packages/cloud-ci-cli/src/setup_wizard.rs`,
 [deployment](./design/deployment.md#setup-wizard)) exist. The wizard's ordering/idempotence/
-failure/dry-run/secret-redaction behavior is unit-tested only — a real run in this environment
+failure/dry-run/no-raw-output-on-apply-failure behavior is unit-tested only — a real run in this environment
 (`wrangler` was not on the `PATH` the check environment's shell used, though it is pinned via
 mise in `packages/cloud-ci-worker/mise.toml`; no Cloudflare account either) was exercised only
 as far as its first prerequisite check, observed failing exactly as a missing executable does
