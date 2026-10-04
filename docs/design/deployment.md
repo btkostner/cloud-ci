@@ -145,16 +145,24 @@ themselves. `--dry-run` runs only read-only checks (`wrangler whoami`, `d1 migra
    `--file` (default `packages/cloud-ci-worker/wrangler.toml`), and that the D1 binding's
    `database_id` is not the repo's placeholder. Missing bindings or a still-placeholder id fail
    with the exact fix (e.g. `wrangler d1 create cloud-ci`); this step never edits the file itself.
-3. **D1 migrations** — `wrangler d1 migrations list <db> --remote`; if anything is pending, runs
-   `wrangler d1 migrations apply <db> --remote` (skipped under `--dry-run`, which only reports
-   what is pending) and re-lists to confirm the apply actually cleared the backlog before calling
-   it done.
+3. **D1 migrations** — `wrangler d1 migrations list <db> --remote`, classified positively: the
+   exact text "No migrations to apply" is clean, a listed `.sql` file (or "Migrations to be
+   applied") is pending, and anything else — including a non-zero exit — is undeterminable and
+   fails the step with no mutating command run. Only a positively-pending result (never
+   `--dry-run`) runs `wrangler d1 migrations apply <db> --remote`, first printing which database
+   it targets; a failed apply surfaces a redacted, truncated summary of wrangler's own output
+   instead of a bare "failed". The listing is re-run afterward and must come back positively
+   clean before the step reports done.
 4. **Secrets Store secrets** — reads the four `[[secrets_store_secrets]]` bindings
    (`GITHUB_APP_PRIVATE_KEY`/`GITHUB_APP_CLIENT_SECRET`/`GITHUB_WEBHOOK_SECRET`/
-   `CLOUD_CI_MASTER_KEY`) out of `wrangler.toml` and, if present, confirms each named secret shows
-   up in `wrangler secrets-store secret list` for its store — by name only; no secret value is
-   ever read or printed. Missing bindings are reported manual (the next step creates them); a
-   binding that names a secret absent from the store is a hard failure.
+   `CLOUD_CI_MASTER_KEY`) out of `wrangler.toml` and, if present, confirms each named secret
+   shows up in `wrangler secrets-store secret list` for its store — by exact name match, never a
+   substring (`FOO` does not match a listed `FOO_OLD`), paging through every result
+   (`--per-page`/`--page`, capped at 50 pages — hitting the cap while new names are still
+   appearing fails the step rather than concluding absence from a truncated listing) until every
+   wanted name is found or a page adds nothing new. No secret value is ever read or printed.
+   Missing bindings are reported manual (the next step creates them); a binding that names a
+   secret absent from the store is a hard failure.
 5. **GitHub App** — if `GITHUB_APP_ID` is already set and the four secret bindings exist, this is
    a no-op. Otherwise it runs `cloud-ci setup github-app` itself (forwarding `--name`,
    `--allowed-orgs`, `--deployment-url`, `--cloudflare-account-id`, `--secrets-store-id`, `--public`
@@ -178,17 +186,24 @@ regardless of whether the run as a whole succeeded or stopped early.
 
 ### What is exercised and what is not
 
-The step-ordering, idempotent-re-run, failed-prerequisite-stops, dry-run-changes-nothing, and
-secret-redaction behavior are covered by `setup_wizard.rs`'s own unit tests against fake
+The step-ordering, idempotent-re-run, failed-prerequisite-stops, dry-run-changes-nothing,
+secret-redaction, positive migration-state classification (never treating unrecognized or
+failed-exit output as pending), paginated exact-name secret matching, and forwarded-value
+validation behavior are covered by `setup_wizard.rs`'s own unit tests against fake
 command-runner and filesystem implementations — no network, no real `wrangler`, no real
 Cloudflare/GitHub account, same pattern as the rest of this `setup` family (see "Step by step"
-below). Separately, `cloud-ci setup --dry-run` was run for real in this environment (no
-`wrangler` binary installed, no Cloudflare account) against this repo's own
-`packages/cloud-ci-worker/wrangler.toml`: it correctly stopped at step 1 with "could not run
-`wrangler whoami`: No such file or directory" rather than claiming success, confirming the
-fail-closed behavior end to end — but it did not exercise steps 2–6
-(bindings/migrations/secrets/App/orgs), which need a real `wrangler` and real Cloudflare state
-this environment does not have.
+below). Two of those checks (the migration-list failed-exit branch, and the
+`CLOUDFLARE_API_TOKEN` precheck) were additionally confirmed load-bearing by removing each one
+in a scratch copy and observing its own pinning test fail. Separately, `cloud-ci setup --dry-run`
+was run for real in this environment against this repo's own
+`packages/cloud-ci-worker/wrangler.toml`: `wrangler` was not on the `PATH` the check
+environment's shell used (it is pinned via mise in `packages/cloud-ci-worker/mise.toml`, so a
+shell that has run `mise activate`/`mise exec` there would find it; this check environment's
+shell had not), and no Cloudflare account was available either. The run correctly stopped at
+step 1 with "could not run `wrangler whoami`: No such file or directory" rather than claiming
+success, confirming the fail-closed behavior for exactly that failure mode end to end — but it
+did not exercise steps 2–6 (bindings/migrations/secrets/App/orgs) against a real `wrangler` or
+real Cloudflare state, which this environment does not have.
 
 ### Prerequisites the CLI assumes but does not create
 

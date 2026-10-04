@@ -90,15 +90,19 @@ deployed anywhere), the `cloud-ci setup allowed-orgs`/`cloud-ci setup github-app
 and the one-step `cloud-ci setup` wizard (`packages/cloud-ci-cli/src/setup_wizard.rs`,
 [deployment](./design/deployment.md#setup-wizard)) exist. The wizard's ordering/idempotence/
 failure/dry-run/secret-redaction behavior is unit-tested only — a real run in this environment
-(no `wrangler`, no Cloudflare account) was exercised only as far as its first prerequisite check
-before stopping closed, per that doc. Not built: the upgrade/migration story and the button,
+(`wrangler` was not on the `PATH` the check environment's shell used, though it is pinned via
+mise in `packages/cloud-ci-worker/mise.toml`; no Cloudflare account either) was exercised only
+as far as its first prerequisite check, observed failing exactly as a missing executable does
+("could not run `wrangler whoami`: No such file or directory"), before stopping closed, per that
+doc.
+Not built: the upgrade/migration story and the button,
 which is blocked by Cloudflare's isolated-subdirectory rule, see
 [deployment](./design/deployment.md#deploy-to-cloudflare).
 
 ## Next steps
 
-Ordered by dependency; items 1-2 are done (details and limitations inline), the rest are not.
-Each item unblocks the ones after it.
+Ordered by dependency; items 1, 2 and 5 are done (details and limitations inline), the rest are
+not. Each item unblocks the ones after it.
 
 1. ~~**Proto and contract work first**~~ **Done (2026-10-03).** All backward compatible
    (additive fields/RPCs only, no renumbering); `buf breaking` passes against `main`:
