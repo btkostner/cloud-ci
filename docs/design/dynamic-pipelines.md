@@ -304,13 +304,19 @@ sequenceDiagram
 ```
 
 `RC->>C: start (policy-checked size, image, secrets)` and the `exit code` in `ci.container`'s
-result above describe the target design, not what's callable today: the Containers from Rust
-spike (2026-10-02) found the vendored `worker`/`worker-sys` crates' `Container` bindings have no
-`image`/`instance` fields on `ContainerStartupOptions` and no `exec()`/exit-code accessor, so
-per-call instance sizing (the `durable_object` scheduling policy) and exit-status reads are not
-reachable from Rust until those bindings are extended or upstreamed into `cloudflare/workers-rs`.
-`default`-policy containers (fixed image/size, no exit code) do start and run to exit from Rust
-today, proven via local Docker-backed `wrangler dev` in the same spike.
+result above are partly built, so read this paragraph with its date. The Containers from Rust
+spike (2026-10-02) found the vendored `worker`/`worker-sys` 0.8.7 crates' `Container` bindings
+lacked `image`/`instance` on `ContainerStartupOptions` and any `exec()`/exit-code accessor. That
+gap is closed by the pinned fork ([ADR 0011](../adr/0011-patching-third-party-crates.md),
+`btkostner/workers-rs@df96700`): its source, read 2026-10-03, has
+`ContainerStartupOptions::set_instance` and `set_custom_instance`,
+`ContainerExecOptions::add_env`, and `Container::exec(cmd, Option<ContainerExecOptions>)`
+(`worker/src/container.rs`). `node_container.rs` uses the `exec()` exit code today. It does
+**not** yet set an instance (every `NodeContainer` node runs at the runtime default `lite`,
+see [oom-recovery.md](./oom-recovery.md#prerequisite-stage-0-managed-nodes-run-at-lite)), and
+per-call sizing against a real account has not been exercised. `default`-policy containers
+(fixed image/size) were proven to start and run to exit from Rust via local Docker-backed
+`wrangler dev` in the spike.
 
 Each `ci.container(id, spec)` call is two durable operations:
 
