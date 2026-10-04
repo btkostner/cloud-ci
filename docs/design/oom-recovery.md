@@ -548,10 +548,15 @@ CREATE TABLE IF NOT EXISTS oom_decision (
   confirmation of the one-row-per-decision shape and the latest-row projection above.
 
 **Atomicity (low notes).** The decision row is inserted inside the **same
-`storage().transaction()` closure** that records the event carrying the evidence (the batch
-acceptance in `accept_resource_sample_batch_and_queue_all` for trigger A, or the node-completion
-write for trigger B). A duplicate batch returns early at `AlreadyAccepted`, so a decision
-written in a separate step after a crash would never be re-driven. The reads feeding
+`storage().transaction()` closure** that records the event carrying the evidence: under option
+A (and C's corroborating path) the batch acceptance in
+`accept_resource_sample_batch_and_queue_all`; under option B (and C's trigger of record) the
+`/complete-node` acceptance. **That transaction writes the evidence and the `oom_decision` row
+only - never the node's terminal status** (§1.1 option B, §3.2): `MarkOldTerminal`, the
+decision's first effect, writes the status afterwards. Under option A the node was already
+written `failed` by the existing `handle_complete_node` path before the batch arrived (§3.2's
+upgrade rule). A duplicate batch returns early at `AlreadyAccepted`, so a decision written in
+a separate step after a crash would never be re-driven. The reads feeding
 `decide_oom_recovery` and the insert contain no `await` between them. The single alarm slot is
 **armed before** the commit (as `handle_shard_terminal` does with
 `schedule_overflow_flush_alarm`), so a crash after commit still has a wake pending. Effects are
