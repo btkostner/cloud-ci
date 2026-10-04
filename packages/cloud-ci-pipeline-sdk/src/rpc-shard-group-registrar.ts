@@ -132,7 +132,7 @@ export class RpcShardGroupRegistrar implements ShardGroupRegistrar {
       throw new ShardGroupRegisterRpcError(code, message, res.status);
     }
 
-    return decodeResponse(body, token);
+    return decodeResponse(body, token, request.jobName);
   }
 }
 
@@ -151,14 +151,30 @@ function malformed(message: string): ShardGroupRegisterRpcError {
  * Narrows the untrusted parsed-JSON `body` field by field (`in`/`typeof`)
  * rather than casting it, same fail-closed discipline as
  * `rpc-shard-planner.ts`'s `decodeResponse` — a missing or non-string
- * `jobName` is `malformed_response`, never silently coerced to `""`. */
-function decodeResponse(body: unknown, token: string): ShardGroupRegisterResult {
+ * `jobName` is `malformed_response`, never silently coerced to `""`.
+ * `expectedJobName` is `register()`'s own request `jobName`: the server
+ * echoes it back unchanged (`handle_register_shard_group`'s
+ * `RegisterShardGroupOutcome`), so a response naming a *different*
+ * `jobName` is itself a malformed response — either a transport-level
+ * mismatch (a proxy/cache serving the wrong response) or a server bug —
+ * never trusted as this call's own result. */
+function decodeResponse(
+  body: unknown,
+  token: string,
+  expectedJobName: string,
+): ShardGroupRegisterResult {
   if (typeof body !== "object" || body === null) {
     throw malformed(`expected a RegisterShardGroupResponse JSON object, got ${show(body, token)}`);
   }
   if (!("jobName" in body) || typeof body.jobName !== "string" || body.jobName.length === 0) {
     throw malformed(
       `"jobName" must be a non-empty string in RegisterShardGroupResponse: ${show(body, token)}`,
+    );
+  }
+  if (body.jobName !== expectedJobName) {
+    throw malformed(
+      `RegisterShardGroupResponse "jobName" (${show(body.jobName, token)}) does not match the ` +
+        `request's own jobName (${show(expectedJobName, token)})`,
     );
   }
   return { jobName: body.jobName };

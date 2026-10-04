@@ -169,6 +169,27 @@ describe("RpcShardGroupRegistrar", () => {
     expect(err.code).toBe("malformed_response");
   });
 
+  it("throws malformed_response when the response jobName does not match the request's own jobName", async () => {
+    const fetcher = new FakeFetcher(() => ({
+      status: 200,
+      body: { jobName: "a-different-job" },
+    }));
+    const registrar = new RpcShardGroupRegistrar({ fetcher, runId: "run_abc", token: "tok_abc" });
+
+    const err = await rejects(
+      registrar.register({
+        jobName: "e2e",
+        expectedTotal: 1,
+        failFast: false,
+        mergeOnFailure: "if_any_passed",
+      }),
+    );
+
+    expect(err.code).toBe("malformed_response");
+    expect(err.message).toContain("e2e");
+    expect(err.message).toContain("a-different-job");
+  });
+
   it("throws a transport ShardGroupRegisterRpcError when the Fetcher itself rejects", async () => {
     const fetcher: ShardPlanFetcher = {
       fetch: async () => {
