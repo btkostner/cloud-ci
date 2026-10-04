@@ -199,15 +199,20 @@ Revision 1 never discussed the ordering between the report and `/complete-node`.
   decision yet - but a crash between the commit and that inline drain leaves the node
   `Running` with a `pending` decision until the alarm sweep (§3.6) completes `MarkOldTerminal`;
   this is the same "drained by the alarm, not only inline" healing property every other effect
-  already has (§3's "O2/O3" row), not a new gap. A completion the classification (below) marks
-  NOT-OOM or UNKNOWN writes the node's status immediately and normally, with no decision row
-  and no deferral. Pros: works when the agent is killed; matches analytics.md's two triggers;
-  evidence and failure arrive in one durable write, which removes the ordering hazard without
-  needing the node to render two conflicting states. Cons: a second `exec` after the main one
-  exited is `[unverified]` against a real runtime, as is whether the cgroup it sees is the
-  job's; 137 also arises from a manual kill or a timeout kill (mitigated by requiring
-  `oom_kill > 0`); needs the container to remain up after the main process dies; adds a
-  Worker-owned `memory.events` parser.
+  already has (§3's "O2/O3" row), not a new gap. **By default**, a completion the
+  classification (below) marks NOT-OOM or UNKNOWN writes the node's status immediately and
+  normally, with no decision row and no deferral - this is the behavior as specified so far in
+  this design, independent of H1's pending choice. **Holding a failure write instead of
+  recording it immediately is a Q11 option only, not part of this default**; if the owner
+  picks that option, see the "Explicit UNKNOWN scenarios" discussion in §6.2 for what it would
+  cost under each H1 option. Pros: works when the agent is killed; matches analytics.md's two
+  triggers; evidence and the OOM-classified outcome are recorded durably in the same write,
+  so there is no window between "evidence arrived" and "the decision exists" for the
+  coordinator to lose track of. Cons: a second `exec` after the main one exited is
+  `[unverified]` against a real runtime, as is whether the cgroup it sees is the job's; 137
+  also arises from a manual kill or a timeout kill (mitigated by requiring `oom_kill > 0`);
+  needs the container to remain up after the main process dies; adds a Worker-owned
+  `memory.events` parser.
 * **C. Both.** B as the trigger of record, the agent's `oom_detected` as corroborating evidence
   stored on the batch. Cons: two paths into one decision need one deduplication rule (the
   decision is keyed by lineage and seq, §2.2, so both converge, but tests double).
@@ -281,15 +286,28 @@ A" problem statement above). Whichever H1 option is chosen, this design needs on
   on the batch, or `oom_detected`/`memory_peak_bytes` both absent in a request the coordinator
   can tell apart from "zero samples because the batch truly had none" - so UNKNOWN is a
   positive signal, not an absence.
-* **A coordinator-side window.** The coordinator treats a missing `SubmitResourceSamples` (or,
-  under option B, a missing second-`exec` result) as UNKNOWN once the node's own
-  `/complete-node` has arrived and some bounded time has passed with no evidence report -
-  analogous to the existing run-timeout pattern (§3.6), not a new unbounded wait. This needs
-  its own deadline, separate from the run timeout, stated by the owner alongside H1.
+* **A coordinator-side window.** Two distinct shapes exist under this name, and they are not
+  interchangeable (T1/T3):
+  * **Bound how long a late batch can still upgrade an already-recorded failure** (no change
+    to `handle_complete_node`): under option A, `/complete-node` already writes `failed`
+    immediately and unconditionally, as it does today; the window only bounds how long the
+    §3.2 upgrade rule stays willing to accept a late-arriving batch and flip `closed_by` to
+    `'oom'`. After the bound, a late batch is just a late, inert delivery. This is additive
+    and does not touch the existing completion handler.
+  * **Defer the write itself until evidence arrives or the window expires** (§6.2's "Holding a
+    failure write" discussion): under option A this is not additive - `handle_complete_node`
+    would have to learn to withhold its write for `runner_auto` nodes, which it does not do
+    today. Under option B it is unnecessary, since B's evidence is already synchronous with
+    the completion it accompanies (§6.2).
+  Either shape needs its own deadline, separate from the run timeout (F6), stated by the owner
+  alongside H1 and Q11 (§9, "mechanism and window length").
 
-Neither mechanism exists today; both are additive (an agent code change for the first, a
-coordinator timer for the second), and either is a genuine stage deliverable (§8 Stage 4), not
-something Stage 4 can treat as already covered by the agent's current abort-on-error behavior.
+None of these exist today. The upload and the late-upgrade-bound window shape are additive (an
+agent code change for the first, a coordinator timer for the second, neither touching an
+existing handler); the defer-the-write window shape additionally requires modifying
+`handle_complete_node` under option A (above). Whichever combination is chosen is a genuine
+stage deliverable (§8 Stage 4), not something Stage 4 can treat as already covered by the
+agent's current abort-on-error behavior.
 
 **When it flushes (option A).** Once, after `sample_for`'s bounded loop for `--duration-secs`
 (default 60 s), as one `SubmitResourceSamples` call. `node_status_for_exit_code` (`logic.rs`
@@ -1046,15 +1064,36 @@ evidence only once (no double decision); exit 137 with `oom_kill = 0` classifies
 OOM, and the node's failure is recorded normally with no decision row; `memory.events`
 unreadable by the second `exec` classifies UNKNOWN, same outcome as NOT-OOM.
 
-Explicit UNKNOWN scenarios (G1, option-independent): a node whose `/complete-node` carries an
-explicit "evidence unavailable" marker is recorded as an ordinary failure with no decision
-row, exactly like a successful-batch NOT-OOM; **if a coordinator-side window is the chosen
-mechanism**, a node whose completion arrives with no evidence report stays un-classified
-(no decision, no ordinary-failure write forced early) until that window's own deadline
-passes, at which point it is recorded as UNKNOWN - a report that arrives after the node was
-already recorded this way is a late report, handled like any other late evidence (§1.1); the
-window's deadline is independent of, and strictly shorter than, the run timeout, so it is
-never the run-timeout drain (§3.6) that resolves it.
+**Explicit UNKNOWN scenarios (G1, option-independent).** A node whose `/complete-node` carries
+an explicit "evidence unavailable" marker is recorded as an ordinary failure with no decision
+row, exactly like a successful-batch NOT-OOM - this is the default behavior (§1.1 option B)
+and needs no new test beyond the ordinary NOT-OOM path.
+
+**Holding a failure write pending evidence is a Q11 option only; this design does not build
+it by default (T1/T3).** If the owner picks holding as Q11's answer, what is actually
+buildable differs sharply by H1 option, and the test plan must reflect that rather than
+presuppose one shape:
+* **Under option B**, holding is unnecessary to achieve the goal: `NodeContainer` is this
+  project's own code, so instead of a coordinator-side wait it can simply include the explicit
+  "evidence unavailable" marker (above) on the very first `/complete-node` call whenever the
+  second `exec` fails or the cgroup read fails - there is no later evidence to wait for, since
+  B's evidence collection already happens synchronously before the completion is posted at
+  all. A coordinator-side window adds nothing under B.
+* **Under option A**, holding is not something this design can add without changing existing
+  code: the node is already written `failed` by `handle_complete_node` (the current,
+  unconditional path) before the agent's batch - which may carry OOM evidence - has any chance
+  to arrive. A coordinator-side window that holds the write would require `handle_complete_node`
+  itself to learn to defer for `runner_auto` nodes, a change to an existing, currently
+  unconditional handler, not an additive one. Whether that change is worth making, and for how
+  long to hold, is Q11 plus the two new questions this revision tracks (§9, "mechanism and
+  window length").
+
+If and only if the owner answers Q11 "hold, under option A, via a coordinator-side window",
+the DO-level test plan needs: a node whose completion arrives with no evidence report stays
+un-classified (no decision, no ordinary-failure write forced early) until the window's own
+deadline passes, at which point it is recorded as UNKNOWN; a report that arrives after the
+node was already recorded this way is a late report, handled like any other late evidence
+(§1.1). The window's deadline bound is specified in §1.1 (see F6).
 
 ### 6.3 Live smoke (not runnable in this environment)
 
