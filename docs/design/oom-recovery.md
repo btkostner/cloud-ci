@@ -484,15 +484,16 @@ CREATE TABLE IF NOT EXISTS oom_decision (
   intervening `await`, a re-delivery of the same evidence event re-reads the now-latest row
   (which the first delivery already inserted) and returns `AlreadyDecided` *before* ever
   reaching a second `INSERT` - it never gets far enough to collide. The constraint exists only
-  to fail loudly, not silently corrupt state, if that invariant is ever violated by a future
-  change (for example two evidence-bearing transactions for the same lineage somehow
-  interleaving with an `await` between the read and the insert, which the current design does
-  not do).
-* **If the backstop is ever reached anyway, it is handled as "already decided", never
-  surfaced as an SQL error (D1).** If the `INSERT` fails on the `(job_name, idx, seq)`
-  constraint, the caller re-reads the row that now exists at that `seq`, re-projects it, and
-  returns its `outcome` as `AlreadyDecided` - the same shape `decide_oom_recovery` already
-  returns for a duplicate.
+  to catch that invariant being violated by a future change (for example two evidence-bearing
+  transactions for the same lineage somehow interleaving with an `await` between the read and
+  the insert, which the current design does not do) - it is a backstop against silent state
+  corruption, not a signal this design expects a caller to ever see.
+* **If the backstop is ever reached anyway, it resolves to "already decided" without ever
+  surfacing an SQL error to the caller (D1).** If the `INSERT` fails on the `(job_name, idx,
+  seq)` constraint, the caller re-reads the row that now exists at that `seq`, re-projects it,
+  and returns its `outcome` as `AlreadyDecided` - the same shape `decide_oom_recovery` already
+  returns for a duplicate; the constraint violation itself is caught and absorbed inside this
+  retry, never propagated past it.
 * **Duplicate reports must pass the latest row, not always the seq-1 row (D1).** Revision 2
   said "any further report is `AlreadyDecided` (`decide_oom_recovery` already returns this for
   `FailedAtMax`)" - that is correct only once the **seq 2** row exists and is passed as
@@ -941,8 +942,11 @@ behavior.
 * Second-decision model: seq 1 `retry` then a report with `attempt == observed_attempt + 1`
   yields `New(FailedAtMax)`; under **option A (and C)**, a report with the original attempt
   and a different node id is rejected by the binding rule (§1.1); under **option B**, the
-  equivalent rejection is a `/complete-node` for a node whose `runner_auto`/`shard_attempt`
-  do not admit it; either way, `AlreadyDecided` after seq 2 or a seq 1 `failed_at_max`.
+  equivalent case is a *late* `/complete-node` for the original attempt's own node arriving
+  after seq 2 already exists - that node already has `closed_by = 'oom'` (M1, §2.1), so the
+  completion is dropped by the `resolve_complete_node` `closed_by` rule before it ever reaches
+  `decide_oom_recovery`, not by a `runner_auto`/`shard_attempt` admission check (there is none
+  on the completion path); either way, `AlreadyDecided` after seq 2 or a seq 1 `failed_at_max`.
 * `oom_report_matches_node` (option A only): exact equality with `shard_node_id(job, idx,
   attempt)`; rejects a missing `node_id`, a node id of another attempt, a legacy node
   (`runner_auto = 0`). Option B has no equivalent matcher (§1.1): a test instead asserts the
@@ -980,11 +984,17 @@ decisions and overflow still drains both and then releases the slot; deadline pa
 stuck decision closes the run; a late `/complete-node` for an OOM-closed node writes nothing
 (M1); fail-fast between `InsertRetry` and `StartRetry` leaves no container (M3); healing
 continues with `OOM_RECOVERY` switched off; **the PK-collision backstop (D1, N6)** - since the
-single-threaded read-then-insert path makes a real collision effectively unreachable (§2.2),
-this is tested by deliberately forcing the stale case rather than racing two drains: call the
-insert path with a stale `existing` (an already-superseded row) so its own `INSERT` targets a
-`seq` the harness pre-populated out of band, and assert the result is `AlreadyDecided`, never
-a surfaced SQL error; **a late or duplicate report after seq 2 exists is a clean no-op** (G6) -
+single-threaded read-then-insert path makes a real collision effectively unreachable in
+production (§2.2), the production code path (read `MAX(seq)`, compute `seq + 1`, insert)
+cannot be used to force it: passing a stale `existing` into that path does not help, because
+`seq` is always recomputed fresh from the read, not taken from `existing`. **The seam this
+test needs is the lower-level, `seq`-parameterized insert step itself**
+(`insert_decision_at_seq(sql, job, idx, seq, ...)`, the function the normal `MAX(seq)`-then-
+insert flow calls internally with its freshly computed `seq + 1`): the test pre-populates a
+row at some `seq` via the harness's own SQL access, then calls
+`insert_decision_at_seq` directly with that same `seq`, bypassing the normal `MAX(seq)` read
+entirely, and asserts the resulting constraint violation resolves to `AlreadyDecided`, never a
+surfaced SQL error; **a late or duplicate report after seq 2 exists is a clean no-op** (G6) -
 neither a seq 3 row nor an SQL error; **the seq-2 target node is already terminal when
 `MarkOldTerminal` for seq 2 runs** (G6, e.g. the retry was independently cancelled) - the
 decision proceeds to `StopOld`/projections without a conflicting write.
@@ -992,7 +1002,8 @@ decision proceeds to `StopOld`/projections without a conflicting write.
 Option A scenarios: duplicate `SubmitResourceSamples` delivery yields one decision; a report
 after the run is terminal is samples-only; a report arriving for a node already `failed`
 (plain exit 137) with matching OOM evidence **upgrades** it rather than abandoning the
-decision (L1); a report for a node terminal as `succeeded`/`cancelled` abandons the decision.
+decision (L1); a report for a node terminal as `succeeded`/`cancelled`/`skipped`/`timed_out`
+abandons the decision.
 
 Option B scenarios (L1/L2): a duplicate `/complete-node` delivery for the same node carries
 evidence only once (no double decision); exit 137 with `oom_kill = 0` classifies NOT-OOM, not
