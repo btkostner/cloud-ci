@@ -109,14 +109,17 @@ also why trigger design (H1) matters.
 * Billing impact: pricing is not stated in the sources read for this document and is
   `[unverified]` here. Owner must supply the expected cost change.
 
-**Rollout gate and rollback (G4).** Stage 0 is not inert and needs owner sign-off (above), so
-it ships behind its own gate, separate from `OOM_RECOVERY`: a deployment setting (for example
+**Rollout gate and rollback (G4, N4).** Stage 0's *code* is inert by default: it ships behind
+its own gate, separate from `OOM_RECOVERY` - a deployment setting (for example
 `Settings.runners.default_instance`, resolved the same way other deployment-wide bounds are -
-settings.md's "Deployment-wide limits" table) naming the instance size `handle_start_node`
-passes for a **non**-`runner_auto` node. It **defaults to the current behavior** - omitted,
-which the runtime resolves to `lite` (§5.4) - so a deployment that never sets it sees no
-change at all. An owner opts in per deployment by setting it explicitly (`Q1` is which value
-to recommend as the opt-in default, not what the code defaults to). **Rollback** is resetting
+settings.md's "Deployment-wide limits" table, though whether this specific setting belongs in
+that existing table, a new per-repo setting, or a plain deployment var is itself open, see Q1)
+naming the instance size `handle_start_node` passes for a **non**-`runner_auto` node. It
+**defaults to the current behavior** - omitted, which the runtime resolves to `lite` (§5.4) -
+so a deployment that never sets it sees no change at all; shipping the code changes nothing
+until an owner opts in. **What is "not inert" is the act of an owner opting a deployment in**
+(the cost and quota consequences above) **- not the code shipping (N4).** `Q1` is which value
+to recommend as the opt-in default, not what the code defaults to. **Rollback** is resetting
 the setting (or redeploying the prior Worker version) and redeploying; no data migration is
 needed, because the setting is read only at `startNode` time and affects only containers
 started after the change - already-running containers are unaffected either way, and a node
@@ -231,9 +234,16 @@ Revision 1 never discussed the ordering between the report and `/complete-node`.
 
 *Recommendation (owner decides):* B, optionally corroborated by A (C). Reason: it is the only
 option that fires in the dominant case and it removes the report-after-failure ordering problem
-by construction. Whichever is chosen, one rule is fixed: **OOM evidence must be evaluated no
-later than the moment the node's failure is recorded**, because after that the barrier and
-fail-fast may already have acted on it.
+by construction. **The goal - OOM evidence evaluated no later than the moment the node's
+failure is recorded - is not a rule every option satisfies; it is satisfied automatically only
+under option B (and C's trigger of record), because B's evidence and its decision are written
+before any status write happens at all (§1.1 option B, T1/T3). Under option A, this goal is
+NOT satisfied by default (N5):** `handle_complete_node`'s existing, unconditional path already
+records the failure before the agent's batch can arrive (the same ordering problem H1's own
+problem statement opens with), so evaluating evidence "no later than" that write would require
+Q11's "hold" option, which - under A specifically - is the one shape with a non-additive cost
+(changing `handle_complete_node`, §6.2's "Holding a failure write" discussion), not something
+this design gets for free by choosing A.
 
 **Trigger classification: OOM / NOT-OOM / UNKNOWN (G1).** Whichever H1 option is chosen,
 classifying one failed node's evidence must be total and three-valued, never a bare boolean:
@@ -255,11 +265,21 @@ Cases, and which bucket they fall in:
 | exit 137, `oom_kill` read successfully and `= 0` | NOT-OOM | a definite negative read: something sent SIGKILL (manual kill, a timeout mechanism) with no kernel OOM event in this cgroup |
 | `oom_kill > 0`, exit code is not 137 (e.g. a child process was OOM-killed but the job's own shell exited `1`) | NOT-OOM | the strict AND rule is not met; memory pressure existed but did not kill the measured process, so retrying would not necessarily help |
 | the second `exec` (option B) fails, or `memory.events`/`memory.peak` cannot be read | UNKNOWN | evidence unreadable |
-| the agent's sampling window ends before the job does (option A only) | UNKNOWN | no evidence was ever collected for the failure |
+| the agent's sampling window ends, and the job is OOM-killed after the agent's final `oom_kill` read (option A only) | **NOT-OOM in practice (N2)**, not a distinguishable UNKNOWN - see the note below the table | the agent's batch still arrives with a successfully-read `oom_kill = 0` (its last reading, taken before the real OOM happened); this is the exact same observable as row 2 above, so the coordinator classifies it NOT-OOM and has no way to tell the two cases apart |
 | a cancelled node | excluded structurally, not classified | `resolve_complete_node` already returns `DroppedCancelled` before any status write (`logic.rs` line 778); OOM classification never runs for a cancelled node |
 | a container never started, or is lost (no `/complete-node` ever arrives) | UNKNOWN, and un-actionable | nothing reaches the coordinator to classify; the node stays non-terminal until the run's own timeout (§3.6's weakened backstop) |
 | a timeout kill (a job-level wall-clock timeout mechanism sending SIGKILL/SIGTERM) | NOT-OOM if `oom_kill` reads `0`, UNKNOWN if unreadable | same rule as above; a timeout kill is not itself OOM evidence |
 | a crash or infrastructure loss (the DO, the container, or the whole job is lost) | UNKNOWN | no evidence reaches the coordinator; same as "container never started or lost" |
+
+**The option-A window case is not operationally distinguishable from a definite negative
+(N2).** The table above lists the window case's bucket as "NOT-OOM in practice", not UNKNOWN,
+because that is what actually happens: an OOM that occurs after `sample_for`'s final read
+produces a batch that looks identical to a genuine negative - the agent read `oom_kill` once
+more than the kernel had incremented it, submitted that value, and the coordinator has no
+timestamp or correlation to tell "this 0 is real" from "this 0 is stale". This is a real
+limitation of option A's fixed-window evidence collection, not a labeling choice this design
+can fix by itself; a design that widened the window to the job's full lifetime (H1 option A's
+own "(i)" variant) would close this gap for A, at the stated cost in §1.1.
 
 **Evidence source, exact (read 2026-10-03).** The agent **already** reads both counters:
 `cloud_ci_core::cgroup::CgroupReader::read_oom_kill` and `::read_memory_peak`
@@ -1003,7 +1023,19 @@ transition, in the same pass, release attempt N's failure.
   `oom_decision` row already carries `observed_attempt` and the original `target_node_id`,
   which is enough to reconstruct the terminal `shard_state` row) as the shard's verdict, then
   running barrier evaluation exactly as option 2's normal path would have.
-* If a retry **did** start and then independently fails or is cancelled, that is not this
+* **The release must gate barrier dispatch on the run still being non-terminal (N3).** The
+  `abandoned` trigger specifically includes "the run went terminal before the retry started"
+  (§3.6) - releasing in that case must not then evaluate the barrier and dispatch whatever
+  `BarrierOutcome` results, because `handle_shard_terminal` evaluates the barrier whenever
+  `group.status == 'running'` (`mod.rs` ~3925), and `job_group.status` is tracked
+  independently of the run's own status - a group can still read `'running'` after its run
+  has already closed. Dispatching `FailFastTriggered` (cancel siblings) or a merge enqueue for
+  an already-closed run would act on a run nothing is waiting on anymore. **Rule:** immediately
+  before evaluating the barrier in either option's release path above, re-read the run's
+  status; if terminal, write the verdict (the `shard_state` row, or stop excluding the
+  superseded row) but skip `evaluate_barrier` and every downstream dispatch entirely - the
+  release still resolves the lineage's own bookkeeping, it just never acts on a closed run.
+  If a retry **did** start and then independently fails or is cancelled, that is not this
   rule: the retry's own `/complete-node` (option 2) or a genuine new shard-terminal report for
   attempt N+1 (option 1) is the verdict, handled by the ordinary paths above. This rule applies
   only when the retry never reached a reportable state at all.
@@ -1234,8 +1266,10 @@ is inert until the last stage: `OOM_RECOVERY` defaults off and `runner_auto` is 
 while off (§5.1).
 
 0. **Stage 0 (separate change, owner sign-off, Q1): managed nodes stop running at lite.** Pass an
-   explicit `instance` through `JobSpec` to `set_instance` and choose the default. Not inert:
-   cost and quota change. No OOM logic. See "Prerequisite stage 0".
+   explicit `instance` through `JobSpec` to `set_instance`, gated by the deployment setting
+   (G4): the shipped code's own default is unchanged (`lite`, unless a deployment opts in).
+   **The code itself is inert; an owner opting a deployment in is not (N4)** - the cost and
+   quota impact is real once that opt-in happens. No OOM logic. See "Prerequisite stage 0".
 1. **Pure logic only.** `oom_effect_target`, `oom_report_matches_node`, `resolve_live_shard_node`,
    backoff and `StartRetry` precondition functions, the `closed_by` variant of
    `resolve_complete_node`, the command-template guard, tests. Removes the
@@ -1318,9 +1352,10 @@ answered - resolving every owner decision does not by itself make this design im
 ## 9. Open questions needing an owner decision
 
 * **Q1 (blocking).** `NodeContainer` starts every node on `lite` (256 MiB) today. Confirm it is
-  a bug and pick the default size for non-auto nodes (`standard-4` to match the advertised
-  capability, a smaller size, or `runners.default`), with the cost and quota impact stated
-  (Stage 0).
+  a bug, and pick the value Stage 0's opt-in gate (G4) should recommend deployments set
+  (`standard-4` to match the advertised capability, a smaller size, or `runners.default`) -
+  **not** the shipped code's own default, which stays `lite` regardless (N4) - with the cost
+  and quota impact of opting in stated (Stage 0).
 * **Q2.** The documented default `runners.auto.min = "basic"` is rejected by the
   `durable_object` runtime. Change the documented default (`lite`/`standard-1`) or alias
   `basic` to `lite`? (settings.md, analytics.md.)
@@ -1359,8 +1394,8 @@ answered - resolving every owner decision does not by itself make this design im
   `failed_at_max` should write `sizing_decisions` at all once it exists (recommendation: only a
   seq 1 `retry` writes, raising the size; `failed_at_max` writes nothing and is reported on the
   node).
-* **Q13.** Cost and quota: old and new containers can overlap briefly; a 12 GiB default (Q1)
-  against 6 TiB / 1,500 vCPU account limits (Stage 0 numbers).
+* **Q13.** Cost and quota: old and new containers can overlap briefly; a 12 GiB opt-in value
+  (Q1, N4 - not a shipped default) against 6 TiB / 1,500 vCPU account limits (Stage 0 numbers).
 * **Q14.** Command-template contract: no `--attempt`, `--node-id`, `--instance-type` flags in
   `runner_auto` commands (rejected at `startNode`, §1.3), versus teaching the agent an env
   fallback for `--instance-type`.
