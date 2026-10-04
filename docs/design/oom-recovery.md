@@ -168,6 +168,80 @@ by construction. Whichever is chosen, one rule is fixed: **OOM evidence must be 
 later than the moment the node's failure is recorded**, because after that the barrier and
 fail-fast may already have acted on it.
 
+**Trigger classification: OOM / NOT-OOM / UNKNOWN (G1).** Whichever H1 option is chosen,
+classifying one failed node's evidence must be total and three-valued, never a bare boolean:
+
+* **OOM** - exit code 137 (SIGKILL) AND `oom_kill > 0`, both successfully read. Triggers
+  `decide_oom_recovery`.
+* **NOT-OOM** - evidence was successfully read and does not meet the OOM rule above. An
+  ordinary failure: recorded normally (`resolve_complete_node`'s existing path), never retried.
+* **UNKNOWN** - evidence could not be read or could not reach the coordinator at all.
+  **Also an ordinary failure, never retried** - UNKNOWN is not a third kind of trigger, it is
+  NOT-OOM's safe degradation: inability to prove OOM must never silently behave as if OOM
+  evidence existed.
+
+Cases, and which bucket they fall in:
+
+| Case | Bucket | Why |
+| --- | --- | --- |
+| exit 137, `oom_kill` read successfully and `> 0` | OOM | matches the rule |
+| exit 137, `oom_kill` read successfully and `= 0` | NOT-OOM | a definite negative read: something sent SIGKILL (manual kill, a timeout mechanism) with no kernel OOM event in this cgroup |
+| `oom_kill > 0`, exit code is not 137 (e.g. a child process was OOM-killed but the job's own shell exited `1`) | NOT-OOM | the strict AND rule is not met; memory pressure existed but did not kill the measured process, so retrying would not necessarily help |
+| the second `exec` (option B) fails, or `memory.events`/`memory.peak` cannot be read | UNKNOWN | evidence unreadable |
+| the agent's sampling window ends before the job does (option A only) | UNKNOWN | no evidence was ever collected for the failure |
+| a cancelled node | excluded structurally, not classified | `resolve_complete_node` already returns `DroppedCancelled` before any status write (`logic.rs` line 778); OOM classification never runs for a cancelled node |
+| a container never started, or is lost (no `/complete-node` ever arrives) | UNKNOWN, and un-actionable | nothing reaches the coordinator to classify; the node stays non-terminal until the run's own timeout (§3.6's weakened backstop) |
+| a timeout kill (a job-level wall-clock timeout mechanism sending SIGKILL/SIGTERM) | NOT-OOM if `oom_kill` reads `0`, UNKNOWN if unreadable | same rule as above; a timeout kill is not itself OOM evidence |
+| a crash or infrastructure loss (the DO, the container, or the whole job is lost) | UNKNOWN | no evidence reaches the coordinator; same as "container never started or lost" |
+
+**Evidence source, exact (read 2026-10-03).** The agent **already** reads both counters:
+`cloud_ci_core::cgroup::CgroupReader::read_oom_kill` and `::read_memory_peak`
+(`packages/cloud-ci-core/src/cgroup.rs` lines 209-213 and 197-205), backed by
+`parse_memory_events_oom_kill` (line 111-112) and `parse_memory_peak` (line 98-106). Called
+from `cloud-ci-cli/src/agent.rs::sample_for` once at the start (lines 174-176, the baseline
+`oom_kill_at_start`) and once at the end (lines 199-204, `oom_kill_at_end`); `oom_detected =
+oom_kill_at_end > oom_kill_at_start` (`cloud_ci_core::sampler::Sampler::finish`,
+`packages/cloud-ci-core/src/sampler.rs` lines 119-123).
+
+**Path, permissions, and failure mode (option A).** `CgroupReader::new(base)` takes
+`--cgroup-path` (default `/sys/fs/cgroup`, `cloud-ci-cli/src/cli.rs` line 386).
+`CgroupReader::read` (`cgroup.rs` lines 169-174) is a plain `std::fs::read_to_string` with no
+privilege elevation - an ordinary file read inside the container's own cgroup mount. If a read
+fails (missing file, permission denied), `sample_for` propagates the error with `?`
+(`agent.rs` lines 174-176 and 199-204 both `map_err(...)?`), which **aborts the entire agent
+run before any `SubmitResourceSamples` call is made** - there is no partial batch. So under
+option A, "`memory.events` unreadable" does not produce a batch with missing fields; it
+produces no batch at all, and the node's eventual `/complete-node` (posted independently by
+`run_and_report`) carries only the job's own exit code, with no OOM evidence attached -
+UNKNOWN by construction.
+
+**When it flushes (option A).** Once, after `sample_for`'s bounded loop for `--duration-secs`
+(default 60 s), as one `SubmitResourceSamples` call. `node_status_for_exit_code` (`logic.rs`
+line 835) maps every nonzero exit code, including 137, to `Failed` - there is no OOM-awareness
+in the exit-code mapping itself; all OOM awareness is in the agent's separately-delivered batch.
+
+**Option B is new code with no precedent in the tree (`[unverified]` for the pinned runtime).**
+A spike must prove, against a real deployment, before option B is chosen:
+
+1. A second `exec()` into the container succeeds **after** the main `exec`'s process has
+   already exited non-zero. Cloudflare's Durable Object Container API page (read 2026-10-03)
+   says `exec()` "does not start a stopped container" - if the container itself (not just the
+   main process) transitions to stopped when the job's process dies, a second `exec` is
+   impossible and option B cannot work as described.
+2. The cgroup the second `exec`'s process sees is the **same** cgroup the main process ran in,
+   not a fresh one. `cgroup.rs`'s own module doc says each job's cgroup is "created fresh per
+   job" - a second process started via a separate `exec` call could plausibly get its own
+   distinct cgroup, which would read `oom_kill = 0` even if the main process was genuinely
+   OOM-killed. This must be confirmed, not assumed.
+3. `memory.events`/`memory.peak` are still readable after the main process has exited and
+   before the container is torn down - the pseudofiles are per-cgroup and typically persist
+   until the cgroup itself is removed, but the Containers runtime's exact teardown timing for
+   a `durable_object`-policy container is not documented in the pages read for this design.
+
+If the evidence cannot be read or cannot be transported to the coordinator under the chosen
+option, the result is **UNKNOWN**, and recovery stays off: the ordinary failure is recorded
+through the existing path and no retry is attempted. This is the safe failure mode.
+
 ### 1.2 Deriving the retry's identity
 
 The retry's identity is a pure function of the lineage and the observed attempt, so a replayed
