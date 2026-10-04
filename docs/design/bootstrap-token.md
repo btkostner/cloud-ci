@@ -47,7 +47,7 @@ Non-goals: the agent pull-loop and job-spec serving, non-Containers executors, a
   redeemed, revoked) is run state. It is written only inside the `RunCoordinator`; the stateless
   Worker handler for the exchange call never writes it. It forwards a redeem *request* to the
   coordinator DO (`RunCoordinatorStore`, the same route `BeginRun` and `StartJob` use,
-  `lib.rs:1194`, `:1383`) and the coordinator decides.
+  `lib.rs:1197`, `:1383`) and the coordinator decides.
 - **Inputs enqueue, coordinators decide.** The exchange handler does not trust the token's
   payload to mutate anything. It verifies the MAC (cheap, stateless, rejects garbage before any
   DO is woken) and then the coordinator re-reads its own row to decide redeem-or-reject. A
