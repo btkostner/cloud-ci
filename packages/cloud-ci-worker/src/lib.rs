@@ -406,35 +406,49 @@ async fn handle_analysis_requested(env: &Env, message: &ai_queue::AnalysisReques
         }))
         .map_err(|e| worker::Error::RustError(format!("encoding ai_insight context_json: {e}")))?;
 
-        db.prepare(
-            "INSERT INTO ai_insight \
-             (id, repo_id, run_id, kind, fingerprint, diff_hash, prompt_version, status, context_json, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, 'failure_summary', ?4, NULL, ?5, 'pending_model_call', ?6, ?7, ?7)",
-        )
-        .bind(&[
-            JsValue::from_str(&id),
-            JsValue::from_f64(message.repo_id as f64),
-            JsValue::from_str(&message.run_id),
-            JsValue::from_str(&entry.fingerprint),
-            // `ai_model_call::PROMPT_VERSION` — this round's model call
-            // (`ai_model_call_pass`) reads this row with
-            // `ai_model_call::PROMPT_SUMMARY_V1` already matching this
-            // exact version string, so a future template bump
-            // (`PROMPT_SUMMARY_V2`) never serves a stale cached insight.
-            JsValue::from_str(ai_model_call::PROMPT_VERSION),
-            JsValue::from_str(&context_json),
-            JsValue::from_f64(now_ms as f64),
-        ])?
-        .run()
-        .await?;
+        let result = db
+            .prepare(ai_queue::INSERT_INSIGHT_SQL)
+            .bind(&[
+                JsValue::from_str(&id),
+                JsValue::from_f64(message.repo_id as f64),
+                JsValue::from_str(&message.run_id),
+                JsValue::from_str(&entry.fingerprint),
+                // `ai_model_call::PROMPT_VERSION` — this round's model call
+                // (`ai_model_call_pass`) reads this row with
+                // `ai_model_call::PROMPT_SUMMARY_V1` already matching this
+                // exact version string, so a future template bump
+                // (`PROMPT_SUMMARY_V2`) never serves a stale cached insight.
+                JsValue::from_str(ai_model_call::PROMPT_VERSION),
+                JsValue::from_str(&context_json),
+                JsValue::from_f64(now_ms as f64),
+            ])?
+            .run()
+            .await?;
 
-        worker::console_log!(
-            "ai: run {} ready for model call (fingerprint {}, systemic={}) — \
-             stored ai_insight {id} with status=pending_model_call",
-            message.run_id,
-            entry.fingerprint,
-            assembled.systemic,
-        );
+        // `INSERT_INSIGHT_SQL` is `ON CONFLICT ... DO NOTHING`
+        // (migration 0021's unique index on this message's own
+        // idempotency key): a redelivery of this exact message, or a
+        // retry after a partial-insert failure on an earlier entry,
+        // changes 0 rows here rather than storing a duplicate — `changes`
+        // tells the two cases apart for the log line only; both are
+        // success.
+        let inserted = result.meta()?.and_then(|m| m.changes) == Some(1);
+        if inserted {
+            worker::console_log!(
+                "ai: run {} ready for model call (fingerprint {}, systemic={}) — \
+                 stored ai_insight {id} with status=pending_model_call",
+                message.run_id,
+                entry.fingerprint,
+                assembled.systemic,
+            );
+        } else {
+            worker::console_log!(
+                "ai: run {} fingerprint {} already has an ai_insight row (redelivered \
+                 message or retried insert) — skipping duplicate",
+                message.run_id,
+                entry.fingerprint,
+            );
+        }
     }
 
     Ok(())
@@ -713,14 +727,21 @@ const PENDING_MODEL_CALL_BATCH_LIMIT: f64 = 10.0;
 /// in its `WHERE` clause) — a row an earlier pass already moved to
 /// `'ok'` or `'invalid_output'` is never re-selected and never
 /// re-written, so re-running this pass over the same backlog never
-/// re-calls the model for an already-finished row. The one window this
-/// round does not close is two passes overlapping on the *same* row
-/// between its `SELECT` and its `UPDATE` (no claim/lock column — the
-/// same documented gap `rollup::run`/`reconcile::run` already carry for
-/// their own scanned rows); the realistic failure mode under that rare
-/// overlap is a duplicate model call for one row, not an incorrect final
-/// status, since whichever `UPDATE` commits first wins and the other's
-/// `status`-gated `UPDATE` then matches zero rows.
+/// re-calls the model for an already-finished row. Two passes
+/// overlapping on the *same* row between its `SELECT` and the model call
+/// are closed by a claim: migration 0021's `claimed_at` column is set by
+/// a conditional `UPDATE` ([`ai_queue::CLAIM_PENDING_SQL`]) before the
+/// model is ever called, guarded by `status = 'pending_model_call' AND
+/// (claimed_at IS NULL OR claimed_at <= now - lease)`. SQLite serializes
+/// concurrent writers, so of any number of passes racing this `UPDATE`
+/// for one row, exactly one sees `changes() == 1` ([`ai_queue::claim_won`])
+/// and proceeds; every other sees `0` and skips the row this pass. A
+/// pass that gets a genuine `env.AI.run()` `Err` releases its claim
+/// immediately ([`ai_queue::RELEASE_CLAIM_SQL`]) so a later pass can
+/// retry without waiting out the lease; a pass that crashes mid-call
+/// without releasing leaves the claim to expire after
+/// [`ai_queue::MODEL_CALL_CLAIM_LEASE_MS`], so a stuck claim is
+/// self-healing rather than a permanent stall.
 ///
 /// # Model-call failure vs. invalid-output — not the same thing
 ///
@@ -779,7 +800,26 @@ async fn ai_model_call_pass(env: &Env) -> Result<()> {
         .await?
         .results()?;
 
+    let now_ms = Date::now().as_millis() as i64;
     for row in rows {
+        let claimed = db
+            .prepare(ai_queue::CLAIM_PENDING_SQL)
+            .bind(&[
+                JsValue::from_str(&row.id),
+                JsValue::from_f64(now_ms as f64),
+                JsValue::from_f64(ai_queue::MODEL_CALL_CLAIM_LEASE_MS as f64),
+            ])?
+            .run()
+            .await?;
+        if !ai_queue::claim_won(claimed.meta()?.and_then(|m| m.changes)) {
+            worker::console_log!(
+                "ai: ai_insight {} already claimed by another pass (or claimed and finished \
+                 since this pass's SELECT), skipping this pass",
+                row.id,
+            );
+            continue;
+        }
+
         let context: ai_model_call::StoredInsightContext =
             match serde_json::from_str(&row.context_json) {
                 Ok(c) => c,
@@ -806,6 +846,7 @@ async fn ai_model_call_pass(env: &Env) -> Result<()> {
                      validation failure — leaving status=pending_model_call for a later pass): {e}",
                     row.id,
                 );
+                release_claim(&db, &row.id).await;
                 continue;
             }
         };
@@ -836,6 +877,34 @@ async fn ai_model_call_pass(env: &Env) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Releases [`ai_queue::CLAIM_PENDING_SQL`]'s claim after a genuine
+/// `env.AI.run()` network/binding failure, so a later pass can retry this
+/// row without waiting out [`ai_queue::MODEL_CALL_CLAIM_LEASE_MS`].
+/// Best-effort: an error here only means the claim's lease expires
+/// naturally instead of being released early, so it is logged, not
+/// propagated.
+async fn release_claim(db: &worker::D1Database, insight_id: &str) {
+    let stmt = match db
+        .prepare(ai_queue::RELEASE_CLAIM_SQL)
+        .bind(&[JsValue::from_str(insight_id)])
+    {
+        Ok(s) => s,
+        Err(e) => {
+            worker::console_log!(
+                "ai: binding claim-release params for ai_insight {insight_id} failed (will \
+                 self-heal after the lease expires): {e}",
+            );
+            return;
+        }
+    };
+    if let Err(e) = stmt.run().await {
+        worker::console_log!(
+            "ai: releasing claim on ai_insight {insight_id} failed (will self-heal after the \
+             lease expires): {e}",
+        );
+    }
 }
 
 /// The retried `env.AI.run()` call (ai.md: "retried once with the
@@ -870,6 +939,7 @@ async fn retry_once(
                  error, not a validation failure — leaving status=pending_model_call for a \
                  later pass): {e}",
             );
+            release_claim(db, insight_id).await;
             return Ok(());
         }
     };
