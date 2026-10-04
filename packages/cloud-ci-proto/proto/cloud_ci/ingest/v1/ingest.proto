@@ -313,9 +313,13 @@ message ResolveShardPlanResponse {
 // Durable Object route) field-for-field; `merge_on_failure` must be one of
 // `"if_any_passed"` (default), `"always"`, or `"never"`
 // (`coordinator::logic::MergeOnFailure::from_db_str`). Idempotent: a
-// redelivered call for an already-registered `job_name` is a clean no-op,
-// never a conflict — matching the internal route's own documented
-// idempotency rule.
+// redelivered call carrying the identical config for an already-registered
+// `job_name` is a clean no-op; a different `expected_total`/`fail_fast`/
+// `merge_on_failure` for that same `job_name` is a conflict, never a
+// silent overwrite (`coordinator::logic::resolve_register_shard_group`'s
+// own doc comment has the exact decision rule). `expected_total` and
+// `job_name` are bounded and validated server-side -- see
+// `coordinator::logic::validate_register_shard_group`.
 message RegisterShardGroupRequest {
   string run_id = 1;
   string job_name = 2;

@@ -3570,12 +3570,15 @@ impl RunCoordinator {
     /// `registerShardGroup(job_name, expected_total, fail_fast,
     /// merge_on_failure)` — module docs' "Shard groups / merge barrier"
     /// section, parallelization.md bullet 1. Idempotent: a redelivered
-    /// call for an already-registered `job_name` is a clean no-op
-    /// (existing config untouched), never a conflict — nothing in
-    /// parallelization.md documents a config-mismatch rejection for this
-    /// call the way `StartJob`'s `shard_total`/`BeginRun`'s
-    /// `expect_jobs` do, so this stays deliberately permissive rather
-    /// than inventing an undocumented conflict rule.
+    /// call carrying the *identical* config for an already-registered
+    /// `job_name` is a clean no-op (existing config untouched). A
+    /// redelivered call for the same `job_name` carrying a *different*
+    /// `expected_total`/`fail_fast`/`merge_on_failure` is a 409 conflict,
+    /// never a silent overwrite -- same "same shape, different domain"
+    /// pattern `StartJob`'s `shard_total`/`BeginRun`'s `expect_jobs`
+    /// already use for their own conflicting-redelivery cases
+    /// (`logic::resolve_register_shard_group`'s own doc comment has the
+    /// full idempotency/conflict decision).
     async fn handle_register_shard_group(
         &self,
         sql: &SqlStorage,
@@ -3593,7 +3596,17 @@ impl RunCoordinator {
         {
             return error_response(400, "invalid register_shard_group request");
         }
-        match logic::resolve_register_shard_group(read_job_group(sql, &req.job_name)?.is_some()) {
+        let existing = read_job_group(sql, &req.job_name)?.map(|row| logic::ShardGroupConfig {
+            expected_total: row.expected_total as u32,
+            fail_fast: row.fail_fast != 0,
+            merge_on_failure: row.merge_on_failure,
+        });
+        let incoming = logic::ShardGroupConfig {
+            expected_total: req.expected_total,
+            fail_fast: req.fail_fast,
+            merge_on_failure: req.merge_on_failure.clone(),
+        };
+        match logic::resolve_register_shard_group(existing.as_ref(), &incoming) {
             logic::RegisterShardGroupDecision::Insert => {
                 insert_job_group(
                     sql,
@@ -3604,6 +3617,12 @@ impl RunCoordinator {
                 )?;
             }
             logic::RegisterShardGroupDecision::AlreadyRegistered => {}
+            logic::RegisterShardGroupDecision::Conflict => {
+                return error_response(
+                    409,
+                    "a different shard group config was already registered for this job_name",
+                );
+            }
         }
         Response::from_json(&RegisterShardGroupOutcome {
             job_name: req.job_name,

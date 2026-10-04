@@ -1309,10 +1309,15 @@ async fn handle_start_job(
 /// itself only resolves routing/auth here — the forwarded internal
 /// request carries just `job_name`/`expected_total`/`fail_fast`/
 /// `merge_on_failure`, identical in shape to the internal route's own
-/// request, and inherits that route's idempotency (a redelivered call for
-/// an already-registered `job_name` is a clean no-op). `validate_register_shard_group`
-/// (`coordinator::logic`) rejects a malformed call before it ever reaches
-/// the DO: an empty or over-length `job_name`, a `job_name` containing a
+/// request, and inherits that route's idempotency: a redelivered call
+/// carrying the *identical* config for an already-registered `job_name`
+/// is a clean no-op, but a different `expected_total`/`fail_fast`/
+/// `merge_on_failure` for that same `job_name` is a
+/// `Code::FailedPrecondition` conflict, never a silent overwrite
+/// (`logic::resolve_register_shard_group`'s own doc comment).
+/// `validate_register_shard_group` (`coordinator::logic`) rejects a
+/// malformed call before it ever reaches the DO: an empty or over-length
+/// `job_name`, a `job_name` containing a
 /// control character, `expected_total` of `0` or over
 /// `cloud_ci_core::split::MAX_SHARDS`, or an unknown `merge_on_failure`
 /// value -- all `Code::InvalidArgument`.

@@ -1573,34 +1573,55 @@ pub fn validate_register_shard_group(
     Ok(())
 }
 
+/// A `job_group` row's merge-barrier configuration, for comparing an
+/// incoming `RegisterShardGroup` call against whatever is already stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardGroupConfig {
+    pub expected_total: u32,
+    pub fail_fast: bool,
+    pub merge_on_failure: String,
+}
+
 /// What `registerShardGroup` should do, given whether a `job_group` row
-/// already exists for this `job_name` — `coordinator::mod::
-/// handle_register_shard_group`'s own doc comment: "a redelivered call
-/// for an already-registered `job_name` is a clean no-op (existing config
-/// untouched), never a conflict — nothing in parallelization.md documents
-/// a config-mismatch rejection the way `StartJob`'s `shard_total`/
-/// `BeginRun`'s `expect_jobs` do". Deliberately total over only
-/// `existing`, not the incoming fields: a reordered or duplicate
-/// redelivery (same `job_name`, any field values, arriving in any order)
-/// always resolves to [`AlreadyRegistered`](RegisterShardGroupDecision::AlreadyRegistered)
-/// once a row exists, so two concurrent `RegisterShardGroup` calls racing
-/// for the same never-yet-registered group can never both decide
-/// [`Insert`](RegisterShardGroupDecision::Insert) against a row that only
-/// one of them actually created.
+/// already exists for this `job_name` and, if so, its stored config.
+/// `coordinator::mod::handle_register_shard_group`'s own doc comment: a
+/// redelivered call carrying the *identical* config is a clean no-op
+/// (existing config untouched); a redelivered call for the same
+/// `job_name` carrying a *different* `expected_total`/`fail_fast`/
+/// `merge_on_failure` is a conflict, same "same shape, different domain"
+/// pattern [`resolve_submit_resource_samples`]/[`resolve_shard_terminal`]
+/// already use for their own identity keys -- a stale or buggy caller
+/// must never silently rewrite an already-registered merge barrier out
+/// from under shards that may already be reporting against it.
+/// Deliberately total over only `existing`, not a third "which call
+/// arrived first" input: a reordered or duplicate redelivery (same
+/// `job_name`, same field values, arriving in any order) always resolves
+/// to [`AlreadyRegistered`](RegisterShardGroupDecision::AlreadyRegistered)
+/// once a matching row exists, so two concurrent `RegisterShardGroup`
+/// calls racing for the same never-yet-registered group can never both
+/// decide [`Insert`](RegisterShardGroupDecision::Insert) against a row
+/// that only one of them actually created.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegisterShardGroupDecision {
     /// No `job_group` row exists yet for this `job_name` — the caller
     /// should insert one.
     Insert,
-    /// A row already exists — a no-op; its config is left untouched.
+    /// A row already exists with an identical config — a no-op; nothing
+    /// is written.
     AlreadyRegistered,
+    /// A row already exists with a *different* config — rejected, never
+    /// silently overwritten.
+    Conflict,
 }
 
-pub fn resolve_register_shard_group(existing: bool) -> RegisterShardGroupDecision {
-    if existing {
-        RegisterShardGroupDecision::AlreadyRegistered
-    } else {
-        RegisterShardGroupDecision::Insert
+pub fn resolve_register_shard_group(
+    existing: Option<&ShardGroupConfig>,
+    incoming: &ShardGroupConfig,
+) -> RegisterShardGroupDecision {
+    match existing {
+        None => RegisterShardGroupDecision::Insert,
+        Some(existing) if existing == incoming => RegisterShardGroupDecision::AlreadyRegistered,
+        Some(_) => RegisterShardGroupDecision::Conflict,
     }
 }
 
@@ -3963,35 +3984,106 @@ mod tests {
         );
     }
 
+    fn test_config(
+        expected_total: u32,
+        fail_fast: bool,
+        merge_on_failure: &str,
+    ) -> ShardGroupConfig {
+        ShardGroupConfig {
+            expected_total,
+            fail_fast,
+            merge_on_failure: merge_on_failure.to_string(),
+        }
+    }
+
     #[test]
     fn resolve_register_shard_group_inserts_when_no_row_exists() {
+        let incoming = test_config(4, false, "if_any_passed");
         assert_eq!(
-            resolve_register_shard_group(false),
+            resolve_register_shard_group(None, &incoming),
             RegisterShardGroupDecision::Insert
         );
     }
 
     #[test]
-    fn resolve_register_shard_group_is_a_noop_for_a_duplicate_delivery() {
+    fn resolve_register_shard_group_is_a_noop_for_an_identical_redelivery() {
+        let existing = test_config(4, false, "if_any_passed");
+        let incoming = test_config(4, false, "if_any_passed");
         assert_eq!(
-            resolve_register_shard_group(true),
+            resolve_register_shard_group(Some(&existing), &incoming),
             RegisterShardGroupDecision::AlreadyRegistered
         );
     }
 
     #[test]
-    fn resolve_register_shard_group_reordered_delivery_still_resolves_to_the_same_decision() {
+    fn resolve_register_shard_group_reordered_identical_delivery_still_resolves_to_the_same_decision()
+     {
         // A "reordered" delivery here means: by the time either call is
         // actually evaluated against storage, a row may or may not exist
         // yet, regardless of which `RegisterShardGroup` call was issued
         // first by the caller -- the decision depends only on current
-        // storage state (`existing`), never on delivery order, so
-        // evaluating the same `existing` twice (simulating two redelivered
-        // calls racing to observe the same storage snapshot) always agrees.
-        let first = resolve_register_shard_group(true);
-        let second = resolve_register_shard_group(true);
+        // storage state (`existing`) compared against `incoming`, never
+        // on delivery order, so evaluating the same `(existing,
+        // incoming)` pair twice (simulating two redelivered calls racing
+        // to observe the same storage snapshot) always agrees.
+        let existing = test_config(4, false, "if_any_passed");
+        let incoming = test_config(4, false, "if_any_passed");
+        let first = resolve_register_shard_group(Some(&existing), &incoming);
+        let second = resolve_register_shard_group(Some(&existing), &incoming);
         assert_eq!(first, second);
         assert_eq!(first, RegisterShardGroupDecision::AlreadyRegistered);
+    }
+
+    #[test]
+    fn resolve_register_shard_group_conflicts_on_a_different_expected_total() {
+        let existing = test_config(4, false, "if_any_passed");
+        let incoming = test_config(8, false, "if_any_passed");
+        assert_eq!(
+            resolve_register_shard_group(Some(&existing), &incoming),
+            RegisterShardGroupDecision::Conflict
+        );
+    }
+
+    #[test]
+    fn resolve_register_shard_group_conflicts_on_a_different_fail_fast() {
+        let existing = test_config(4, false, "if_any_passed");
+        let incoming = test_config(4, true, "if_any_passed");
+        assert_eq!(
+            resolve_register_shard_group(Some(&existing), &incoming),
+            RegisterShardGroupDecision::Conflict
+        );
+    }
+
+    #[test]
+    fn resolve_register_shard_group_conflicts_on_a_different_merge_on_failure() {
+        let existing = test_config(4, false, "if_any_passed");
+        let incoming = test_config(4, false, "always");
+        assert_eq!(
+            resolve_register_shard_group(Some(&existing), &incoming),
+            RegisterShardGroupDecision::Conflict
+        );
+    }
+
+    #[test]
+    fn resolve_register_shard_group_conflict_never_overwrites_the_stored_config() {
+        // A conflicting call followed by a later call identical to the
+        // *original* stored config must still resolve from that
+        // untouched stored row, not from whatever the conflicting call
+        // tried to write -- i.e. the conflict decision alone (which this
+        // pure function returns) is what keeps the caller from ever
+        // calling `insert_job_group` on it; re-evaluating against the
+        // same still-original `existing` proves nothing was mutated.
+        let existing = test_config(4, false, "if_any_passed");
+        let conflicting = test_config(8, false, "if_any_passed");
+        assert_eq!(
+            resolve_register_shard_group(Some(&existing), &conflicting),
+            RegisterShardGroupDecision::Conflict
+        );
+        let identical_to_original = test_config(4, false, "if_any_passed");
+        assert_eq!(
+            resolve_register_shard_group(Some(&existing), &identical_to_original),
+            RegisterShardGroupDecision::AlreadyRegistered
+        );
     }
 
     fn row(idx: u32, attempt: u32, status: ShardTerminalStatus) -> ShardStateRow {
