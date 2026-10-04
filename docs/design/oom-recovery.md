@@ -91,7 +91,8 @@ decided. It must ship **separately**, with owner sign-off, **before** any OOM wo
 false. Any real job larger than a trivial script is likely to be OOM-killed at `lite`, which is
 also why trigger design (H1) matters.
 
-**Cost and quota impact of fixing it (this is not an inert change):**
+**Cost and quota impact of opting in to an explicit size (Stage 0's code ships inert by default,
+but opting a deployment in is not an inert change - see "Rollout gate and rollback"):**
 
 * Setting an explicit size changes the memory and vCPU of every managed node. Moving the default
   from `lite` to `standard-4` is a 48x memory increase per node (256 MiB to 12 GiB) and 64x vCPU
@@ -241,9 +242,9 @@ before any status write happens at all (§1.1 option B, T1/T3). Under option A, 
 NOT satisfied by default (N5):** `handle_complete_node`'s existing, unconditional path already
 records the failure before the agent's batch can arrive (the same ordering problem H1's own
 problem statement opens with), so evaluating evidence "no later than" that write would require
-Q11's "hold" option, which - under A specifically - is the one shape with a non-additive cost
-(changing `handle_complete_node`, §6.2's "Holding a failure write" discussion), not something
-this design gets for free by choosing A.
+Q11's "hold" option, which - under A specifically - is the one shape that requires changing
+`handle_complete_node` (§6.2's "Holding a failure write" discussion) and so is not additive;
+the other Q11 shapes do not.
 
 **Trigger classification: OOM / NOT-OOM / UNKNOWN (G1).** Whichever H1 option is chosen,
 classifying one failed node's evidence must be total and three-valued, never a bare boolean:
@@ -279,7 +280,7 @@ more than the kernel had incremented it, submitted that value, and the coordinat
 timestamp or correlation to tell "this 0 is real" from "this 0 is stale". This is a real
 limitation of option A's fixed-window evidence collection, not a labeling choice this design
 can fix by itself; a design that widened the window to the job's full lifetime (H1 option A's
-own "(i)" variant) would close this gap for A, at the stated cost in §1.1.
+own "(i)" variant) would close this gap for A, with the consequences stated in §1.1.
 
 **Evidence source, exact (read 2026-10-03).** The agent **already** reads both counters:
 `cloud_ci_core::cgroup::CgroupReader::read_oom_kill` and `::read_memory_peak`
@@ -364,8 +365,8 @@ A" problem statement above). Whichever H1 option is chosen, this design needs on
   reached, that node is left `Running` (or un-classified, under the defer shape) with no
   further event to resolve it - closing the run does not itself resolve the window. **Whether
   to add a rule resolving every still-deferred or still-unclassified `runner_auto` node at run
-  close (and what it resolves to - most conservatively, record the ordinary failure with no
-  retry, the fail-closed default this design uses elsewhere) is itself an owner question where
+  close (one candidate: record the ordinary failure with no
+  retry) is itself an owner question where
   it is a genuine policy choice, not something this revision decides** (§9, "run-close
   resolution for a deferred node").
 
@@ -481,20 +482,21 @@ passes `None` today.
   attribution only, not OOM detection; whether to enforce it on B is the same Q14 question. The
   current size is read from `node.size` (§1.1), not from `--instance-type`, under every option.
 
-**Unresolved technical prerequisite: the `--instance-type` ban is not implementable as stated
-today (F5).** `handle_start_node` is specified above to reject a `runner_auto` command
-containing `--instance-type` at all - but the shipped agent hard-fails immediately without
-it: `cloud-ci-cli/src/agent.rs` lines 110-113 return `AgentError::new("resolve instance type",
-"--instance-type is required")` when the flag is absent, and `cli.rs` lines 424-425 declare it
-as a flag-only argument (`#[arg(long = "instance-type")] pub instance_type: Option<String>`,
-no corresponding env var anywhere in `identity.rs` or `agent.rs`, unlike `--attempt`/
-`--node-id`). As specified, banning the flag from a `runner_auto` command's command line makes
-that command unable to run `cloud-ci agent` at all, not merely unable to report an accurate
-size. **This ban is unimplementable until the agent gains an env fallback for
-`--instance-type`** (the same pattern `CLOUD_CI_SHARD_ATTEMPT`/`CLOUD_CI_NODE_ID` already use)
-- that fallback is a technical prerequisite (see "Technical prerequisites before
-implementation" after §8), not a Q14 policy choice; Q14 itself only decides whether the ban
-additionally applies under option B once the prerequisite exists.
+**Technical prerequisite for the `--instance-type` ban (F5):** the ban applies only on the ban
+branch of Q14, and on that branch `handle_start_node` is specified above to reject a
+`runner_auto` command containing `--instance-type` at all. The shipped agent hard-fails
+without the flag: `cloud-ci-cli/src/agent.rs` lines 110-113 return
+`AgentError::new("resolve instance type", "--instance-type is required")` when it is absent,
+and `cli.rs` lines 424-425 declare it as a flag-only argument
+(`#[arg(long = "instance-type")] pub instance_type: Option<String>`, no corresponding env var
+anywhere in `identity.rs` or `agent.rs`, unlike `--attempt`/`--node-id`). So on the ban branch,
+banning the flag makes that command unable to run `cloud-ci agent` at all, not merely unable
+to report an accurate size. **The ban branch therefore requires the agent to gain an env
+fallback for `--instance-type` first** (the same pattern `CLOUD_CI_SHARD_ATTEMPT`/
+`CLOUD_CI_NODE_ID` already use); that fallback is a technical prerequisite (see "Technical
+prerequisites before implementation" after §8). Q14 itself is the policy choice between the
+ban and teaching the agent an env fallback, and whether the ban additionally applies under
+option B.
 * `StartNodeRequest` gains `shard_attempt: Option<u32>`, `runner_auto` (§5.1) and the instance
   size; `JobSpec` (`executor.rs`) gains the same; all feed `spec_hash`.
 
@@ -728,17 +730,18 @@ The order is already encoded in `logic::next_oom_effect_excluding` and is kept v
 
 1. `MarkOldTerminal`: mark the decision's target node `failed`, `closed_by = 'oom'`, result
    `{"error":"oom", ...}` (naming the configured max and the measured peak, "unknown" if `None`,
-   for `failed_at_max`). **This overwrites, and does not preserve, whatever completion payload
+   **This overwrites, and does not preserve, whatever completion payload
    (`exit_code`, `stdout`, `stderr`) `run_and_report` already wrote to `result` (F2) -**
    `node_container.rs` lines 325-350 posts that payload on every `/complete-node` call
    regardless of exit reason, and under option A's upgrade rule (§3.2) the node's `result` at
    the time `MarkOldTerminal` runs already holds exactly that output. The `oom_decision`
-   schema (§2.2) has no column to carry it either. **This is a stated design choice, not an
-   oversight: the job's own stdout/stderr - often exactly what an operator wants when
-   diagnosing an OOM - is lost at the moment a node is marked for recovery**, under both H1
-   options. A future revision that wants to preserve it would need either a column on
+   schema (§2.2) has no column to carry it either. **This is what the design as written does,
+   stated explicitly rather than left implicit: the job's own stdout/stderr - often exactly
+   what an operator wants when diagnosing an OOM - is lost at the moment a node is marked for
+   recovery**, under both H1 options. Whether to preserve it is not decided by this revision;
+   it would need either a column on
    `oom_decision` or a merge (`result = {"error": "oom", ..., "original": <prior result>}`)
-   instead of an overwrite; this design does not do either.
+   instead of an overwrite; this design does neither.
 2. `StopOld`: `stop_node_container(target_node_id, target.physical_address)`.
 3. `InsertRetry` (retry only): `insert_node` with the §1.2 id, `runner_auto = 1`, `size = to_size`,
    `shard_attempt = observed_attempt + 1`.
@@ -1265,7 +1268,7 @@ Each stage is independently shippable and leaves the tree green (`mise run check
 is inert until the last stage: `OOM_RECOVERY` defaults off and `runner_auto` is rejected 422
 while off (§5.1).
 
-0. **Stage 0 (separate change, owner sign-off, Q1): managed nodes stop running at lite.** Pass an
+0. **Stage 0 (separate change, owner sign-off, Q1): managed nodes' running size becomes explicit.** Pass an
    explicit `instance` through `JobSpec` to `set_instance`, gated by the deployment setting
    (G4): the shipped code's own default is unchanged (`lite`, unless a deployment opts in).
    **The code itself is inert; an owner opting a deployment in is not (N4)** - the cost and
@@ -1323,16 +1326,17 @@ answered - resolving every owner decision does not by itself make this design im
    the tree" discussion already lists this and the spike it requires (whether a second `exec`
    succeeds after the main process exited, whether it sees the same cgroup, and whether the
    pseudofiles are still readable); restated here because it blocks option B specifically, the
-   same way the other four entries block parts of every option. `[unverified]`.
+   same way the other entries block parts of every option. `[unverified]`.
 3. **The agent launch model and cgroup sharing (N7, §1.1).** How `cloud-ci agent` is launched
    relative to the job command it measures, and whether they share one cgroup, is not
    specified anywhere in this design or in the existing code (`NodeContainer::handle_start`
    execs exactly one `command: &[String]`). Blocks option A's evidence collection and every
    trigger classification that assumes the agent measured the right process.
-4. **An env fallback for `--instance-type` (F5, §1.3).** The command-template contract bans
-   the flag from a `runner_auto` command, but the shipped agent hard-fails without it
-   (`agent.rs` lines 110-113) and has no env fallback today, unlike `--attempt`/`--node-id`.
-   Blocks the command-template contract (§1.3) for every H1 option.
+4. **An env fallback for `--instance-type` (F5, §1.3).** Needed wherever the agent loses the
+   flag: the command-template contract's ban branch (Q14) bans the flag from a `runner_auto`
+   command, but the shipped agent hard-fails without it (`agent.rs` lines 110-113) and has no
+   env fallback today, unlike `--attempt`/`--node-id`. Blocks the ban branch of Q14 (§1.3);
+   the other Q14 branch is this fallback.
 5. **A new additive proto field for the explicit UNKNOWN marker (F4, §1.1).** `oom_detected`
    (a required `bool`) and `memory_peak_bytes` cannot represent "evidence unavailable"; a new
    field is required, and does not exist on `SubmitResourceSamplesRequest` or
@@ -1351,7 +1355,7 @@ answered - resolving every owner decision does not by itself make this design im
 
 ## 9. Open questions needing an owner decision
 
-* **Q1 (blocking).** `NodeContainer` starts every node on `lite` (256 MiB) today. Confirm it is
+* **Q1 (blocking).** `NodeContainer` starts every node on `lite` (256 MiB) today. Confirm whether that is
   a bug, and pick the value Stage 0's opt-in gate (G4) should recommend deployments set
   (`standard-4` to match the advertised capability, a smaller size, or `runners.default`) -
   **not** the shipped code's own default, which stays `lite` regardless (N4) - with the cost
@@ -1411,7 +1415,7 @@ answered - resolving every owner decision does not by itself make this design im
 * **Q18 (new, F7).** Whichever window shape Q17 picks: how long (the configured window before
   `min(window, remaining_run_time)` applies, F6), and what resolves a `runner_auto` node still
   deferred or still un-classified when the run closes first (F6) - record the ordinary failure
-  with no retry (this design's fail-closed default elsewhere), or something else?
+  with no retry (the ordinary-failure candidate), or something else?
 
 ## 10. Contradictions found in the existing docs and code
 
