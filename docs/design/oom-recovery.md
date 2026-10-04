@@ -730,6 +730,7 @@ The order is already encoded in `logic::next_oom_effect_excluding` and is kept v
 
 1. `MarkOldTerminal`: mark the decision's target node `failed`, `closed_by = 'oom'`, result
    `{"error":"oom", ...}` (naming the configured max and the measured peak, "unknown" if `None`,
+   for `failed_at_max`).
    **This overwrites, and does not preserve, whatever completion payload
    (`exit_code`, `stdout`, `stderr`) `run_and_report` already wrote to `result` (F2) -**
    `node_container.rs` lines 325-350 posts that payload on every `/complete-node` call
