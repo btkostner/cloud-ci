@@ -306,8 +306,23 @@ A" problem statement above). Whichever H1 option is chosen, this design needs on
     would have to learn to withhold its write for `runner_auto` nodes, which it does not do
     today. Under option B it is unnecessary, since B's evidence is already synchronous with
     the completion it accompanies (§6.2).
-  Either shape needs its own deadline, separate from the run timeout (F6), stated by the owner
-  alongside H1 and Q11 (§9, "mechanism and window length").
+  **The window's deadline is bounded by the run, not independent of it (F6).**
+  `resolve_timeout_seconds` (`logic.rs` line 517) accepts any positive requested timeout up to
+  `MAX_TIMEOUT_SECONDS` - a run can legitimately request a timeout shorter than any fixed
+  window (the existing test `resolve_timeout_seconds_passes_through_a_requested_value_under_
+  the_max` accepts `3` seconds unchanged) - so a fixed window cannot be assumed "strictly
+  shorter than the run timeout". The window must instead be computed as
+  `min(configured_window, remaining_run_time)` at the moment it would be armed, exactly like
+  `clamp_retry_delay_to_deadline` already does for the OOM-effect retry delay (§3.4). This
+  still leaves a gap: `handle_close_run` (`mod.rs` line 2289) never reads or stops any node
+  (§3.6's own "C1" finding), so if the run closes before a windowed node's deadline is
+  reached, that node is left `Running` (or un-classified, under the defer shape) with no
+  further event to resolve it - closing the run does not itself resolve the window. **Whether
+  to add a rule resolving every still-deferred or still-unclassified `runner_auto` node at run
+  close (and what it resolves to - most conservatively, record the ordinary failure with no
+  retry, the fail-closed default this design uses elsewhere) is itself an owner question where
+  it is a genuine policy choice, not something this revision decides** (§9, "run-close
+  resolution for a deferred node").
 
 None of these exist today. The upload and the late-upgrade-bound window shape are additive (an
 agent code change for the first, a coordinator timer for the second, neither touching an
