@@ -1983,6 +1983,13 @@ impl RunCoordinator {
         if req.attempt == 0 {
             return error_response(400, "attempt must be 1 or greater");
         }
+        if req
+            .node_id
+            .as_deref()
+            .is_some_and(|n| logic::validate_node_id(n).is_err())
+        {
+            return error_response(400, "node_id is invalid");
+        }
 
         let samples: Vec<logic::ResourceSampleInput> = req
             .samples

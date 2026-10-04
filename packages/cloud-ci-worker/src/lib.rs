@@ -1555,6 +1555,10 @@ async fn handle_submit_resource_samples(
     bearer: Option<&str>,
 ) -> std::result::Result<Vec<u8>, ConnectError> {
     let req: SubmitResourceSamplesRequest = codec.decode(body)?;
+    if let Some(node_id) = req.node_id.as_deref() {
+        coordinator::logic::validate_node_id(node_id)
+            .map_err(|e| ConnectError::new(Code::InvalidArgument, e.to_string()))?;
+    }
     let claims = authenticate_ingest_bearer(env, bearer)?;
     let identity = resolve_job_identity(env, &req.job_id).await?;
     require_matching_identity(&claims, &identity)?;

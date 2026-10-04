@@ -1141,6 +1141,52 @@ pub fn build_sample_events(
         .collect()
 }
 
+/// `SubmitResourceSamplesRequest.node_id`'s documented bound (`cloud-ci-proto`):
+/// at most 256 bytes, no control characters.
+pub const MAX_NODE_ID_BYTES: usize = 256;
+
+/// Why [`validate_node_id`] rejected a `node_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeIdError {
+    /// Over [`MAX_NODE_ID_BYTES`] bytes.
+    TooLong { len: usize },
+    /// Contains a Unicode control character (`char::is_control`) --
+    /// embedding one in a node id that later appears in logs/responses
+    /// risks terminal/log injection.
+    ControlCharacter,
+}
+
+impl std::fmt::Display for NodeIdError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NodeIdError::TooLong { len } => write!(
+                f,
+                "node_id must be at most {MAX_NODE_ID_BYTES} bytes, got {len}"
+            ),
+            NodeIdError::ControlCharacter => {
+                write!(f, "node_id must not contain control characters")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NodeIdError {}
+
+/// Validates `node_id` against its own documented bound. An empty string
+/// is always valid -- it already folds to "no node" in
+/// [`resource_sample_batch_content_hash`], same as an absent value.
+pub fn validate_node_id(node_id: &str) -> Result<(), NodeIdError> {
+    if node_id.is_empty() {
+        return Ok(());
+    }
+    if node_id.len() > MAX_NODE_ID_BYTES {
+        return Err(NodeIdError::TooLong { len: node_id.len() });
+    }
+    if node_id.chars().any(|c| c.is_control()) {
+        return Err(NodeIdError::ControlCharacter);
+    }
+    Ok(())
+}
 // ---------------------------------------------------------------------------
 // `SubmitResourceSamples` idempotency (`resource_sample_batch`'s DO row,
 // keyed by `(job_id, shard_index, attempt)` — this execution identity
@@ -2604,6 +2650,69 @@ mod tests {
             1, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0,
         ];
         assert_ne!(a_with_node, pinned_no_node);
+    }
+
+    #[test]
+    fn validate_node_id_accepts_empty() {
+        assert_eq!(validate_node_id(""), Ok(()));
+    }
+
+    #[test]
+    fn validate_node_id_accepts_a_normal_value() {
+        assert_eq!(validate_node_id("shard:job-1:0:1"), Ok(()));
+    }
+
+    #[test]
+    fn validate_node_id_accepts_exactly_the_max_length() {
+        let node_id = "a".repeat(MAX_NODE_ID_BYTES);
+        assert_eq!(validate_node_id(&node_id), Ok(()));
+    }
+
+    #[test]
+    fn validate_node_id_rejects_one_byte_over_the_max() {
+        let node_id = "a".repeat(MAX_NODE_ID_BYTES + 1);
+        assert_eq!(
+            validate_node_id(&node_id),
+            Err(NodeIdError::TooLong {
+                len: MAX_NODE_ID_BYTES + 1
+            })
+        );
+    }
+
+    #[test]
+    fn validate_node_id_measures_length_in_bytes_not_chars() {
+        // Each "é" is 2 UTF-8 bytes -- 129 of them is 258 bytes, over the
+        // 256-byte bound, even though `.chars().count()` would say 129.
+        let node_id = "é".repeat(129);
+        assert_eq!(node_id.len(), 258);
+        assert_eq!(
+            validate_node_id(&node_id),
+            Err(NodeIdError::TooLong { len: 258 })
+        );
+    }
+
+    #[test]
+    fn validate_node_id_rejects_a_nul_byte() {
+        assert_eq!(
+            validate_node_id("shard\0job"),
+            Err(NodeIdError::ControlCharacter)
+        );
+    }
+
+    #[test]
+    fn validate_node_id_rejects_a_newline() {
+        assert_eq!(
+            validate_node_id("shard\njob"),
+            Err(NodeIdError::ControlCharacter)
+        );
+    }
+
+    #[test]
+    fn validate_node_id_rejects_a_del_character() {
+        assert_eq!(
+            validate_node_id("shard\u{7f}job"),
+            Err(NodeIdError::ControlCharacter)
+        );
     }
 
     #[test]
