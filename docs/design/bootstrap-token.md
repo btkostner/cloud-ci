@@ -32,12 +32,12 @@ Non-goals: the agent pull-loop and job-spec serving, non-Containers executors, a
 | `exec_in_container` calls `container.exec(&cmd, None)`: no env option is ever passed | `node_container.rs:356-362` |
 | Duplicate `startNode` is absorbed by `resolve_start_node`; `AlreadyStarted` never calls `start_node_container` again. The node row is inserted **before** the container call | `coordinator/mod.rs:2716-2790`, `:2739`, `insert_node` `:5263` |
 | `node` rows live in the `RunCoordinator`'s own SQLite and are projected to D1 `nodes` | `coordinator/mod.rs:4350` (`ensure_schema`), `:4467`; `migrations/0010_nodes.sql` |
-| The only mint of a run-bound credential is `BeginRun`: authenticate (OIDC or scoped API token) then `ingest_token::mint` | `lib.rs:1069-1120`, mint at `:1106` |
-| Ingest token = `<b64url(claims)>.<b64url(HMAC-SHA256)>`, claims `{typ:"ingest", scope:["ingest:write"], repo_id, run_id, exp}`, TTL 3600 s, key = `INGEST_TOKEN_SECRET` used directly | `ingest_token.rs:28-38`, `:57-80`, `:100-135`; key `lib.rs:1232-1240` |
+| The only mint of a run-bound credential is `BeginRun`: authenticate (OIDC or scoped API token) then `ingest_token::mint` | `lib.rs:1164-1211`, mint at `:1201` |
+| Ingest token = `<b64url(claims)>.<b64url(HMAC-SHA256)>`, claims `{typ:"ingest", scope:["ingest:write"], repo_id, run_id, exp}`, TTL 3600 s, key = `INGEST_TOKEN_SECRET` used directly | `ingest_token.rs:28-38`, `:57-80`, `:100-135`; key `lib.rs:1327-1335` |
 | `verify` rejects a bad MAC, `typ != "ingest"`, missing `ingest:write`, expired | `ingest_token.rs:100-135` (`:122`, `:127`) |
-| Every run-scoped RPC: `authenticate_ingest_bearer` then `resolve_run_identity` (D1 `runs` row) then `require_matching_identity` (both `repo_id` and `run_id` must match, else `PermissionDenied`) | `lib.rs:1242-1262`, `:1265-1276`, `:1614-1645`, callers `:1285`, `:1337`, `:1517-1597` |
-| Raw part `PUT` re-verifies and compares claim `repo_id`/`run_id` to the upload's owner | `lib.rs:1800-1830` |
-| Scoped API tokens: random `cc_tok_` value, only `sha256` stored, admin-only issuance behind session + role check | `token_issuance.rs:97`, `:313`, `:333`; `lib.rs:2028-2105`; `api_tokens.rs:49`; `migrations/0005_api_tokens.sql` |
+| Every run-scoped RPC: `authenticate_ingest_bearer` then `resolve_run_identity` (D1 `runs` row) then `require_matching_identity` (both `repo_id` and `run_id` must match, else `PermissionDenied`) | `lib.rs:1337-1357`, `:1360-1371`, `:1709-1740`, callers `:1380`, `:1432`, `:1612-1692` |
+| Raw part `PUT` re-verifies and compares claim `repo_id`/`run_id` to the upload's owner | `lib.rs:1895-1925` |
+| Scoped API tokens: random `cc_tok_` value, only `sha256` stored, admin-only issuance behind session + role check | `token_issuance.rs:97`, `:313`, `:333`; `lib.rs:2123-2200`; `api_tokens.rs:49`; `migrations/0005_api_tokens.sql` |
 | Proto: `BeginRunResponse.ingest_token = 3`; no exchange RPC exists | `cloud-ci-proto/proto/cloud_ci/ingest/v1/ingest.proto:10-20`, `:69-74` |
 | Agent today: reads `CLOUD_CI_JOB_TOKEN` (fallback `CLOUD_CI_TOKEN`/OIDC) and uses it directly as the bearer for `SubmitResourceSamples`; server from `CLOUD_CI_SERVER_URL`; it does no exchange and pulls no job spec | `cloud-ci-cli/src/agent.rs:12-22`, `:98-110`, `:123-129`, `:151`; `identity.rs:145-148` |
 
@@ -47,7 +47,7 @@ Non-goals: the agent pull-loop and job-spec serving, non-Containers executors, a
   redeemed, revoked) is run state. It is written only inside the `RunCoordinator`; the stateless
   Worker handler for the exchange call never writes it. It forwards a redeem *request* to the
   coordinator DO (`RunCoordinatorStore`, the same route `BeginRun` and `StartJob` use,
-  `lib.rs:1099`, `:1288`) and the coordinator decides.
+  `lib.rs:1194`, `:1383`) and the coordinator decides.
 - **Inputs enqueue, coordinators decide.** The exchange handler does not trust the token's
   payload to mutate anything. It verifies the MAC (cheap, stateless, rejects garbage before any
   DO is woken) and then the coordinator re-reads its own row to decide redeem-or-reject. A
@@ -124,7 +124,7 @@ payload = {v:1, typ:"bootstrap", repo_id, run_id, node_id, gen, jti, exp}
   and route to the right DO (the `run_id` is in the payload) with no D1 read.
 - `key_boot` is domain-separated from the ingest key. auth.md specifies
   `HKDF(CLOUD_CI_MASTER_KEY, info="cloud-ci/<typ>/v1")` (`auth.md:352-363`); the code uses
-  `INGEST_TOKEN_SECRET` directly (`lib.rs:1232`). Which root to use is OQ3 and a prerequisite.
+  `INGEST_TOKEN_SECRET` directly (`lib.rs:1327`). Which root to use is OQ3 and a prerequisite.
 - `jti = sha256(run_id || node_id || gen)` truncated and encoded, i.e. **deterministic**, and
   `exp` is fixed at first mint and stored. Minting the same `(run_id,node_id,gen)` again
   therefore reproduces the **identical token bytes** (the property
@@ -187,15 +187,15 @@ sequenceDiagram
 
 New RPC (proposed shape only, name is OQ4): `ExchangeBootstrapToken` takes no meaningful request
 fields (the token is the bearer credential, like `BeginRun` it is the one call made before a
-run-scoped token exists, `lib.rs:1030-1068`) and returns `{ingest_token}`; `run_id` is returned
+run-scoped token exists, `lib.rs:1125-1163`) and returns `{ingest_token}`; `run_id` is returned
 for the agent's convenience. Authentication order mirrors `handle_begin_run`: the credential is
 mandatory (no header is `Unauthenticated` and wakes no DO), resolve the signing key and fail
-loudly if unset (`lib.rs:1092-1094`), verify, then call the coordinator.
+loudly if unset (`lib.rs:1187-1189`), verify, then call the coordinator.
 
 **Interaction with the existing bearer checks: none are weakened.** The returned ingest token is
 produced by the same `ingest_token::mint` that `BeginRun` uses and is presented to the same
-`authenticate_ingest_bearer` (`lib.rs:1242`), `resolve_run_identity` (`:1614`) and
-`require_matching_identity` (`:1265`). Specifically:
+`authenticate_ingest_bearer` (`lib.rs:1337`), `resolve_run_identity` (`:1709`) and
+`require_matching_identity` (`:1360`). Specifically:
 
 - `ingest_token::verify` is not edited. Its `typ == "ingest"`, scope and `exp` checks stay.
 - `require_matching_identity` is not edited; the exchange-minted token binds the **row's**
@@ -352,7 +352,7 @@ questions:
    (`node_container.rs:356-362` passes `None`). Until then the token cannot be delivered
    safely. `[unverified]`
 2. **Key derivation mismatch.** `auth.md:352-363` specifies HKDF from `CLOUD_CI_MASTER_KEY`;
-   `ingest_token.rs`/`lib.rs:1232` use `INGEST_TOKEN_SECRET` raw, and `.dev.vars.example` only
+   `ingest_token.rs`/`lib.rs:1327` use `INGEST_TOKEN_SECRET` raw, and `.dev.vars.example` only
    configures the latter. A bootstrap key needs a decision and a dev/prod config path.
 3. **Ingest TTL vs run length.** Ingest token TTL is a fixed 3600 s (`ingest_token.rs:28`) while
    `BeginRun` timeouts are configurable (default 30 min, `byo-ci.md`). A node running longer than
@@ -379,7 +379,7 @@ questions:
 ## 13. Where existing docs and code disagree
 
 - `auth.md:352-363` (HKDF from `CLOUD_CI_MASTER_KEY`, payload with `v`/`sub`/`jti`) vs
-  `ingest_token.rs:30-38` and `lib.rs:1232` (raw `INGEST_TOKEN_SECRET`, no `v`/`sub`/`jti`).
+  `ingest_token.rs:30-38` and `lib.rs:1327` (raw `INGEST_TOKEN_SECRET`, no `v`/`sub`/`jti`).
 - `auth.md:347` and ADR 0010 describe a `typ=job` token minted by the coordinator and exchanged
   for a bootstrap token; no `typ=job` exists in code, and `verify` accepts only `typ=ingest`.
 - `auth.md:337` lists `UploadArtifact` and `FinishRun` as `ingest:write` RPCs; neither exists in
