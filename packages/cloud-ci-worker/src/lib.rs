@@ -727,21 +727,39 @@ const PENDING_MODEL_CALL_BATCH_LIMIT: f64 = 10.0;
 /// in its `WHERE` clause) — a row an earlier pass already moved to
 /// `'ok'` or `'invalid_output'` is never re-selected and never
 /// re-written, so re-running this pass over the same backlog never
-/// re-calls the model for an already-finished row. Two passes
+/// re-calls the model for an already-finished row. The `SELECT`
+/// ([`ai_queue::SELECT_CLAIMABLE_SQL`]) already excludes rows held by a
+/// live claim (`claimed_at IS NULL OR claimed_at <= now - lease`), so a
+/// row another pass is still working cannot starve newer pending rows out
+/// of this pass's `LIMIT`; the authority on who may actually call the
+/// model is still the claim `UPDATE` below, not this filter. Two passes
 /// overlapping on the *same* row between its `SELECT` and the model call
-/// are closed by a claim: migration 0021's `claimed_at` column is set by
-/// a conditional `UPDATE` ([`ai_queue::CLAIM_PENDING_SQL`]) before the
-/// model is ever called, guarded by `status = 'pending_model_call' AND
-/// (claimed_at IS NULL OR claimed_at <= now - lease)`. SQLite serializes
-/// concurrent writers, so of any number of passes racing this `UPDATE`
-/// for one row, exactly one sees `changes() == 1` ([`ai_queue::claim_won`])
-/// and proceeds; every other sees `0` and skips the row this pass. A
-/// pass that gets a genuine `env.AI.run()` `Err` releases its claim
-/// immediately ([`ai_queue::RELEASE_CLAIM_SQL`]) so a later pass can
-/// retry without waiting out the lease; a pass that crashes mid-call
-/// without releasing leaves the claim to expire after
-/// [`ai_queue::MODEL_CALL_CLAIM_LEASE_MS`], so a stuck claim is
-/// self-healing rather than a permanent stall.
+/// are closed by that claim: migration 0021's `claimed_at` column is set
+/// by a conditional `UPDATE` ([`ai_queue::CLAIM_PENDING_SQL`]), sampling
+/// `now_ms` fresh for each row (not once for the whole pass), guarded by
+/// `status = 'pending_model_call' AND (claimed_at IS NULL OR claimed_at
+/// <= now - lease)`. SQLite serializes concurrent writers, so of any
+/// number of passes racing this `UPDATE` for one row, exactly one sees
+/// `changes() == 1` ([`ai_queue::claim_won`]) and proceeds; every other
+/// sees `0` and skips the row this pass. A pass that gets a genuine
+/// `env.AI.run()` `Err` releases its claim immediately
+/// ([`ai_queue::RELEASE_CLAIM_SQL`], conditioned on `claimed_at`
+/// matching this pass's own claim timestamp — `?2` — so a pass whose
+/// lease has already expired can never clear a *different*, newer
+/// pass's live claim) so a later pass can retry without waiting out the
+/// lease; a pass that crashes mid-call without releasing leaves the
+/// claim to expire after [`ai_queue::MODEL_CALL_CLAIM_LEASE_MS`], so a
+/// stuck claim is self-healing rather than a permanent stall.
+///
+/// **Residual window:** the claim only bounds how long a row is held, not
+/// how long `env.AI.run()` itself may take. If a single model call
+/// genuinely outlives the lease, a second pass can claim the same row and
+/// call the model again while the first call is still in flight — this
+/// round does not cancel or fence the first call. Both calls' usage is
+/// recorded ([`record_usage`], see "Budget/usage accounting" below); a
+/// redelivery or retry does *not* "never" cost a second model call in
+/// this specific case, only in every case where the first call completes
+/// (successfully or with an error) inside the lease.
 ///
 /// # Model-call failure vs. invalid-output — not the same thing
 ///
@@ -790,23 +808,25 @@ async fn ai_model_call_pass(env: &Env) -> Result<()> {
         repo_id: i64,
         context_json: String,
     }
+    let select_now_ms = Date::now().as_millis() as i64;
     let rows: Vec<PendingRow> = db
-        .prepare(
-            "SELECT id, repo_id, context_json FROM ai_insight \
-             WHERE status = 'pending_model_call' ORDER BY created_at ASC LIMIT ?1",
-        )
-        .bind(&[JsValue::from_f64(PENDING_MODEL_CALL_BATCH_LIMIT)])?
+        .prepare(ai_queue::SELECT_CLAIMABLE_SQL)
+        .bind(&[
+            JsValue::from_f64(select_now_ms as f64),
+            JsValue::from_f64(ai_queue::MODEL_CALL_CLAIM_LEASE_MS as f64),
+            JsValue::from_f64(PENDING_MODEL_CALL_BATCH_LIMIT),
+        ])?
         .all()
         .await?
         .results()?;
 
-    let now_ms = Date::now().as_millis() as i64;
     for row in rows {
+        let claim_now_ms = Date::now().as_millis() as i64;
         let claimed = db
             .prepare(ai_queue::CLAIM_PENDING_SQL)
             .bind(&[
                 JsValue::from_str(&row.id),
-                JsValue::from_f64(now_ms as f64),
+                JsValue::from_f64(claim_now_ms as f64),
                 JsValue::from_f64(ai_queue::MODEL_CALL_CLAIM_LEASE_MS as f64),
             ])?
             .run()
@@ -846,7 +866,7 @@ async fn ai_model_call_pass(env: &Env) -> Result<()> {
                      validation failure — leaving status=pending_model_call for a later pass): {e}",
                     row.id,
                 );
-                release_claim(&db, &row.id).await;
+                release_claim(&db, &row.id, claim_now_ms).await;
                 continue;
             }
         };
@@ -865,6 +885,7 @@ async fn ai_model_call_pass(env: &Env) -> Result<()> {
                     &model,
                     &row.id,
                     row.repo_id,
+                    claim_now_ms,
                     &base_messages,
                     &first_response.response,
                     &first_error,
@@ -882,14 +903,17 @@ async fn ai_model_call_pass(env: &Env) -> Result<()> {
 /// Releases [`ai_queue::CLAIM_PENDING_SQL`]'s claim after a genuine
 /// `env.AI.run()` network/binding failure, so a later pass can retry this
 /// row without waiting out [`ai_queue::MODEL_CALL_CLAIM_LEASE_MS`].
-/// Best-effort: an error here only means the claim's lease expires
-/// naturally instead of being released early, so it is logged, not
-/// propagated.
-async fn release_claim(db: &worker::D1Database, insight_id: &str) {
-    let stmt = match db
-        .prepare(ai_queue::RELEASE_CLAIM_SQL)
-        .bind(&[JsValue::from_str(insight_id)])
-    {
+/// `claimed_at_ms` must be the timestamp this pass itself used to claim
+/// the row: [`ai_queue::RELEASE_CLAIM_SQL`] only clears a claim that still
+/// matches it, so a pass whose lease has already expired can never clear
+/// a different, newer pass's live claim. Best-effort: an error here only
+/// means the claim's lease expires naturally instead of being released
+/// early, so it is logged, not propagated.
+async fn release_claim(db: &worker::D1Database, insight_id: &str, claimed_at_ms: i64) {
+    let stmt = match db.prepare(ai_queue::RELEASE_CLAIM_SQL).bind(&[
+        JsValue::from_str(insight_id),
+        JsValue::from_f64(claimed_at_ms as f64),
+    ]) {
         Ok(s) => s,
         Err(e) => {
             worker::console_log!(
@@ -918,6 +942,7 @@ async fn retry_once(
     model: &str,
     insight_id: &str,
     repo_id: i64,
+    claimed_at_ms: i64,
     base_messages: &[ai_model_call::ChatMessage],
     first_raw_response: &str,
     first_error: &ai_model_call::ModelResponseError,
@@ -939,7 +964,7 @@ async fn retry_once(
                  error, not a validation failure — leaving status=pending_model_call for a \
                  later pass): {e}",
             );
-            release_claim(db, insight_id).await;
+            release_claim(db, insight_id, claimed_at_ms).await;
             return Ok(());
         }
     };
