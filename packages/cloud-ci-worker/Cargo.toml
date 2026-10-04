@@ -28,6 +28,7 @@ worker = { version = "0.8.7", features = ["http", "d1", "queue"] }
 
 [dev-dependencies]
 futures = { version = "0.3", default-features = false, features = ["executor"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 
 # Patches `worker` to add `durable_object`-scheduling-policy Container
 # startup fields (image/instance/containerSnapshot/labels) and

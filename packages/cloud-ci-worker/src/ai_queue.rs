@@ -398,6 +398,57 @@ pub fn assemble_failure_context(
     }
 }
 
+/// Idempotent `ai_insight` insert (migration `0021`): the unique index
+/// `idx_ai_insight_idempotency` on `(run_id, kind, fingerprint,
+/// prompt_version, COALESCE(diff_hash, ''))` makes a redelivered message,
+/// or a retry after a partial insert failure, a no-op for rows that already
+/// exist — the message's own entries are already unique per fingerprint
+/// (`assemble_failure_context` selects at most one entry per fingerprint,
+/// see that function), so only cross-delivery duplicates can ever hit the
+/// conflict. `diff_hash` stays a `NULL` literal, same as before this
+/// migration — this round's context never includes a PR diff (see this
+/// module's "Honest gaps" doc comment). Params: `?1` id, `?2` repo_id,
+/// `?3` run_id, `?4` fingerprint, `?5` prompt_version, `?6` context_json,
+/// `?7` now_ms.
+pub const INSERT_INSIGHT_SQL: &str = "INSERT INTO ai_insight \
+     (id, repo_id, run_id, kind, fingerprint, diff_hash, prompt_version, status, context_json, created_at, updated_at) \
+     VALUES (?1, ?2, ?3, 'failure_summary', ?4, NULL, ?5, 'pending_model_call', ?6, ?7, ?7) \
+     ON CONFLICT (run_id, kind, fingerprint, prompt_version, COALESCE(diff_hash, '')) DO NOTHING";
+
+/// How long a model-call claim holds a row, in ms (migration `0021`'s
+/// `claimed_at` column). A pass that crashes mid-call leaves `claimed_at`
+/// set; after this lease the row is claimable again by a later pass. Longer
+/// than any realistic pair of `ai.run` attempts (first call plus one
+/// retry).
+pub const MODEL_CALL_CLAIM_LEASE_MS: i64 = 10 * 60 * 1000;
+
+/// Claims one `pending_model_call` row for a model call via a conditional
+/// `UPDATE`: it only changes a row that is still `pending_model_call` and
+/// either never claimed or whose claim's lease has expired. Params: `?1`
+/// id, `?2` now_ms, `?3` lease_ms. Of any number of concurrent passes
+/// racing this statement for the same `id`, SQLite serializes the writes
+/// and exactly one sees `changes() == 1`; every other sees `0` — see
+/// [`claim_won`].
+pub const CLAIM_PENDING_SQL: &str = "UPDATE ai_insight SET claimed_at = ?2 \
+     WHERE id = ?1 AND status = 'pending_model_call' \
+     AND (claimed_at IS NULL OR claimed_at <= ?2 - ?3)";
+
+/// Releases a claim after a network/binding failure (not a validation
+/// failure — those write a terminal `status` and leave the claim moot) so a
+/// later pass can retry this row without waiting out the full lease. Param:
+/// `?1` id. Guarded by `status = 'pending_model_call'` so it is a no-op
+/// once a concurrent attempt already reached a terminal status.
+pub const RELEASE_CLAIM_SQL: &str =
+    "UPDATE ai_insight SET claimed_at = NULL WHERE id = ?1 AND status = 'pending_model_call'";
+
+/// Whether a [`CLAIM_PENDING_SQL`] conditional `UPDATE` won the race, from
+/// D1's reported changed-row count. An unknown count (`None`, a driver
+/// surprise) is treated as "not claimed" rather than "claimed", so an
+/// unexpected driver response can only skip a model call, never double one.
+pub fn claim_won(changes: Option<usize>) -> bool {
+    changes == Some(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,6 +464,40 @@ mod tests {
     fn is_over_daily_cap_true_for_zero_cap() {
         // A repo configured (or defaulted) to a zero cap has no room ever.
         assert!(is_over_daily_cap(0, 0));
+    }
+
+    #[test]
+    fn claim_won_true_only_for_exactly_one_change() {
+        // D1's reported changed-row count from `CLAIM_PENDING_SQL`: a `1`
+        // means this call's conditional `UPDATE` matched and changed the
+        // one row it targeted by `id` — it is the only outcome that means
+        // this pass may call the model.
+        assert!(claim_won(Some(1)));
+    }
+
+    #[test]
+    fn claim_won_false_for_zero_changes() {
+        // Another pass already holds a live claim, or the row already left
+        // `pending_model_call` — either way this pass must not call the
+        // model for it.
+        assert!(!claim_won(Some(0)));
+    }
+
+    #[test]
+    fn claim_won_false_for_unknown_changes() {
+        // A `None` changed-count (a driver surprise) must fail closed: an
+        // unexpected response can only cause a skipped call, never a
+        // doubled one.
+        assert!(!claim_won(None));
+    }
+
+    #[test]
+    fn claim_won_false_for_more_than_one_change() {
+        // `CLAIM_PENDING_SQL`'s `WHERE id = ?1` can only ever match one
+        // row; a count above 1 is impossible in practice, but treating it
+        // as "not won" keeps the function fail-closed for any value other
+        // than the one expected success case.
+        assert!(!claim_won(Some(2)));
     }
 
     #[test]
@@ -628,5 +713,320 @@ Traceback (most recent call last):
         let ctx = assemble_failure_context(&tests, ai_insight::DEFAULT_CONTEXT_WINDOW);
         assert_eq!(ctx.entries.len(), 2);
         assert!(!ctx.systemic);
+    }
+}
+
+/// SQL-level proof for migration `0021` and the idempotent statements this
+/// module exports: applies the real migration files (via `include_str!`,
+/// so this always exercises exactly what ships, never a re-typed copy)
+/// against an in-memory SQLite database through `rusqlite`. D1 is built on
+/// SQLite, so these statements running correctly here is the strongest
+/// proof available without a live D1 binding (which only the Workers
+/// runtime provides — see this module's own "Testability" doc comment).
+#[cfg(test)]
+mod migration_sql_tests {
+    use rusqlite::{Connection, params};
+
+    const MIGRATIONS_0001_TO_0020: [&str; 20] = [
+        include_str!("../migrations/0001_runs_and_jobs.sql"),
+        include_str!("../migrations/0002_uploads_and_reports.sql"),
+        include_str!("../migrations/0003_installations_and_repos.sql"),
+        include_str!("../migrations/0004_installations_account_id.sql"),
+        include_str!("../migrations/0005_api_tokens.sql"),
+        include_str!("../migrations/0006_users_sessions_role_cache.sql"),
+        include_str!("../migrations/0007_job_conclusion_message.sql"),
+        include_str!("../migrations/0008_check_runs.sql"),
+        include_str!("../migrations/0009_run_timeout.sql"),
+        include_str!("../migrations/0010_nodes.sql"),
+        include_str!("../migrations/0011_test_stats.sql"),
+        include_str!("../migrations/0012_report_r2_key.sql"),
+        include_str!("../migrations/0013_nodes_image_command.sql"),
+        include_str!("../migrations/0014_shard_states.sql"),
+        include_str!("../migrations/0015_run_rollups_and_insights.sql"),
+        include_str!("../migrations/0016_ai_usage_and_insight.sql"),
+        include_str!("../migrations/0017_ai_insight_model_response.sql"),
+        include_str!("../migrations/0018_shard_merges.sql"),
+        include_str!("../migrations/0019_repo_settings_cache.sql"),
+        include_str!("../migrations/0020_runs_settings_sha.sql"),
+    ];
+
+    const MIGRATION_0021: &str = include_str!("../migrations/0021_ai_insight_idempotency.sql");
+
+    /// A DB with every migration through `0020` applied, but not `0021` —
+    /// lets a test insert pre-fix duplicate rows the old, non-idempotent
+    /// consumer could have produced, before applying the fix migration
+    /// under test.
+    fn db_before_0021() -> rusqlite::Result<Connection> {
+        let conn = Connection::open_in_memory()?;
+        for migration in MIGRATIONS_0001_TO_0020 {
+            conn.execute_batch(migration)?;
+        }
+        conn.execute(
+            "INSERT INTO runs (id, repo_id, sha, run_key, attempt, status, trigger, created_at) \
+             VALUES ('run1', 1, 'abc123', 'gha/1', 1, 'completed', 'push', 1000)",
+            [],
+        )?;
+        Ok(conn)
+    }
+
+    /// A fully migrated DB (`0021` applied), for tests that exercise the
+    /// idempotent insert/claim statements rather than the dedupe migration
+    /// itself.
+    fn db_after_0021() -> rusqlite::Result<Connection> {
+        let conn = db_before_0021()?;
+        conn.execute_batch(MIGRATION_0021)?;
+        Ok(conn)
+    }
+
+    fn insight_count(conn: &Connection, run_id: &str) -> rusqlite::Result<i64> {
+        conn.query_row(
+            "SELECT COUNT(*) FROM ai_insight WHERE run_id = ?1",
+            params![run_id],
+            |row| row.get(0),
+        )
+    }
+
+    #[test]
+    fn same_message_processed_twice_yields_one_row() -> rusqlite::Result<()> {
+        let conn = db_after_0021()?;
+        // Both calls bind the exact same params `handle_analysis_requested`
+        // would bind for a redelivery of the same `AnalysisRequested`
+        // message against the same assembled entry: same `id` is not
+        // guaranteed (a fresh ulid per call), but the idempotency key
+        // (run_id, kind, fingerprint, prompt_version, diff_hash) is.
+        for id in ["ins_a", "ins_b_redelivery"] {
+            conn.execute(
+                super::INSERT_INSIGHT_SQL,
+                params![id, 1_i64, "run1", "fp1", "v1", "{}", 1000_i64],
+            )?;
+        }
+        assert_eq!(insight_count(&conn, "run1")?, 1);
+        // The row that exists is the first one — `DO NOTHING` never
+        // overwrites it with the redelivery's attempt.
+        let kept_id: String =
+            conn.query_row("SELECT id FROM ai_insight WHERE run_id = 'run1'", [], |r| {
+                r.get(0)
+            })?;
+        assert_eq!(kept_id, "ins_a");
+        Ok(())
+    }
+
+    #[test]
+    fn partial_failure_retry_converges_to_the_same_state_as_one_clean_run() -> rusqlite::Result<()>
+    {
+        // A message with two entries (two distinct fingerprints). First
+        // delivery: entry 1 inserts, then the delivery fails before entry
+        // 2 is written (simulated by simply not inserting it this round).
+        let conn = db_after_0021()?;
+        conn.execute(
+            super::INSERT_INSIGHT_SQL,
+            params![
+                "ins_1_first_try",
+                1_i64,
+                "run1",
+                "fp1",
+                "v1",
+                "{}",
+                1000_i64
+            ],
+        )?;
+        assert_eq!(insight_count(&conn, "run1")?, 1);
+
+        // Retry: the Queue redelivers the whole message, so both entries
+        // are inserted again — entry 1 collides (DO NOTHING), entry 2 is
+        // genuinely new.
+        conn.execute(
+            super::INSERT_INSIGHT_SQL,
+            params!["ins_1_retry", 1_i64, "run1", "fp1", "v1", "{}", 2000_i64],
+        )?;
+        conn.execute(
+            super::INSERT_INSIGHT_SQL,
+            params!["ins_2_retry", 1_i64, "run1", "fp2", "v1", "{}", 2000_i64],
+        )?;
+
+        // Final state: exactly one row per fingerprint — identical to
+        // what a single clean run over both entries would have produced.
+        assert_eq!(insight_count(&conn, "run1")?, 2);
+        let fp1_id: String = conn.query_row(
+            "SELECT id FROM ai_insight WHERE run_id = 'run1' AND fingerprint = 'fp1'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(fp1_id, "ins_1_first_try");
+        Ok(())
+    }
+
+    #[test]
+    fn only_one_of_two_concurrent_claims_wins_for_one_row() -> rusqlite::Result<()> {
+        let conn = db_after_0021()?;
+        conn.execute(
+            super::INSERT_INSIGHT_SQL,
+            params!["ins_claim", 1_i64, "run1", "fp1", "v1", "{}", 1000_i64],
+        )?;
+
+        let lease = super::MODEL_CALL_CLAIM_LEASE_MS;
+        let first_claim = conn.execute(
+            super::CLAIM_PENDING_SQL,
+            params!["ins_claim", 5000_i64, lease],
+        )?;
+        let second_claim = conn.execute(
+            super::CLAIM_PENDING_SQL,
+            params!["ins_claim", 5010_i64, lease],
+        )?;
+
+        assert!(super::claim_won(Some(first_claim)));
+        assert!(!super::claim_won(Some(second_claim)));
+        Ok(())
+    }
+
+    #[test]
+    fn expired_lease_allows_a_later_pass_to_reclaim() -> rusqlite::Result<()> {
+        let conn = db_after_0021()?;
+        conn.execute(
+            super::INSERT_INSIGHT_SQL,
+            params!["ins_claim", 1_i64, "run1", "fp1", "v1", "{}", 1000_i64],
+        )?;
+        let lease = super::MODEL_CALL_CLAIM_LEASE_MS;
+        conn.execute(
+            super::CLAIM_PENDING_SQL,
+            params!["ins_claim", 5000_i64, lease],
+        )?;
+
+        // The lease is still live one ms before it expires.
+        let still_leased = conn.execute(
+            super::CLAIM_PENDING_SQL,
+            params!["ins_claim", 5000_i64 + lease - 1, lease],
+        )?;
+        assert!(!super::claim_won(Some(still_leased)));
+
+        // `now - lease == claimed_at` (not `>`) already counts as expired
+        // (`CLAIM_PENDING_SQL`'s `<=`), so a later pass is never forced to
+        // wait any longer than the documented lease.
+        let after_expiry = conn.execute(
+            super::CLAIM_PENDING_SQL,
+            params!["ins_claim", 5000_i64 + lease, lease],
+        )?;
+        assert!(super::claim_won(Some(after_expiry)));
+        Ok(())
+    }
+
+    #[test]
+    fn release_then_resolved_status_both_stop_further_claims() -> rusqlite::Result<()> {
+        let conn = db_after_0021()?;
+        conn.execute(
+            super::INSERT_INSIGHT_SQL,
+            params!["ins_claim", 1_i64, "run1", "fp1", "v1", "{}", 1000_i64],
+        )?;
+        let lease = super::MODEL_CALL_CLAIM_LEASE_MS;
+        conn.execute(
+            super::CLAIM_PENDING_SQL,
+            params!["ins_claim", 5000_i64, lease],
+        )?;
+
+        // A failed call releases the claim: an immediate re-claim succeeds
+        // without waiting out the lease.
+        conn.execute(super::RELEASE_CLAIM_SQL, params!["ins_claim"])?;
+        let reclaim_after_release = conn.execute(
+            super::CLAIM_PENDING_SQL,
+            params!["ins_claim", 5001_i64, lease],
+        )?;
+        assert!(super::claim_won(Some(reclaim_after_release)));
+
+        // Once the row reaches a terminal status, neither claim nor
+        // release can touch it again.
+        conn.execute(
+            "UPDATE ai_insight SET status = 'ok' WHERE id = 'ins_claim'",
+            [],
+        )?;
+        let claim_after_resolved = conn.execute(
+            super::CLAIM_PENDING_SQL,
+            params!["ins_claim", 999_999_999_i64, lease],
+        )?;
+        assert!(!super::claim_won(Some(claim_after_resolved)));
+        let release_after_resolved_changes =
+            conn.execute(super::RELEASE_CLAIM_SQL, params!["ins_claim"])?;
+        assert_eq!(release_after_resolved_changes, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn migration_0021_dedupes_pre_existing_duplicates_keeping_the_resolved_row()
+    -> rusqlite::Result<()> {
+        let conn = db_before_0021()?;
+        // Three rows the old, non-unique-indexed consumer could have left
+        // behind for the same (run_id, kind, fingerprint, prompt_version,
+        // diff_hash) key: a resolved one and two still-pending ones with
+        // different `created_at`/`id` — exactly the shape a Queue
+        // redelivery plus an in-flight pass would produce.
+        conn.execute(
+            "INSERT INTO ai_insight \
+             (id, repo_id, run_id, kind, fingerprint, diff_hash, prompt_version, status, \
+              context_json, model_response_json, created_at, updated_at) \
+             VALUES ('ins_b_pending_later', 1, 'run1', 'failure_summary', 'fp1', NULL, 'v1', \
+              'pending_model_call', '{}', NULL, 2000, 2000)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO ai_insight \
+             (id, repo_id, run_id, kind, fingerprint, diff_hash, prompt_version, status, \
+              context_json, model_response_json, created_at, updated_at) \
+             VALUES ('ins_a_ok', 1, 'run1', 'failure_summary', 'fp1', NULL, 'v1', 'ok', '{}', \
+              '{\"summary\":\"x\"}', 1500, 1500)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO ai_insight \
+             (id, repo_id, run_id, kind, fingerprint, diff_hash, prompt_version, status, \
+              context_json, model_response_json, created_at, updated_at) \
+             VALUES ('ins_c_pending_earliest', 1, 'run1', 'failure_summary', 'fp1', NULL, 'v1', \
+              'pending_model_call', '{}', NULL, 1000, 1000)",
+            [],
+        )?;
+        // A distinct key must survive the dedupe untouched.
+        conn.execute(
+            "INSERT INTO ai_insight \
+             (id, repo_id, run_id, kind, fingerprint, diff_hash, prompt_version, status, \
+              context_json, model_response_json, created_at, updated_at) \
+             VALUES ('ins_other', 1, 'run1', 'failure_summary', 'fp2', NULL, 'v1', \
+              'pending_model_call', '{}', NULL, 1000, 1000)",
+            [],
+        )?;
+        assert_eq!(insight_count(&conn, "run1")?, 4);
+
+        conn.execute_batch(MIGRATION_0021)?;
+
+        assert_eq!(insight_count(&conn, "run1")?, 2);
+        let fp1_id: String = conn.query_row(
+            "SELECT id FROM ai_insight WHERE run_id = 'run1' AND fingerprint = 'fp1'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(
+            fp1_id, "ins_a_ok",
+            "the resolved row must outlive the pending duplicates"
+        );
+        let fp2_id: String = conn.query_row(
+            "SELECT id FROM ai_insight WHERE run_id = 'run1' AND fingerprint = 'fp2'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(fp2_id, "ins_other");
+
+        // The unique index is now live: a second insert attempt for the
+        // surviving key is a no-op, never a second row.
+        conn.execute(
+            super::INSERT_INSIGHT_SQL,
+            params![
+                "ins_after_migration",
+                1_i64,
+                "run1",
+                "fp1",
+                "v1",
+                "{}",
+                9999_i64
+            ],
+        )?;
+        assert_eq!(insight_count(&conn, "run1")?, 2);
+        Ok(())
     }
 }
