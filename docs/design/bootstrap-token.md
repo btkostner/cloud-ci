@@ -251,10 +251,10 @@ state about it.
 on a live deployment by construction (a new table cannot break an old DO instance). If the owner
 wants dashboards of bootstrap events in D1, that is a separate projection and a forward-only
 migration `0022_bootstrap_tokens.sql` written by the coordinator's projection path like
-`project_node_to_d1`, not by the handler. The number is a placeholder: `main` today ends at
-`0020_runs_settings_sha.sql`, and `0021` is already claimed by the in-flight
-`ai-consumer-idempotency` branch (`0021_ai_insight_idempotency.sql`), so the real number is the
-next free one at the time this migration is written.
+`project_node_to_d1`, not by the handler. The number is a placeholder: `main` now ends at
+`0021_ai_insight_idempotency.sql` (merged), so `0022` is the next free number today, but another
+branch may take it first, so the real number is the next free one at the time this migration is
+written.
 
 ### Retry and idempotency semantics
 
