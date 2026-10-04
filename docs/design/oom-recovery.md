@@ -316,26 +316,50 @@ CREATE TABLE IF NOT EXISTS oom_decision (
   in stage 1 by `oom_effect_target(row)`). For seq 1, the target is the original node. For
   seq 2, it is the retry node, which equals seq 1's `retry_node_id`; the insert verifies that
   equality and refuses otherwise.
-* **Seq 1** is written when no row exists for the lineage. `decide_oom_recovery(ladder, None,
-  incoming)` gives `New(RetryAt)` (`outcome = 'retry'`) or `New(FailedAtMax)` at the ladder top
-  (`outcome = 'failed_at_max'`, no retry, `is_retry = false`).
-* **Seq 2** is written only when seq 1 is `retry` and `incoming.attempt == seq1.observed_attempt
-  + 1` (the existing `decide_oom_recovery` branch). The pure `existing` argument is the seq 1
-  row mapped to `OomDecisionRecord { attempt: observed_attempt, base_node_id: <original>,
-  outcome }`; `New(FailedAtMax)` becomes `outcome = 'failed_at_max'`, `target_node_id =` the
-  retry node, flags all fresh (`false`), `is_retry = false` for `next_oom_effect`. Its effects
-  are exactly: `MarkOldTerminal` (the retry node, `closed_by = 'oom'`, result carrying the max
-  and peak), `StopOld` (the retry node's own `physical_address`), `ProjectOld`.
-* After a seq 2 row, or a seq 1 `failed_at_max`, any further report is `AlreadyDecided`: no new
-  row (`decide_oom_recovery` already returns this for `FailedAtMax`).
-* Seq 1's pending projections and seq 2's critical effects are drained independently
-  (separate rows, separate counters); seq 2 cannot exist before the retry started, but seq 1
-  may still have projections pending.
-* `OomEffectFlags.decision_projected` is set `true` at insert for as long as `sizing_decisions`
-  is deferred (§2.3); the pure type keeps the field.
+* **`existing` is the projection of the LATEST decision row for the lineage** (D1) - not
+  always the seq 1 row: `attempt = that row's observed_attempt`, `outcome = that row's
+  outcome`. `base_node_id` is not read by `decide_oom_recovery` and is not part of the
+  mapping.
+* **Seq assignment is race-free (D1).** The DO is single-threaded between `await` points. The
+  insert path: read `SELECT MAX(seq) FROM oom_decision WHERE job_name = ? AND idx = ?` (or no
+  row), compute `decide_oom_recovery(ladder, existing, incoming)` from that row's projection,
+  and `INSERT` the new row with `seq = (max seq) + 1` (`1` if none) - with **no `await`
+  between the read and the insert**. The primary key `(job_name, idx, seq)` is the backstop,
+  not the primary race guard: with no intervening `await`, a second insert at the same
+  `(job_name, idx, seq)` can only happen on re-delivery of the same evidence event, not from a
+  genuine concurrent race.
+* **A primary-key collision on insert is handled as "already decided", never surfaced as an
+  SQL error (D1).** If the `INSERT` fails on the `(job_name, idx, seq)` constraint, the caller
+  re-reads the row that now exists at that `seq`, re-projects it, and returns its `outcome` as
+  `AlreadyDecided` - the same shape `decide_oom_recovery` already returns for a duplicate. This
+  is the re-delivery case: the same evidence event (the same batch content hash under option A,
+  or a duplicate `/complete-node` under option B) reaching the insert a second time.
+* **Duplicate reports must pass the latest row, not always the seq-1 row (D1).** Revision 2
+  said "any further report is `AlreadyDecided` (`decide_oom_recovery` already returns this for
+  `FailedAtMax`)" - that is correct only once the **seq 2** row exists and is passed as
+  `existing`. A duplicate report arriving when only the seq 1 `RetryAt` row exists, with
+  `incoming.attempt == seq1.observed_attempt + 1`, is **not** yet `AlreadyDecided`: it is
+  `New(FailedAtMax)` the first time (which creates seq 2) and only `AlreadyDecided` on a later
+  call once seq 2's row is read and passed as `existing`. The caller must therefore always
+  read and pass the **latest** row (seq 2 if present, else seq 1, else `None`), never a cached
+  seq 1 projection.
+* Seq 2 is written only when the latest row is seq 1, its outcome is `retry`, and
+  `incoming.attempt == seq1.observed_attempt + 1` (the existing `decide_oom_recovery` branch).
+  `New(FailedAtMax)` becomes `outcome = 'failed_at_max'`, `target_node_id =` the retry node,
+  flags all fresh (`false`), `is_retry = false` for `next_oom_effect`. Its effects are exactly:
+  `MarkOldTerminal` (the retry node, `closed_by = 'oom'`, result carrying the max and peak),
+  `StopOld` (the retry node's own `physical_address`), `ProjectOld`.
+* Seq 1's pending projections and seq 2's critical effects are drained independently (separate
+  rows, separate counters); seq 2 cannot exist before the retry started, but seq 1 may still
+  have projections pending.
+* **D2 - the row-to-flags mapping sets `decision_projected = true` unconditionally on read**,
+  not via a stored column: the `oom_decision` schema above has no `decision_projected` column
+  (that field only matters while `sizing_decisions` is deferred, §2.3), so converting a SQL
+  row to the pure `OomEffectFlags` always sets `decision_projected: true` regardless of row
+  contents. When `sizing_decisions` is eventually built, this mapping - and the schema - both
+  gain a real column and this hardcoded `true` is removed.
 * The H2 specification is final enough to implement; what it needs from the reviewer is
-  confirmation of the one-row-per-decision shape and that `decide_oom_recovery`'s
-  `OomDecisionRecord` stays the seq 1 row's projection.
+  confirmation of the one-row-per-decision shape and the latest-row projection above.
 
 **Atomicity (low notes).** The decision row is inserted inside the **same
 `storage().transaction()` closure** that records the event carrying the evidence (the batch
