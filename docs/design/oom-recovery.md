@@ -749,6 +749,34 @@ req.attempt`, the call is recorded (`shard_state` row, idempotency kept) with `e
 superseded `(idx, attempt)` rows from the barrier input. For a `failed_at_max` decision, the
 failure is the real verdict and is evaluated normally.
 
+**Release rule for a withheld failure (G2, Q11) - fail closed: release, never strand.** Both
+options withhold attempt N's failure from the barrier while a `retry` decision for
+`(job, idx)` is still in flight. If that decision never resolves to a running retry - it
+becomes `stuck` (the retry cannot be confirmed started or stopped, §3.4) or `abandoned` (the
+run went terminal before the retry started, §3.6) - the withheld failure MUST be released to
+the barrier instead of leaving the shard with no verdict forever (the alternative is the group
+silently waiting for the run timeout, exactly the gap the review found). The release trigger
+is the same alarm sweep that marks the decision `stuck`/`abandoned` (§3.4, §3.6): on that
+transition, in the same pass, release attempt N's failure.
+
+* **Under option 1,** the superseded `shard_state` row already exists (recorded at the time of
+  the original report with `effect_kind = "superseded_by_oom_retry"`); release means
+  `read_all_shard_terminal_rows`/`latest_attempt_per_shard` stop excluding it - no new write,
+  only re-running barrier evaluation (`evaluate_barrier`) for `(job, idx)` with that row
+  un-excluded, dispatching whatever `BarrierOutcome` it now produces (`Waiting`,
+  `FailFastTriggered`, or satisfied).
+* **Under option 2,** nothing was ever written for attempt N (it was never the coordinator's
+  own node completion that mattered - the original report, under option 1's producer, does
+  not exist under option 2 at all; the shard's only producer is `/complete-node` for the
+  `shard:` node itself). Release means writing attempt N's own original failure (the
+  `oom_decision` row already carries `observed_attempt` and the original `target_node_id`,
+  which is enough to reconstruct the terminal `shard_state` row) as the shard's verdict, then
+  running barrier evaluation exactly as option 2's normal path would have.
+* If a retry **did** start and then independently fails or is cancelled, that is not this
+  rule: the retry's own `/complete-node` (option 2) or a genuine new shard-terminal report for
+  attempt N+1 (option 1) is the verdict, handled by the ordinary paths above. This rule applies
+  only when the retry never reached a reportable state at all.
+
 ## 5. Size selection
 
 ### 5.1 Declaring `runner: "auto"`
