@@ -190,14 +190,24 @@ Revision 1 never discussed the ordering between the report and `/complete-node`.
   `memory.events` (`oom_kill` counter) and treats exit code 137 plus `oom_kill > 0` as OOM
   evidence, and reports it on the node's `/complete-node` call (an optional internal field on
   `CompleteNodeRequest`; it is a Durable-Object-internal request, not the public proto).
-  The coordinator then records the node's failure and the OOM decision **in the same
-  transaction**, so fail-fast and the barrier never see an un-upgraded failure. Pros: works when
-  the agent is killed; matches analytics.md's two triggers; evidence and failure arrive
-  together, which removes the ordering hazard. Cons: a second `exec` after the main one exited
-  is `[unverified]` against a real runtime, as is whether the cgroup it sees is the job's; 137
-  also arises from a manual kill or a timeout kill (mitigated by requiring `oom_kill > 0`);
-  needs the container to remain up after the main process dies; adds a Worker-owned
-  `memory.events` parser.
+  **The transaction that accepts this `/complete-node` call records the `oom_decision` row
+  (the evidence and the outcome) but deliberately does NOT write the node's terminal status**
+  for an OOM-classified completion - that write is `MarkOldTerminal` (§3.1), the first effect
+  of the decision just recorded, which sets `failed` with `closed_by = 'oom'`. `MarkOldTerminal`
+  runs inline immediately after the commit (§2.2's "Atomicity" note), so in the common case
+  fail-fast and the barrier never observe a gap where the node looks non-terminal with no
+  decision yet - but a crash between the commit and that inline drain leaves the node
+  `Running` with a `pending` decision until the alarm sweep (§3.6) completes `MarkOldTerminal`;
+  this is the same "drained by the alarm, not only inline" healing property every other effect
+  already has (§3's "O2/O3" row), not a new gap. A completion the classification (below) marks
+  NOT-OOM or UNKNOWN writes the node's status immediately and normally, with no decision row
+  and no deferral. Pros: works when the agent is killed; matches analytics.md's two triggers;
+  evidence and failure arrive in one durable write, which removes the ordering hazard without
+  needing the node to render two conflicting states. Cons: a second `exec` after the main one
+  exited is `[unverified]` against a real runtime, as is whether the cgroup it sees is the
+  job's; 137 also arises from a manual kill or a timeout kill (mitigated by requiring
+  `oom_kill > 0`); needs the container to remain up after the main process dies; adds a
+  Worker-owned `memory.events` parser.
 * **C. Both.** B as the trigger of record, the agent's `oom_detected` as corroborating evidence
   stored on the batch. Cons: two paths into one decision need one deduplication rule (the
   decision is keyed by lineage and seq, §2.2, so both converge, but tests double).
@@ -324,28 +334,41 @@ fork extension and no command-wrapping fallback are needed: `NodeContainer` buil
 `ContainerExecOptions`, calls `add_env` for each variable, and passes `Some(options)` where it
 passes `None` today.
 
-* **Variables set per node (needed for OOM detection under option A (and C); still useful,
-  but only for sample attribution, under option B - see below):**
-  `CLOUD_CI_NODE_ID={node_id}` and `CLOUD_CI_SHARD_ATTEMPT={shard_attempt}`, plus whatever the
-  agent needs (`CLOUD_CI_TOKEN`, `CLOUD_CI_SERVER_URL`). **Because `exec` env replaces the
-  environment, this changes the environment of every node, not only auto ones**, and no
-  dispatcher mints the token or URL today (roadmap Phase 6: bootstrap-token path not built).
-  See Q3.
-* **Command-template contract (M5, Q14) - option A (and C) only.** `resolve_shard_attempt` and
-  `resolve_node_id` give an explicit flag priority over the env var (`cloud-ci-cli/src/
-  identity.rs`, `cloud-ci-cli/src/agent.rs`). Therefore, under **option A (and C)**, the
-  command a `runner_auto` shard node is started with MUST carry **no** `--attempt`,
-  `--node-id` or `--instance-type` flags. If it did, the retry (same command, new env) would
-  report the old attempt and node id and fail the §1.1 binding rule, so the second OOM would
-  never be detected. `handle_start_node` rejects a `runner_auto` command containing any of
-  those three flags (422 `runner_auto_command_carries_identity_flag`) **only while option A
-  (or C) is the chosen trigger**; under **option B alone**, this ban is unnecessary for OOM
-  detection, because the coordinator never reads the command's own flags to identify the
-  node - it already has `req.node_id` as the call's own primary key (§1.1). The flags would
-  still exist on the command for the agent's own sample-attribution use (so its
-  `SubmitResourceSamples` batch, if any, is correctly attributed), independent of whether they
-  gate OOM recovery. The current size is read from `node.size` (§1.1), not from
-  `--instance-type`, under either option.
+* **Variables set per node.** `CLOUD_CI_NODE_ID={node_id}` and
+  `CLOUD_CI_SHARD_ATTEMPT={shard_attempt}`, plus whatever the agent needs
+  (`CLOUD_CI_TOKEN`, `CLOUD_CI_SERVER_URL`). They serve two different purposes, and only one of
+  them depends on the H1 option:
+  * **OOM detection: needed under option A (and C) only.** The agent's report is the evidence
+    event, so its `node_id` and `attempt` must name the right node (§1.1 binding rule).
+  * **Sample correctness: needed under every option in which the agent submits samples at all
+    (A, B and C).** The agent reports its own `attempt` and `node_id` on every
+    `SubmitResourceSamples` batch, whether or not that batch is OOM evidence. Without the
+    carriers (and without the flag ban below) a retry's batch is reported as the original
+    attempt.
+
+  **Because `exec` env replaces the environment, this changes the environment of every node,
+  not only auto ones**, and no dispatcher mints the token or URL today (roadmap Phase 6:
+  bootstrap-token path not built). See Q3.
+* **Command-template contract (M5, Q14) - all options in which the agent submits samples.**
+  `resolve_shard_attempt` and `resolve_node_id` give an explicit flag priority over the env
+  var (`cloud-ci-cli/src/identity.rs` `resolve_shard_attempt`, `cloud-ci-cli/src/agent.rs`
+  `resolve_node_id`; read 2026-10-03), and `--instance-type` has no env fallback at all.
+  Therefore the command a `runner_auto` shard node is started with MUST carry **no**
+  `--attempt`, `--node-id` or `--instance-type` flags. If it did, the retry (same command, new
+  env) would still report the ORIGINAL attempt and node id on its batch:
+  * under **option A (and C)** the report would then fail the §1.1 binding rule, so the second
+    OOM would never be detected;
+  * under **option B**, OOM detection does not read the batch (the coordinator already has
+    `req.node_id` as the `/complete-node` call's primary key, §1.1), but the retry's batch
+    would still be attributed to attempt N. Because the batch identity is `(job_id,
+    shard_index, attempt)`, it either collides with the original attempt's batch (409 on a
+    different content hash) or, if the original batch never arrived, silently takes its place.
+    Command flags are therefore **not** a valid attribution source under B either.
+
+  `handle_start_node` rejects a `runner_auto` command containing any of those three flags (422
+  `runner_auto_command_carries_identity_flag`). Under option B alone the ban protects sample
+  attribution only, not OOM detection; whether to enforce it on B is the same Q14 question. The
+  current size is read from `node.size` (§1.1), not from `--instance-type`, under every option.
 * `StartNodeRequest` gains `shard_attempt: Option<u32>`, `runner_auto` (§5.1) and the instance
   size; `JobSpec` (`executor.rs`) gains the same; all feed `spec_hash`.
 
@@ -356,10 +379,10 @@ matches the retry's node row; `decide_oom_recovery` sees the lineage's first dec
 replay of the original attempt now has a different `node_id`/attempt pair and is rejected by
 the binding rule. **Under option B**, there is no such report to map: the coordinator already
 knows which node completed (`req.node_id`, §1.1) and which `oom_decision` row (if any) that
-node is the live target of, so the same unambiguous mapping holds trivially, without needing
-the env carriers or the command-template ban at all - they remain useful only so the agent's
-own, separately-delivered samples (if the agent still runs) attribute correctly to the right
-attempt.
+node is the live target of, so the same unambiguous mapping holds trivially, and OOM detection
+needs neither the env carriers nor the command-template ban. Those remain required only so
+that the agent's separately-delivered samples are attributed to the right attempt (see the
+sample-correctness bullet above); they are not an attribution source for the OOM decision.
 
 ## 2. State
 
@@ -440,12 +463,14 @@ CREATE TABLE IF NOT EXISTS oom_decision (
 *Rules:*
 
 * **Target is always the row's own `target_node_id`.** `target_node_id` is set at insert from
-  the evidence event - under **option A (and C)** that is the report's own `node_id`; under
-  **option B** it is `req.node_id` from the `CompleteNodeRequest` the evidence arrived on
-  (§1.1) - never from `base_node_id` and never from `resolve_oom_node_id` (which is replaced
-  in stage 1 by `oom_effect_target(row)`). For seq 1, the target is the original node. For
-  seq 2, it is the retry node, which equals seq 1's `retry_node_id`; the insert verifies that
-  equality and refuses otherwise.
+  the evidence event, not from the agent's corroborating evidence when both exist. Under
+  **option A**, the evidence event is the agent's report, so the target is the report's own
+  `node_id`. Under **option B, and under option C** (C's trigger of record is B, §0 "C. Both"),
+  the evidence event is the `/complete-node` call, so the target is `req.node_id` from that
+  `CompleteNodeRequest` (§1.1) - never from `base_node_id` and never from `resolve_oom_node_id`
+  (which is replaced in stage 1 by `oom_effect_target(row)`). For seq 1, the target is the
+  original node. For seq 2, it is the retry node, which equals seq 1's `retry_node_id`; the
+  insert verifies that equality and refuses otherwise.
 * **`existing` is the projection of the LATEST decision row for the lineage** (D1) - not
   always the seq 1 row: `attempt = that row's observed_attempt`, `outcome = that row's
   outcome`. `base_node_id` is not read by `decide_oom_recovery` and is not part of the
@@ -574,18 +599,20 @@ The order is already encoded in `logic::next_oom_effect_excluding` and is kept v
 | Project* | `INSERT .. ON CONFLICT DO UPDATE`. | D1 call returned ok |
 
 **MarkOldTerminal's "already terminal" case is option-dependent (L1).** Under **option B**,
-evidence and the node's failure are recorded in the same transaction (§1.1), so the target
-node is always still non-terminal when `MarkOldTerminal` runs; a node that is terminal for
-another reason (it naturally `succeeded`, was `cancelled`, or was `skipped`) genuinely means
-someone else won the race, and the decision is `abandoned` (§3.6), not overwritten. Under
-**option A**, the target node is very often *already* `failed` (plain exit 137, `closed_by`
-unset) by the time the batch arrives - H1's own problem statement is that this is the dominant
-case, not an edge case. `update_node_status` still writes only when non-terminal, but a node
-that is `failed` with `closed_by` unset **and** the arriving batch classifies as OOM (§1.1's
-classification) is **upgraded**, not abandoned: `closed_by` is set to `'oom'` and `result` is
-overwritten with the OOM message, even though the row was already terminal before this call.
-Only a node terminal as `succeeded`/`cancelled`/`skipped`/`timed_out` is abandoned under
-option A; a node terminal as plain `failed` with matching OOM evidence is upgraded.
+the evidence-accepting transaction writes only the `oom_decision` row, never the node's
+status (§1.1's option B description), so the target node is always still non-terminal when
+`MarkOldTerminal` - the decision's own first effect - runs and performs that write; a node
+that is terminal for another reason (it naturally `succeeded`, was `cancelled`, `skipped`, or
+`timed_out`) genuinely means someone else won the race, and the decision is `abandoned`
+(§3.6), not overwritten. Under **option A**, the target node is very often *already* `failed`
+(plain exit 137, `closed_by` unset) by the time the batch arrives - H1's own problem statement
+is that this is the dominant case, not an edge case. `update_node_status` still writes only
+when non-terminal, but a node that is `failed` with `closed_by` unset **and** the arriving
+batch classifies as OOM (§1.1's classification) is **upgraded**, not abandoned: `closed_by` is
+set to `'oom'` and `result` is overwritten with the OOM message, even though the row was
+already terminal before this call. Only a node terminal as
+`succeeded`/`cancelled`/`skipped`/`timed_out` is abandoned under option A; a node terminal as
+plain `failed` with matching OOM evidence is upgraded.
 
 `start()` returns before the container is ready, and later failures need `monitor()`
 (Cloudflare, "Durable Object Container API" page, "Last updated Sep 30, 2026", read
