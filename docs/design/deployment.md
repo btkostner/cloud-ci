@@ -125,11 +125,70 @@ track at the end of this doc.
 
 ## Setup wizard
 
-`cloud-ci setup github-app` and `cloud-ci setup allowed-orgs`
-(`packages/cloud-ci-cli/src/setup_github_app.rs`, `.../src/setup.rs`) are real, implemented, and
-already documented step by step with a full sequence diagram in
-[auth.md § GitHub App setup](./auth.md#github-app-setup). This section covers the steps around
-them that a fresh deployer needs and the CLI does not perform itself.
+`cloud-ci setup` (no subcommand, `packages/cloud-ci-cli/src/setup_wizard.rs`) is the one
+orchestrating command: it walks a deployer through every step below, in order, re-checking
+current state before acting so re-running it is safe — a step already satisfied is reported
+`skipped (already done)` and nothing is re-sent. It is built entirely on the real, already-shipped
+pieces (`cloud-ci setup github-app`/`setup allowed-orgs`, `wrangler` itself) and never fakes a
+step: where a step needs a real browser/GitHub account/Cloudflare credentials, the wizard either
+runs the real subcommand that does the work and re-verifies its result from `wrangler.toml`
+before calling it done, or prints the exact command/instruction for the operator to run
+themselves. `--dry-run` runs only read-only checks (`wrangler whoami`, `d1 migrations list`,
+`secrets-store secret list`) and performs no mutating command, file write, or deploy.
+
+### Steps, in order
+
+1. **`wrangler login`** — runs `wrangler whoami`; a non-authenticated result is a hard failure
+   that stops the wizard (clear message: run `wrangler login` or set `CLOUDFLARE_API_TOKEN`).
+2. **`wrangler.toml` bindings** — checks every required binding
+   (`DB`/`ASSETS`/`METRICS`/`AI`/the two queues/all five Durable Object bindings) is present in
+   `--file` (default `packages/cloud-ci-worker/wrangler.toml`), and that the D1 binding's
+   `database_id` is not the repo's placeholder. Missing bindings or a still-placeholder id fail
+   with the exact fix (e.g. `wrangler d1 create cloud-ci`); this step never edits the file itself.
+3. **D1 migrations** — `wrangler d1 migrations list <db> --remote`; if anything is pending, runs
+   `wrangler d1 migrations apply <db> --remote` (skipped under `--dry-run`, which only reports
+   what is pending) and re-lists to confirm the apply actually cleared the backlog before calling
+   it done.
+4. **Secrets Store secrets** — reads the four `[[secrets_store_secrets]]` bindings
+   (`GITHUB_APP_PRIVATE_KEY`/`GITHUB_APP_CLIENT_SECRET`/`GITHUB_WEBHOOK_SECRET`/
+   `CLOUD_CI_MASTER_KEY`) out of `wrangler.toml` and, if present, confirms each named secret shows
+   up in `wrangler secrets-store secret list` for its store — by name only; no secret value is
+   ever read or printed. Missing bindings are reported manual (the next step creates them); a
+   binding that names a secret absent from the store is a hard failure.
+5. **GitHub App** — if `GITHUB_APP_ID` is already set and the four secret bindings exist, this is
+   a no-op. Otherwise it runs `cloud-ci setup github-app` itself (forwarding `--name`,
+   `--allowed-orgs`, `--deployment-url`, `--cloudflare-account-id`, `--secrets-store-id`, `--public`
+   if given) — the real manifest flow, which still opens a browser and blocks on a human clicking
+   "Create GitHub App" (auth.md's one un-drivable step, unchanged) — and only reports it done after
+   re-reading `wrangler.toml` and confirming `GITHUB_APP_ID` is now set; a subcommand exit code of
+   0 that somehow left `GITHUB_APP_ID` empty is reported as a failure, not a success. Missing flags
+   or a missing `CLOUDFLARE_API_TOKEN` print the exact command to run by hand instead of guessing.
+   Always adds "each allowed org's owner must install the App from GitHub's UI" to the final
+   checklist — this CLI has no way to verify an installation.
+6. **Allowed orgs** — compares `--allowed-orgs` (if given) against the current
+   `GITHUB_ALLOWED_ORGS`; any login not yet present is added via `cloud-ci setup allowed-orgs
+   --add` (one real subcommand call per login), then re-read to confirm. With no `--allowed-orgs`
+   flag and a non-empty existing list, this step is a no-op report; an empty list with nothing
+   requested is reported manual (the Worker fails closed on an empty allowlist).
+
+After the last step, the wizard prints a **checklist** of everything it could not verify or do
+itself: the GitHub-UI installation step, a reminder to `wrangler deploy` if config changed, and
+(if any step failed) which step to fix before re-running. The checklist is built the same way
+regardless of whether the run as a whole succeeded or stopped early.
+
+### What is exercised and what is not
+
+The step-ordering, idempotent-re-run, failed-prerequisite-stops, dry-run-changes-nothing, and
+secret-redaction behavior are covered by `setup_wizard.rs`'s own unit tests against fake
+command-runner and filesystem implementations — no network, no real `wrangler`, no real
+Cloudflare/GitHub account, same pattern as the rest of this `setup` family (see "Step by step"
+below). Separately, `cloud-ci setup --dry-run` was run for real in this environment (no
+`wrangler` binary installed, no Cloudflare account) against this repo's own
+`packages/cloud-ci-worker/wrangler.toml`: it correctly stopped at step 1 with "could not run
+`wrangler whoami`: No such file or directory" rather than claiming success, confirming the
+fail-closed behavior end to end — but it did not exercise steps 2–6
+(bindings/migrations/secrets/App/orgs), which need a real `wrangler` and real Cloudflare state
+this environment does not have.
 
 ### Prerequisites the CLI assumes but does not create
 
@@ -138,7 +197,8 @@ them that a fresh deployer needs and the CLI does not perform itself.
    flag so it never lands in shell history or a process list.
 2. **An existing Secrets Store.** `cloud-ci setup github-app --secrets-store-id <id>` creates four
    secrets *inside* a store that must already exist; creating the store itself is explicitly out
-   of scope of that command. Real command: `wrangler secrets-store store create <name> --remote`
+   of scope of that command (and of the wizard's step 4 above). Real command: `wrangler
+   secrets-store store create <name> --remote`
    (developers.cloudflare.com/secrets-store/integrations/workers/, checked 2026-10-03).
 3. **A deployed Worker** to attach the App and secrets to — `wrangler deploy --config
    packages/cloud-ci-worker/wrangler.toml` from the repo root, after resolving the `database_id`
@@ -150,41 +210,46 @@ them that a fresh deployer needs and the CLI does not perform itself.
 ### Step by step (what is real today)
 
 1. `mise install` at the repo root.
-2. `wrangler login` (or set `CLOUDFLARE_API_TOKEN`).
-3. `wrangler d1 create cloud-ci`, then set the returned id as `database_id` in
-   `packages/cloud-ci-worker/wrangler.toml` (prerequisite 3/the gap above).
-4. `wrangler secrets-store store create cloud-ci --remote` (or reuse an existing store) and note
+2. `wrangler d1 create cloud-ci`, then set the returned id as `database_id` in
+   `packages/cloud-ci-worker/wrangler.toml` (prerequisite 3/the gap above) — the wizard's step 2
+   detects and reports this placeholder but does not edit the file itself.
+3. `wrangler secrets-store store create cloud-ci --remote` (or reuse an existing store) and note
    its id.
-5. `wrangler deploy --config packages/cloud-ci-worker/wrangler.toml` from the repo root.
-6. From `packages/cloud-ci-cli/`:
+4. `wrangler deploy --config packages/cloud-ci-worker/wrangler.toml` from the repo root.
+5. From the repo root (or `packages/cloud-ci-cli/` with `cargo run --release --`):
    ```sh
-   cargo run --release -- setup github-app \
-     --name "cloud-ci (<company>)" --allowed-orgs <org1,org2> \
+   cloud-ci setup --name "cloud-ci (<company>)" --allowed-orgs <org1,org2> \
      --deployment-url https://<worker-hostname> \
-     --cloudflare-account-id <id> --secrets-store-id <id-from-step-4> \
-     --deploy
+     --cloudflare-account-id <id> --secrets-store-id <id-from-step-3>
    ```
-   Opens a real browser to GitHub's manifest flow — a human must click "Create GitHub App" in
+   Runs the `wrangler login`, bindings, and D1-migration checks, then opens a real browser to
+   GitHub's manifest flow for the GitHub App step — a human must click "Create GitHub App" in
    their own authenticated session; this step is not simulated anywhere in this repo. On success
    it writes `GITHUB_APP_ID`/`GITHUB_ALLOWED_ORGS` and the four Secrets Store bindings into
-   `wrangler.toml` and (because `--deploy` was passed) redeploys.
+   `wrangler.toml`, then adds the requested orgs. Re-running the same command after a partial
+   failure (e.g. before the App was created) skips every already-done step and resumes where it
+   stopped.
+6. `wrangler deploy --config packages/cloud-ci-worker/wrangler.toml` from the repo root — the
+   wizard's own final checklist item, not run automatically (same "deploy-time-only" reasoning as
+   `AllowedOrgsArgs::deploy`/`GithubAppArgs::deploy`, which this wizard inherits by calling those
+   same subcommands without `--deploy`).
 7. Each allowed org's owner installs the App from GitHub's own UI — outside this CLI's control;
-   until then the deployed Worker's webhook/OAuth/OIDC paths fail closed (auth.md's own note).
-8. Later allowlist changes, no browser needed: `cargo run --release -- setup allowed-orgs --add
-   <login> --deploy` from the same directory.
+   until then the deployed Worker's webhook/OAuth/OIDC paths fail closed (auth.md's own note). The
+   wizard's checklist always names this step.
+8. Later allowlist changes, no browser needed: `cloud-ci setup --allowed-orgs <org1,org2,...>` (or
+   `cloud-ci setup allowed-orgs --add <login>` for one login with `--deploy`).
 
-Steps 2 and 6–7 need a real Cloudflare account, a real GitHub account, and a real browser session
-and were **not executed for this doc** — they are documented from the CLI's own source and
-`auth.md`'s sequence diagram, not run end to end. The CLI's unit tests
-(`setup.rs`'s pure `parse_logins`/`apply_op`/`serialize_logins`/`mutate_allowed_orgs`) are the
-only part of this flow exercised by this repository's own test suite.
+Steps 2–7 above need a real Cloudflare account, a real GitHub account, and (for step 5's App
+creation) a real browser session; they were **not executed end to end for this doc** — see "What
+is exercised and what is not" above for exactly what was and was not run in this environment.
 
 ## Open items for other tracks
 
 - **Worker config** (`packages/cloud-ci-worker/wrangler.toml`, not edited by this doc): the
   placeholder `database_id` blocks both the Deploy-to-Cloudflare button's and plain `wrangler
-  deploy`'s automatic D1 provisioning (see above).
-- **CLI** (`packages/cloud-ci-cli`, not edited by this doc): no build/run convenience task in its
-  `mise.toml`, and no single orchestrating subcommand that runs the D1/Secrets-Store/deploy steps
-  above before `setup github-app` — today's wizard is this doc's manual composition of real,
-  separately-built pieces, not one guided command.
+  deploy`'s automatic D1 provisioning (see above); the wizard detects and reports this but cannot
+  provision a database on a deployer's behalf.
+- **CLI** (`packages/cloud-ci-cli`, not edited by this doc): still no build/run convenience task
+  in its `mise.toml` — a deployer runs `cargo run --release --` (or builds once and runs the
+  binary) from a checkout, same as every other `cloud-ci` subcommand.
+

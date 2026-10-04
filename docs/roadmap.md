@@ -86,9 +86,13 @@ Status (2026-10-03), from reading the code, not from a live run:
 - Deploy-to-Cloudflare button, setup wizard, upgrade/migration story, public docs site.
 
 Status (2026-10-03): partly built. `packages/cloud-ci-docs` (a VitePress docs site, not
-deployed anywhere) and the `cloud-ci setup allowed-orgs` and `cloud-ci setup github-app`
-subcommands exist. Not built: the one-step setup wizard, the upgrade/migration story, and the
-button, which is blocked by Cloudflare's isolated-subdirectory rule, see
+deployed anywhere), the `cloud-ci setup allowed-orgs`/`cloud-ci setup github-app` subcommands,
+and the one-step `cloud-ci setup` wizard (`packages/cloud-ci-cli/src/setup_wizard.rs`,
+[deployment](./design/deployment.md#setup-wizard)) exist. The wizard's ordering/idempotence/
+failure/dry-run/secret-redaction behavior is unit-tested only — a real run in this environment
+(no `wrangler`, no Cloudflare account) was exercised only as far as its first prerequisite check
+before stopping closed, per that doc. Not built: the upgrade/migration story and the button,
+which is blocked by Cloudflare's isolated-subdirectory rule, see
 [deployment](./design/deployment.md#deploy-to-cloudflare).
 
 ## Next steps
@@ -128,12 +132,17 @@ Each item unblocks the ones after it.
    remaining prerequisites.
 4. **NodeContainer isolation live proof.** Run-scoped addressing is unit-tested only; proving it
    needs `wrangler dev` with a `CLOUDFLARE_API_TOKEN`, which this environment lacks.
-5. **Phase 7.** The Deploy-to-Cloudflare button is blocked by Cloudflare's isolated-subdirectory
+5. ~~**Setup wizard**~~ **Done, unit-only (2026-10-03).** `cloud-ci setup`
+   (`packages/cloud-ci-cli/src/setup_wizard.rs`) orchestrates `wrangler login`/bindings/D1
+   migrations/secrets checks plus the existing `cloud-ci setup github-app` and `cloud-ci setup
+   allowed-orgs` subcommands, in order, skipping steps already satisfied; proven only against
+   fake command-runner/filesystem implementations, see
+   [deployment](./design/deployment.md#setup-wizard) for exactly what was and was not run for
+   real. The Deploy-to-Cloudflare button remains blocked by Cloudflare's isolated-subdirectory
    rule: the worker has path dependencies outside its directory
    (developers.cloudflare.com/workers/platform/deploy-buttons/, "Last updated Jul 22, 2026",
    as cited in [deployment](./design/deployment.md#deploy-to-cloudflare); not re-fetched for
-   this entry). Partial setup subcommands already exist (`cloud-ci setup github-app` and
-   `cloud-ci setup allowed-orgs`); the wizard needs an orchestrating subcommand on top of them.
+   this entry).
 6. **Then:** the `step` and `cache` Analytics Engine events, the nightly rightsizing cron that
    calls the pure rightsizing functions with real Analytics Engine data, the Phase 5 AI context
    builder, and the dashboard.
