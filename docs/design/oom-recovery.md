@@ -79,12 +79,30 @@ also why trigger design (H1) matters.
   30 TB concurrent disk. At `standard-4`, 1,500 vCPU is 375 concurrent nodes; at `standard-1`
   it is 3,000 (memory then binds first at about 1,536 nodes by 6 TiB / 4 GiB). Interaction with
   `concurrency.repository` clamping (settings.md) must be stated by the owner.
+* **No application-level concurrency cap exists to backstop that math (G5).** The
+  `wrangler.toml` comment on `NodeContainer`'s `[[containers]]` entry already notes
+  `max_instances` is `default`-policy only; Cloudflare's "Scheduling Policies" page (read
+  2026-10-03) confirms it: "The `durable_object` policy does not support `max_instances`."
+  The account limits above are therefore the *only* guard against over-provisioning, not a
+  belt-and-suspenders check behind a lower application cap. This matters directly for Q13.
 * Billing impact: pricing is not stated in the sources read for this document and is
   `[unverified]` here. Owner must supply the expected cost change.
 
-**Stage 0 scope:** pass an explicit `instance` through `JobSpec` to
-`node_container::start_container` to `ContainerStartupOptions::set_instance`, with the default
-chosen by the owner (Q1). No OOM logic. The fork method exists (§1.3). Ship as its own change.
+**Rollout gate and rollback (G4).** Stage 0 is not inert and needs owner sign-off (above), so
+it ships behind its own gate, separate from `OOM_RECOVERY`: a deployment setting (for example
+`Settings.runners.default_instance`, resolved the same way other deployment-wide bounds are -
+settings.md's "Deployment-wide limits" table) naming the instance size `handle_start_node`
+passes for a **non**-`runner_auto` node. It **defaults to the current behavior** - omitted,
+which the runtime resolves to `lite` (§5.4) - so a deployment that never sets it sees no
+change at all. An owner opts in per deployment by setting it explicitly (`Q1` is which value
+to recommend as the opt-in default, not what the code defaults to). **Rollback** is resetting
+the setting (or redeploying the prior Worker version) and redeploying; no data migration is
+needed, because the setting is read only at `startNode` time and affects only containers
+started after the change - already-running containers are unaffected either way, and a node
+row does not persist which default produced its size beyond the existing `node.size`-style
+columns this design already adds for `runner_auto` nodes (§2.1; a non-auto node's actual
+running size is not currently recorded on its row at all, a pre-existing gap Stage 0 does not
+need to close).
 
 ## 1. Identity
 
