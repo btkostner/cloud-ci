@@ -1031,6 +1031,78 @@ mod migration_sql_tests {
         Ok(())
     }
 
+    #[test]
+    fn mark_context_unparsable_guards_stale_claim_and_non_pending_status() -> rusqlite::Result<()> {
+        let conn = db_after_0021()?;
+        let lease = super::MODEL_CALL_CLAIM_LEASE_MS;
+        let status_and_claim = |id: &str| -> rusqlite::Result<(String, Option<i64>)> {
+            conn.query_row(
+                "SELECT status, claimed_at FROM ai_insight WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+        };
+
+        // Stale claim: a pass whose claim timestamp no longer matches the
+        // row's (a newer pass reclaimed it) must not terminate the row.
+        conn.execute(
+            super::INSERT_INSIGHT_SQL,
+            params![
+                "ins_stale",
+                1_i64,
+                "run1",
+                "fp_s",
+                "v1",
+                "not json",
+                1000_i64
+            ],
+        )?;
+        conn.execute(
+            super::CLAIM_PENDING_SQL,
+            params!["ins_stale", 5000_i64, lease],
+        )?;
+        let stale = conn.execute(
+            super::MARK_CONTEXT_UNPARSABLE_SQL,
+            params!["ins_stale", 4999_i64, 6000_i64],
+        )?;
+        assert_eq!(stale, 0);
+        assert_eq!(
+            status_and_claim("ins_stale")?,
+            ("pending_model_call".to_string(), Some(5000))
+        );
+        // The owning pass's own timestamp does terminate it.
+        let owned = conn.execute(
+            super::MARK_CONTEXT_UNPARSABLE_SQL,
+            params!["ins_stale", 5000_i64, 6000_i64],
+        )?;
+        assert_eq!(owned, 1);
+
+        // Non-pending row: an already-resolved row is never overwritten.
+        conn.execute(
+            super::INSERT_INSIGHT_SQL,
+            params!["ins_ok", 1_i64, "run1", "fp_o", "v1", "not json", 1001_i64],
+        )?;
+        conn.execute(super::CLAIM_PENDING_SQL, params!["ins_ok", 5000_i64, lease])?;
+        conn.execute(
+            "UPDATE ai_insight SET status = 'ok', model_response_json = '{\"x\":1}' \
+             WHERE id = 'ins_ok'",
+            [],
+        )?;
+        let resolved = conn.execute(
+            super::MARK_CONTEXT_UNPARSABLE_SQL,
+            params!["ins_ok", 5000_i64, 6000_i64],
+        )?;
+        assert_eq!(resolved, 0);
+        assert_eq!(status_and_claim("ins_ok")?.0, "ok");
+        let response: String = conn.query_row(
+            "SELECT model_response_json FROM ai_insight WHERE id = 'ins_ok'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(response, "{\"x\":1}");
+        Ok(())
+    }
+
     /// Inserts three `reports` rows (one per job `j1`/`j2`/`j3`, in the
     /// given order), all sharing one fingerprint (same `test_id`/message/
     /// stack) but distinguishable `output_tail`s, and returns the assembled
