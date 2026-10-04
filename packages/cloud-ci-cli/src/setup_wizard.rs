@@ -482,28 +482,49 @@ struct Listing {
 }
 
 /// wrangler 4.145.0's error text for an EMPTY page (`[unverified]` against
-/// a live account: read from its distributed source). Only this text after
-/// a full page proves the listing ended; any other failure may be transient.
+/// a live account: read from its distributed source), without a trailing
+/// period or an `[ERROR]` prefix. See [`is_empty_page_error`].
 const EMPTY_PAGE_MARKER: &str = "List request returned no secrets";
 
+/// True only when a failed call's text IS wrangler's empty-page error: the
+/// whole trimmed text, or its last non-empty line, equals
+/// [`EMPTY_PAGE_MARKER`] once an optional leading `X [ERROR]`/`[ERROR]`/
+/// `ERROR:` prefix and a trailing `.` are removed. A transient error that
+/// merely mentions the marker inside longer text is NOT proof the listing
+/// ended.
+fn is_empty_page_error(text: &str) -> bool {
+    let Some(last) = text.lines().map(str::trim).rfind(|l| !l.is_empty()) else {
+        return false;
+    };
+    let mut line = last;
+    for prefix in ["X [ERROR]", "[ERROR]", "ERROR:"] {
+        if let Some(rest) = line.strip_prefix(prefix) {
+            line = rest.trim_start();
+            break;
+        }
+    }
+    line.strip_suffix('.').unwrap_or(line).trim_end() == EMPTY_PAGE_MARKER
+}
+
 /// Reads `wrangler secrets-store secret list` pages (`--page`/`--per-page`)
-/// and returns every token seen plus whether the listing is complete.
+/// and returns every token seen plus whether the listing is proven complete.
 ///
 /// The loop ends in one of these ways:
 /// - a page with fewer than [`SECRETS_PER_PAGE_N`] non-empty output lines
 ///   (header and border lines only inflate the count, which is the safe
 ///   direction: it can only cause one more request): complete;
-/// - a page that adds no new token: complete;
 /// - every wanted name seen: complete (nothing left to look for);
-/// - a failed call after a full page whose text contains
-///   [`EMPTY_PAGE_MARKER`]: complete (wrangler's real empty-page error);
-/// - any OTHER failed call after a full page (a transient error, or a
-///   runner error): NOT complete, so a missing name is unconfirmed rather
-///   than absent.
+/// - a failed call after a full page whose text is wrangler's empty-page
+///   error per [`is_empty_page_error`]: complete;
+/// - a successful full page that adds no new token while a wanted name is
+///   still missing (wrangler may have repeated a page): NOT complete;
+/// - any OTHER failed call after a full page (a transient error, text that
+///   only mentions the marker, or a runner error): NOT complete.
 ///
-/// A failed FIRST page is [`ListError::Unavailable`]. Hitting the page cap
-/// while pages still add tokens is [`ListError::TooManyPages`], so absence
-/// is never concluded from a truncated listing.
+/// A missing name is reported absent only from a complete listing; from an
+/// incomplete one it is "could not confirm". A failed FIRST page is
+/// [`ListError::Unavailable`]. Hitting the page cap while pages still add
+/// tokens is [`ListError::TooManyPages`].
 fn list_store_secrets(ctx: &Ctx<'_>, store: &str, wanted: &[&str]) -> Result<Listing, ListError> {
     let mut seen: HashSet<String> = HashSet::new();
     for page in 1..=SECRETS_MAX_PAGES {
@@ -523,7 +544,7 @@ fn list_store_secrets(ctx: &Ctx<'_>, store: &str, wanted: &[&str]) -> Result<Lis
             Ok(o) if page > 1 => {
                 return Ok(Listing {
                     names: seen,
-                    complete: o.stdout.contains(EMPTY_PAGE_MARKER),
+                    complete: is_empty_page_error(&o.stdout),
                 });
             }
             Err(_) if page > 1 => {
@@ -541,10 +562,21 @@ fn list_store_secrets(ctx: &Ctx<'_>, store: &str, wanted: &[&str]) -> Result<Lis
             }
         }
         let rows = o.stdout.lines().filter(|l| !l.trim().is_empty()).count();
-        if rows < SECRETS_PER_PAGE_N || !grew || wanted.iter().all(|w| seen.contains(*w)) {
+        let all_seen = wanted.iter().all(|w| seen.contains(*w));
+        if rows < SECRETS_PER_PAGE_N || all_seen {
             return Ok(Listing {
                 names: seen,
                 complete: true,
+            });
+        }
+        if !grew {
+            // A successful full page that adds nothing new while a wanted
+            // name is still missing: wrangler may have ignored `--page` and
+            // repeated an earlier page, so this is not proof the listing
+            // ended.
+            return Ok(Listing {
+                names: seen,
+                complete: false,
             });
         }
     }
@@ -1858,6 +1890,165 @@ name = "NODE_CONTAINER"
             rep.steps[3].detail.contains("could not confirm"),
             "{:?}",
             rep.steps[3]
+        );
+    }
+
+    #[test]
+    fn marker_embedded_in_a_longer_proxy_error_is_unconfirmed_not_absent() {
+        // A1: a transient error whose text merely MENTIONS wrangler's
+        // empty-page marker inside a longer sentence is not proof the
+        // listing ended -- only the whole message (or its last line)
+        // being exactly that marker counts.
+        let r = healthy_runner();
+        fn full_then_marker_embedded_in_noise(page: usize) -> (bool, String) {
+            if page == 1 {
+                (
+                    true,
+                    page_with(
+                        &[
+                            "github-app-private-key",
+                            "github-webhook-secret",
+                            "cloud-ci-master-key",
+                        ],
+                        SECRETS_PER_PAGE_N,
+                        "filler",
+                    ),
+                )
+            } else {
+                (
+                    false,
+                    s(
+                        "proxy error 503: upstream said 'List request returned no secrets' while retrying (request id 7f3)",
+                    ),
+                )
+            }
+        }
+        let paged = PagedRunner {
+            base: &r,
+            page_result: full_then_marker_embedded_in_noise,
+        };
+        let fs = FakeFs(RefCell::new(configured()));
+        let rep = run_wizard(&paged, &fs, &args(), "cloud-ci");
+        assert_eq!(rep.steps[3].status, Status::Manual, "{:?}", rep.steps[3]);
+        assert!(!rep.failed(), "{:?}", rep.steps);
+        assert!(
+            rep.steps[3].detail.contains("could not confirm"),
+            "{:?}",
+            rep.steps[3]
+        );
+        assert!(
+            !rep.steps[3].detail.contains("not in the Secrets Store"),
+            "{:?}",
+            rep.steps[3]
+        );
+    }
+
+    #[test]
+    fn marker_followed_by_more_text_on_the_last_line_is_unconfirmed() {
+        // A1: the marker must be the WHOLE last line, not a prefix of it.
+        let r = healthy_runner();
+        fn full_then_marker_with_trailing_text(page: usize) -> (bool, String) {
+            if page == 1 {
+                (
+                    true,
+                    page_with(
+                        &[
+                            "github-app-private-key",
+                            "github-webhook-secret",
+                            "cloud-ci-master-key",
+                        ],
+                        SECRETS_PER_PAGE_N,
+                        "filler",
+                    ),
+                )
+            } else {
+                (
+                    false,
+                    s("List request returned no secrets (rate limited, retry later)"),
+                )
+            }
+        }
+        let paged = PagedRunner {
+            base: &r,
+            page_result: full_then_marker_with_trailing_text,
+        };
+        let fs = FakeFs(RefCell::new(configured()));
+        let rep = run_wizard(&paged, &fs, &args(), "cloud-ci");
+        assert_eq!(rep.steps[3].status, Status::Manual, "{:?}", rep.steps[3]);
+        assert!(!rep.failed(), "{:?}", rep.steps);
+    }
+
+    #[test]
+    fn marker_as_the_last_line_after_leading_noise_is_still_a_confirmed_empty_page() {
+        // A1 control: the marker, as the exact last non-empty line (after
+        // an X [ERROR] prefix, a common wrangler decoration), still counts
+        // as confirmation even with an unrelated line before it.
+        let r = healthy_runner();
+        fn full_then_marker_as_last_line(page: usize) -> (bool, String) {
+            if page == 1 {
+                (
+                    true,
+                    page_with(
+                        &[
+                            "github-app-private-key",
+                            "github-webhook-secret",
+                            "cloud-ci-master-key",
+                        ],
+                        SECRETS_PER_PAGE_N,
+                        "filler",
+                    ),
+                )
+            } else {
+                (
+                    false,
+                    s("warn: retrying request\nX [ERROR] List request returned no secrets."),
+                )
+            }
+        }
+        let paged = PagedRunner {
+            base: &r,
+            page_result: full_then_marker_as_last_line,
+        };
+        let fs = FakeFs(RefCell::new(configured()));
+        let rep = run_wizard(&paged, &fs, &args(), "cloud-ci");
+        assert_eq!(rep.steps[3].status, Status::Failed, "{:?}", rep.steps[3]);
+        assert!(
+            rep.steps[3].detail.contains("(github-app-client-secret)"),
+            "{:?}",
+            rep.steps[3]
+        );
+    }
+
+    #[test]
+    fn repeated_full_page_that_adds_no_new_name_is_unconfirmed_not_absent() {
+        // A2: a SUCCESSFUL full page that adds nothing new (wrangler may
+        // have ignored --page and repeated an earlier page) is not proof
+        // the listing ended, as long as a wanted name is still missing.
+        let r = healthy_runner();
+        fn always_the_same_full_page(_page: usize) -> (bool, String) {
+            (
+                true,
+                page_with(&["github-app-private-key"], SECRETS_PER_PAGE_N, "filler"),
+            )
+        }
+        let paged = PagedRunner {
+            base: &r,
+            page_result: always_the_same_full_page,
+        };
+        let fs = FakeFs(RefCell::new(configured()));
+        let rep = run_wizard(&paged, &fs, &args(), "cloud-ci");
+        assert_eq!(rep.steps[3].status, Status::Manual, "{:?}", rep.steps[3]);
+        assert!(!rep.failed(), "{:?}", rep.steps);
+        assert!(
+            rep.steps[3].detail.contains("could not confirm"),
+            "{:?}",
+            rep.steps[3]
+        );
+        let calls = r.calls.borrow().clone();
+        let list_calls = calls.iter().filter(|c| c.contains("secrets-store")).count();
+        assert_eq!(
+            list_calls, 2,
+            "a repeated page must stop after confirming it repeats, not loop to the cap: {calls:?}"
         );
     }
 
