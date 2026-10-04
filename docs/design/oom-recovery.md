@@ -1,6 +1,6 @@
 # `runner: "auto"` real-time OOM recovery: wiring design
 
-**Status: DRAFT - not approved for implementation; blocked on decisions H1, H3, Q1, Q9, Q10.**
+Status: **DRAFT** - not approved for implementation; blocked on decisions H1, H3, Q1, Q9, Q10.
 
 Revision 3, 2026-10-03, after a second independent review of revision 2 (e4364ac). Revision 2
 was judged acceptable as a DRAFT but not ready to drive code: one defect in the second-decision
