@@ -1310,8 +1310,12 @@ async fn handle_start_job(
 /// request carries just `job_name`/`expected_total`/`fail_fast`/
 /// `merge_on_failure`, identical in shape to the internal route's own
 /// request, and inherits that route's idempotency (a redelivered call for
-/// an already-registered `job_name` is a clean no-op) and validation (an
-/// unknown `merge_on_failure` value is a 400) unchanged.
+/// an already-registered `job_name` is a clean no-op). `validate_register_shard_group`
+/// (`coordinator::logic`) rejects a malformed call before it ever reaches
+/// the DO: an empty or over-length `job_name`, a `job_name` containing a
+/// control character, `expected_total` of `0` or over
+/// `cloud_ci_core::split::MAX_SHARDS`, or an unknown `merge_on_failure`
+/// value -- all `Code::InvalidArgument`.
 async fn handle_register_shard_group(
     codec: Codec,
     body: &[u8],
@@ -1319,6 +1323,12 @@ async fn handle_register_shard_group(
     bearer: Option<&str>,
 ) -> std::result::Result<Vec<u8>, ConnectError> {
     let req: RegisterShardGroupRequest = codec.decode(body)?;
+    coordinator::logic::validate_register_shard_group(
+        &req.job_name,
+        req.expected_total,
+        &req.merge_on_failure,
+    )
+    .map_err(|e| ConnectError::new(Code::InvalidArgument, e.to_string()))?;
     let claims = authenticate_ingest_bearer(env, bearer)?;
     let identity = resolve_run_identity(env, &req.run_id).await?;
     require_matching_identity(&claims, &identity)?;

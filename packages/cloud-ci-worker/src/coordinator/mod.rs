@@ -3584,8 +3584,14 @@ impl RunCoordinator {
         if read_run(sql)?.is_none() {
             return error_response(404, "run not found");
         }
-        if logic::MergeOnFailure::from_db_str(&req.merge_on_failure).is_none() {
-            return error_response(400, "unknown merge_on_failure value");
+        if logic::validate_register_shard_group(
+            &req.job_name,
+            req.expected_total,
+            &req.merge_on_failure,
+        )
+        .is_err()
+        {
+            return error_response(400, "invalid register_shard_group request");
         }
         match logic::resolve_register_shard_group(read_job_group(sql, &req.job_name)?.is_some()) {
             logic::RegisterShardGroupDecision::Insert => {

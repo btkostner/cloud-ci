@@ -1479,6 +1479,100 @@ impl MergeOnFailure {
     }
 }
 
+/// `job_group.job_name`'s server-side bound -- not independently
+/// documented anywhere else; chosen generously above any real `ci.shard`
+/// id while still being a stated, enforced cap rather than "whatever D1
+/// happens to accept" (`job_group` is DO-local SQLite, no D1 column to
+/// defer to).
+pub const MAX_JOB_NAME_BYTES: usize = 128;
+
+/// Why [`validate_register_shard_group`] rejected a `RegisterShardGroup`
+/// call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegisterShardGroupValidationError {
+    EmptyJobName,
+    JobNameTooLong {
+        len: usize,
+    },
+    JobNameControlCharacter,
+    /// `0` means nothing will ever satisfy the merge barrier
+    /// (`count(terminal) == expected_total`) -- a group that can never
+    /// complete.
+    ExpectedTotalZero,
+    /// Over `cloud_ci_core::split::MAX_SHARDS` -- the same `1..=64`
+    /// platform bound every other shard-count path in this service
+    /// enforces (`ResolveShardPlan`/`cloud-ci split`), applied here too
+    /// rather than letting a caller register a barrier no real split
+    /// could ever produce.
+    ExpectedTotalTooLarge {
+        max: u32,
+    },
+    UnknownMergeOnFailure,
+}
+
+impl std::fmt::Display for RegisterShardGroupValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RegisterShardGroupValidationError::EmptyJobName => {
+                write!(f, "job_name must be a non-empty string")
+            }
+            RegisterShardGroupValidationError::JobNameTooLong { len } => write!(
+                f,
+                "job_name must be at most {MAX_JOB_NAME_BYTES} bytes, got {len}"
+            ),
+            RegisterShardGroupValidationError::JobNameControlCharacter => {
+                write!(f, "job_name must not contain control characters")
+            }
+            RegisterShardGroupValidationError::ExpectedTotalZero => {
+                write!(f, "expected_total must be 1 or greater")
+            }
+            RegisterShardGroupValidationError::ExpectedTotalTooLarge { max } => {
+                write!(f, "expected_total must be at most {max}")
+            }
+            RegisterShardGroupValidationError::UnknownMergeOnFailure => {
+                write!(f, "unknown merge_on_failure value")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RegisterShardGroupValidationError {}
+
+/// Validates a `RegisterShardGroup` call's fields, independent of any
+/// already-registered config for this `job_name` -- [`resolve_register_shard_group`]'s
+/// Insert/AlreadyRegistered/Conflict decision only ever runs once these
+/// pass, so a malformed call never reaches the "does it match the
+/// existing row" comparison at all.
+pub fn validate_register_shard_group(
+    job_name: &str,
+    expected_total: u32,
+    merge_on_failure: &str,
+) -> Result<(), RegisterShardGroupValidationError> {
+    if job_name.is_empty() {
+        return Err(RegisterShardGroupValidationError::EmptyJobName);
+    }
+    if job_name.len() > MAX_JOB_NAME_BYTES {
+        return Err(RegisterShardGroupValidationError::JobNameTooLong {
+            len: job_name.len(),
+        });
+    }
+    if job_name.chars().any(|c| c.is_control()) {
+        return Err(RegisterShardGroupValidationError::JobNameControlCharacter);
+    }
+    if expected_total == 0 {
+        return Err(RegisterShardGroupValidationError::ExpectedTotalZero);
+    }
+    if expected_total > cloud_ci_core::split::MAX_SHARDS {
+        return Err(RegisterShardGroupValidationError::ExpectedTotalTooLarge {
+            max: cloud_ci_core::split::MAX_SHARDS,
+        });
+    }
+    if MergeOnFailure::from_db_str(merge_on_failure).is_none() {
+        return Err(RegisterShardGroupValidationError::UnknownMergeOnFailure);
+    }
+    Ok(())
+}
+
 /// What `registerShardGroup` should do, given whether a `job_group` row
 /// already exists for this `job_name` — `coordinator::mod::
 /// handle_register_shard_group`'s own doc comment: "a redelivered call
@@ -3785,6 +3879,88 @@ mod tests {
         assert_eq!(MergeOnFailure::from_db_str("IfAnyPassed"), None);
         assert_eq!(MergeOnFailure::from_db_str("sometimes"), None);
         assert_eq!(MergeOnFailure::from_db_str(""), None);
+    }
+
+    #[test]
+    fn validate_register_shard_group_accepts_a_well_formed_request() {
+        assert_eq!(
+            validate_register_shard_group("e2e", 4, "if_any_passed"),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn validate_register_shard_group_rejects_an_empty_job_name() {
+        assert_eq!(
+            validate_register_shard_group("", 1, "if_any_passed"),
+            Err(RegisterShardGroupValidationError::EmptyJobName)
+        );
+    }
+
+    #[test]
+    fn validate_register_shard_group_accepts_a_job_name_at_exactly_the_max_length() {
+        let job_name = "a".repeat(MAX_JOB_NAME_BYTES);
+        assert_eq!(
+            validate_register_shard_group(&job_name, 1, "if_any_passed"),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn validate_register_shard_group_rejects_a_job_name_one_byte_over_the_max() {
+        let job_name = "a".repeat(MAX_JOB_NAME_BYTES + 1);
+        assert_eq!(
+            validate_register_shard_group(&job_name, 1, "if_any_passed"),
+            Err(RegisterShardGroupValidationError::JobNameTooLong {
+                len: MAX_JOB_NAME_BYTES + 1
+            })
+        );
+    }
+
+    #[test]
+    fn validate_register_shard_group_rejects_a_job_name_with_a_control_character() {
+        assert_eq!(
+            validate_register_shard_group("e2e\n", 1, "if_any_passed"),
+            Err(RegisterShardGroupValidationError::JobNameControlCharacter)
+        );
+    }
+
+    #[test]
+    fn validate_register_shard_group_rejects_zero_expected_total() {
+        assert_eq!(
+            validate_register_shard_group("e2e", 0, "if_any_passed"),
+            Err(RegisterShardGroupValidationError::ExpectedTotalZero)
+        );
+    }
+
+    #[test]
+    fn validate_register_shard_group_accepts_expected_total_at_the_platform_max() {
+        assert_eq!(
+            validate_register_shard_group("e2e", cloud_ci_core::split::MAX_SHARDS, "if_any_passed"),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn validate_register_shard_group_rejects_expected_total_one_over_the_platform_max() {
+        assert_eq!(
+            validate_register_shard_group(
+                "e2e",
+                cloud_ci_core::split::MAX_SHARDS + 1,
+                "if_any_passed"
+            ),
+            Err(RegisterShardGroupValidationError::ExpectedTotalTooLarge {
+                max: cloud_ci_core::split::MAX_SHARDS
+            })
+        );
+    }
+
+    #[test]
+    fn validate_register_shard_group_rejects_an_unknown_merge_on_failure() {
+        assert_eq!(
+            validate_register_shard_group("e2e", 1, "sometimes"),
+            Err(RegisterShardGroupValidationError::UnknownMergeOnFailure)
+        );
     }
 
     #[test]
