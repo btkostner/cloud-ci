@@ -435,11 +435,23 @@ pub const CLAIM_PENDING_SQL: &str = "UPDATE ai_insight SET claimed_at = ?2 \
 
 /// Releases a claim after a network/binding failure (not a validation
 /// failure — those write a terminal `status` and leave the claim moot) so a
-/// later pass can retry this row without waiting out the full lease. Param:
-/// `?1` id. Guarded by `status = 'pending_model_call'` so it is a no-op
-/// once a concurrent attempt already reached a terminal status.
-pub const RELEASE_CLAIM_SQL: &str =
-    "UPDATE ai_insight SET claimed_at = NULL WHERE id = ?1 AND status = 'pending_model_call'";
+/// later pass can retry this row without waiting out the full lease. Params:
+/// `?1` id, `?2` the releasing pass's own claim timestamp (the `now_ms` it
+/// passed to [`CLAIM_PENDING_SQL`]). Guarded by `status =
+/// 'pending_model_call'` so it is a no-op once a concurrent attempt already
+/// reached a terminal status, and by `claimed_at = ?2` so a pass whose lease
+/// expired cannot clear a newer pass's live claim.
+pub const RELEASE_CLAIM_SQL: &str = "UPDATE ai_insight SET claimed_at = NULL \
+     WHERE id = ?1 AND status = 'pending_model_call' AND claimed_at = ?2";
+
+/// Candidate rows for one model-call pass: pending rows not held by a live
+/// claim, oldest first, so claimed rows cannot starve newer pending rows.
+/// Params: `?1` now_ms, `?2` lease_ms, `?3` limit. Only a filter —
+/// [`CLAIM_PENDING_SQL`] stays the authority on who may call the model.
+pub const SELECT_CLAIMABLE_SQL: &str = "SELECT id, repo_id, context_json FROM ai_insight \
+     WHERE status = 'pending_model_call' \
+     AND (claimed_at IS NULL OR claimed_at <= ?1 - ?2) \
+     ORDER BY created_at ASC LIMIT ?3";
 
 /// Whether a [`CLAIM_PENDING_SQL`] conditional `UPDATE` won the race, from
 /// D1's reported changed-row count. An unknown count (`None`, a driver
@@ -923,9 +935,9 @@ mod migration_sql_tests {
             params!["ins_claim", 5000_i64, lease],
         )?;
 
-        // A failed call releases the claim: an immediate re-claim succeeds
-        // without waiting out the lease.
-        conn.execute(super::RELEASE_CLAIM_SQL, params!["ins_claim"])?;
+        // A failed call releases the claim with its own claim timestamp: an
+        // immediate re-claim succeeds without waiting out the lease.
+        conn.execute(super::RELEASE_CLAIM_SQL, params!["ins_claim", 5000_i64])?;
         let reclaim_after_release = conn.execute(
             super::CLAIM_PENDING_SQL,
             params!["ins_claim", 5001_i64, lease],
@@ -944,8 +956,58 @@ mod migration_sql_tests {
         )?;
         assert!(!super::claim_won(Some(claim_after_resolved)));
         let release_after_resolved_changes =
-            conn.execute(super::RELEASE_CLAIM_SQL, params!["ins_claim"])?;
+            conn.execute(super::RELEASE_CLAIM_SQL, params!["ins_claim", 5001_i64])?;
         assert_eq!(release_after_resolved_changes, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn stale_pass_release_cannot_clear_a_newer_live_claim() -> rusqlite::Result<()> {
+        // Pass A claims, A's lease expires without A releasing (e.g. A
+        // crashed mid-call), pass B reclaims the now-stale row, and only
+        // *then* does A's model call finally fail and try to release —
+        // using A's own stale claim timestamp. That release must not
+        // touch B's live claim.
+        let conn = db_after_0021()?;
+        conn.execute(
+            super::INSERT_INSIGHT_SQL,
+            params!["ins_claim", 1_i64, "run1", "fp1", "v1", "{}", 1000_i64],
+        )?;
+        let lease = super::MODEL_CALL_CLAIM_LEASE_MS;
+
+        let a_claim_at = 5000_i64;
+        let a_claimed = conn.execute(
+            super::CLAIM_PENDING_SQL,
+            params!["ins_claim", a_claim_at, lease],
+        )?;
+        assert!(super::claim_won(Some(a_claimed)));
+
+        // A's lease expires; B reclaims with its own, newer timestamp.
+        let b_claim_at = a_claim_at + lease;
+        let b_claimed = conn.execute(
+            super::CLAIM_PENDING_SQL,
+            params!["ins_claim", b_claim_at, lease],
+        )?;
+        assert!(super::claim_won(Some(b_claimed)));
+
+        // A's (late) release, using A's own stale claim timestamp, must be
+        // a no-op — `claimed_at = ?2` no longer matches B's value.
+        let a_release_changes =
+            conn.execute(super::RELEASE_CLAIM_SQL, params!["ins_claim", a_claim_at])?;
+        assert_eq!(a_release_changes, 0);
+
+        // B's claim must still be in place: a third pass racing right now
+        // (before B's own lease expires) must not win.
+        let third_claim = conn.execute(
+            super::CLAIM_PENDING_SQL,
+            params!["ins_claim", b_claim_at + 1, lease],
+        )?;
+        assert!(!super::claim_won(Some(third_claim)));
+
+        // B's own release, with B's own timestamp, does work.
+        let b_release_changes =
+            conn.execute(super::RELEASE_CLAIM_SQL, params!["ins_claim", b_claim_at])?;
+        assert_eq!(b_release_changes, 1);
         Ok(())
     }
 
