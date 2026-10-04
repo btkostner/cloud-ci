@@ -247,8 +247,11 @@ mod tests {
 
     fn parse(argv: &[&str]) -> AllowedOrgsArgs {
         let cli = Cli::parse_from(argv);
-        let Command::Setup(SetupCommand::AllowedOrgs(args)) = cli.command else {
-            unreachable!("expected Command::Setup(SetupCommand::AllowedOrgs)");
+        let Command::Setup(setup_args) = cli.command else {
+            unreachable!("expected Command::Setup");
+        };
+        let Some(SetupCommand::AllowedOrgs(args)) = setup_args.command else {
+            unreachable!("expected SetupCommand::AllowedOrgs");
         };
         args
     }

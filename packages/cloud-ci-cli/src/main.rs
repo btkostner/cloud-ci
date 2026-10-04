@@ -6,6 +6,7 @@ mod lint;
 mod scope;
 mod setup;
 mod setup_github_app;
+mod setup_wizard;
 mod split;
 mod upload;
 
@@ -48,21 +49,39 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Command::Setup(SetupCommand::AllowedOrgs(args)) => match setup::run_allowed_orgs(&args) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(err) => {
-                eprintln!("cloud-ci setup allowed-orgs: {err}");
-                ExitCode::FAILURE
-            }
-        },
-        Command::Setup(SetupCommand::GithubApp(args)) => {
-            match setup_github_app::run_github_app(&args) {
+        Command::Setup(args) => match args.command {
+            Some(SetupCommand::AllowedOrgs(a)) => match setup::run_allowed_orgs(&a) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    eprintln!("cloud-ci setup allowed-orgs: {err}");
+                    ExitCode::FAILURE
+                }
+            },
+            Some(SetupCommand::GithubApp(a)) => match setup_github_app::run_github_app(&a) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(err) => {
                     eprintln!("cloud-ci setup github-app: {err}");
                     ExitCode::FAILURE
                 }
+            },
+            None => {
+                let exe = std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.to_str().map(str::to_string))
+                    .unwrap_or_else(|| "cloud-ci".to_string());
+                let report = setup_wizard::run_wizard(
+                    &setup_wizard::RealRunner,
+                    &setup_wizard::RealFs,
+                    &args.wizard,
+                    &exe,
+                );
+                print!("{}", report.render(args.wizard.dry_run));
+                if report.failed() {
+                    ExitCode::FAILURE
+                } else {
+                    ExitCode::SUCCESS
+                }
             }
-        }
+        },
     }
 }

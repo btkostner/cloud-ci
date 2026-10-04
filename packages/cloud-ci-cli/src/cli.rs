@@ -40,12 +40,15 @@
 //! cloud-ci agent --cgroup-path /sys/fs/cgroup --duration-secs 60
 //! ```
 //!
-//! and `setup`, deployment-operator configuration changes with two
-//! leaves: `allowed-orgs`, per `docs/design/auth.md`'s "Org allowlist
-//! changes" paragraph, and `github-app`, per that doc's "### GitHub App
-//! setup" sequence diagram — see `SetupCommand`'s doc comment for both:
+//! and `setup`, deployment-operator configuration. Bare `cloud-ci setup`
+//! runs the idempotent setup wizard (`crate::setup_wizard`); two leaves run
+//! one step directly: `allowed-orgs`, per `docs/design/auth.md`'s "Org
+//! allowlist changes" paragraph, and `github-app`, per that doc's "###
+//! GitHub App setup" sequence diagram — see `SetupCommand`'s doc comment
+//! for both:
 //!
 //! ```text
+//! cloud-ci setup
 //! cloud-ci setup allowed-orgs --add acme-labs
 //! cloud-ci setup github-app --name "cloud-ci (acme)" \
 //!   --allowed-orgs acme-corp,acme-labs --deployment-url https://ci.acme.example \
@@ -90,10 +93,74 @@ pub enum Command {
     /// collected samples as JSON. See `AgentArgs`' own `--help` text for
     /// this round's scope limitation.
     Agent(AgentArgs),
-    /// Deployment-operator configuration changes. See `SetupCommand`'s doc
-    /// comment.
+    /// Deployment-operator configuration changes: `cloud-ci setup` alone
+    /// runs the idempotent setup wizard (`crate::setup_wizard::run_wizard`,
+    /// see that module's doc comment); `cloud-ci setup allowed-orgs` and
+    /// `cloud-ci setup github-app` run one step directly. See
+    /// `SetupCommand`'s doc comment for the two direct subcommands.
+    Setup(SetupArgs),
+}
+
+/// `cloud-ci setup [--dry-run] [--name ...] [--allowed-orgs ...]
+/// [--deployment-url ...] [--cloudflare-account-id ...]
+/// [--secrets-store-id ...] [--public] [--file <path>]` with no
+/// subcommand runs every step in `docs/design/deployment.md`'s "Setup
+/// wizard" in order, skipping steps already satisfied. The GitHub-App
+/// flags here are optional and only matter if that step still needs to
+/// run (passed straight through to the same `github-app` subcommand
+/// below); the wizard never guesses them.
+#[derive(Debug, Parser)]
+pub struct SetupArgs {
     #[command(subcommand)]
-    Setup(SetupCommand),
+    pub command: Option<SetupCommand>,
+
+    #[command(flatten)]
+    pub wizard: WizardArgs,
+}
+
+#[derive(Debug, Parser)]
+pub struct WizardArgs {
+    /// Path to the `wrangler.toml` the wizard inspects and edits. Same
+    /// default as `AllowedOrgsArgs::file`/`GithubAppArgs::file`.
+    #[arg(long, default_value = "packages/cloud-ci-worker/wrangler.toml")]
+    pub file: std::path::PathBuf,
+
+    /// Check current state and print what would happen; run no mutating
+    /// command (`wrangler deploy`, `d1 migrations apply`, secret
+    /// creation, `wrangler.toml` writes).
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Forwarded to the `github-app` step if it still needs to run. See
+    /// `GithubAppArgs::name`.
+    #[arg(long)]
+    pub name: Option<String>,
+
+    /// Forwarded to the `github-app` step if it still needs to run, and
+    /// used by the `allowed-orgs` step to decide which logins to add. See
+    /// `GithubAppArgs::allowed_orgs`.
+    #[arg(long)]
+    pub allowed_orgs: Option<String>,
+
+    /// Forwarded to the `github-app` step if it still needs to run. See
+    /// `GithubAppArgs::deployment_url`.
+    #[arg(long)]
+    pub deployment_url: Option<String>,
+
+    /// Forwarded to the `github-app` step if it still needs to run. See
+    /// `GithubAppArgs::cloudflare_account_id`.
+    #[arg(long)]
+    pub cloudflare_account_id: Option<String>,
+
+    /// Forwarded to the `github-app` step if it still needs to run. See
+    /// `GithubAppArgs::secrets_store_id`.
+    #[arg(long)]
+    pub secrets_store_id: Option<String>,
+
+    /// Forwarded to the `github-app` step if it still needs to run. See
+    /// `GithubAppArgs::public`.
+    #[arg(long)]
+    pub public: bool,
 }
 
 /// `cloud-ci setup <subcommand>`: `allowed-orgs` (above) and `github-app`
