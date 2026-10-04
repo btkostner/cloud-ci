@@ -845,14 +845,7 @@ async fn ai_model_call_pass(env: &Env) -> Result<()> {
                          (unrecoverable — retrying would never deserialize it): {e}",
                         row.id,
                     );
-                    db.prepare(ai_queue::MARK_CONTEXT_UNPARSABLE_SQL)
-                        .bind(&[
-                            JsValue::from_str(&row.id),
-                            JsValue::from_f64(claim_now_ms as f64),
-                            JsValue::from_f64(Date::now().as_millis() as f64),
-                        ])?
-                        .run()
-                        .await?;
+                    mark_context_unparsable(&db, &row.id, claim_now_ms).await;
                     continue;
                 }
             };
@@ -932,6 +925,39 @@ async fn release_claim(db: &worker::D1Database, insight_id: &str, claimed_at_ms:
         worker::console_log!(
             "ai: releasing claim on ai_insight {insight_id} failed (will self-heal after the \
              lease expires): {e}",
+        );
+    }
+}
+
+/// Terminal transition for a row whose claimed `context_json` could not be
+/// deserialized ([`ai_queue::MARK_CONTEXT_UNPARSABLE_SQL`]'s own doc
+/// comment). Guarded by `claimed_at = claimed_at_ms` the same way
+/// [`release_claim`] is, so a pass whose lease already expired cannot
+/// terminate a different, newer pass's live claim. Best-effort like
+/// `release_claim`: an error here only means this row stays claimed until
+/// its lease expires, after which a later pass re-selects it, re-fails the
+/// same deserialization, and retries this terminal `UPDATE` — so it is
+/// logged, not propagated (never aborts the whole batch pass over one bad
+/// row).
+async fn mark_context_unparsable(db: &worker::D1Database, insight_id: &str, claimed_at_ms: i64) {
+    let stmt = match db.prepare(ai_queue::MARK_CONTEXT_UNPARSABLE_SQL).bind(&[
+        JsValue::from_str(insight_id),
+        JsValue::from_f64(claimed_at_ms as f64),
+        JsValue::from_f64(Date::now().as_millis() as f64),
+    ]) {
+        Ok(s) => s,
+        Err(e) => {
+            worker::console_log!(
+                "ai: binding terminal-status params for ai_insight {insight_id} failed (will \
+                 retry after the claim's lease expires): {e}",
+            );
+            return;
+        }
+    };
+    if let Err(e) = stmt.run().await {
+        worker::console_log!(
+            "ai: marking ai_insight {insight_id} status=error failed (will retry after the \
+             claim's lease expires): {e}",
         );
     }
 }
