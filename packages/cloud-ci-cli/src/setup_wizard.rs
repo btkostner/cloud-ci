@@ -474,26 +474,37 @@ fn name_tokens(text: &str) -> impl Iterator<Item = &str> {
         .filter(|t| !t.is_empty())
 }
 
+/// Names read from a store listing, and whether the listing is proven
+/// complete (so a missing name is really absent).
+struct Listing {
+    names: HashSet<String>,
+    complete: bool,
+}
+
+/// wrangler 4.145.0's error text for an EMPTY page (`[unverified]` against
+/// a live account: read from its distributed source). Only this text after
+/// a full page proves the listing ended; any other failure may be transient.
+const EMPTY_PAGE_MARKER: &str = "List request returned no secrets";
+
 /// Reads `wrangler secrets-store secret list` pages (`--page`/`--per-page`)
-/// and returns every token seen.
+/// and returns every token seen plus whether the listing is complete.
 ///
-/// wrangler 4.145.0 fails (non-zero exit, "List request returned no
-/// secrets.") on an EMPTY page, so the loop ends in one of these ways:
+/// The loop ends in one of these ways:
 /// - a page with fewer than [`SECRETS_PER_PAGE_N`] non-empty output lines
 ///   (header and border lines only inflate the count, which is the safe
-///   direction: it can only cause one more request);
-/// - a failed call after at least one successful page (end of listing);
-/// - a page that adds no new token;
-/// - every wanted name seen.
+///   direction: it can only cause one more request): complete;
+/// - a page that adds no new token: complete;
+/// - every wanted name seen: complete (nothing left to look for);
+/// - a failed call after a full page whose text contains
+///   [`EMPTY_PAGE_MARKER`]: complete (wrangler's real empty-page error);
+/// - any OTHER failed call after a full page (a transient error, or a
+///   runner error): NOT complete, so a missing name is unconfirmed rather
+///   than absent.
 ///
 /// A failed FIRST page is [`ListError::Unavailable`]. Hitting the page cap
 /// while pages still add tokens is [`ListError::TooManyPages`], so absence
 /// is never concluded from a truncated listing.
-fn list_store_secrets(
-    ctx: &Ctx<'_>,
-    store: &str,
-    wanted: &[&str],
-) -> Result<HashSet<String>, ListError> {
+fn list_store_secrets(ctx: &Ctx<'_>, store: &str, wanted: &[&str]) -> Result<Listing, ListError> {
     let mut seen: HashSet<String> = HashSet::new();
     for page in 1..=SECRETS_MAX_PAGES {
         let args = [
@@ -509,7 +520,18 @@ fn list_store_secrets(
         ];
         let o = match ctx.runner.run("wrangler", &args, None) {
             Ok(o) if o.success => o,
-            _ if page > 1 => return Ok(seen),
+            Ok(o) if page > 1 => {
+                return Ok(Listing {
+                    names: seen,
+                    complete: o.stdout.contains(EMPTY_PAGE_MARKER),
+                });
+            }
+            Err(_) if page > 1 => {
+                return Ok(Listing {
+                    names: seen,
+                    complete: false,
+                });
+            }
             _ => return Err(ListError::Unavailable),
         };
         let mut grew = false;
@@ -520,7 +542,10 @@ fn list_store_secrets(
         }
         let rows = o.stdout.lines().filter(|l| !l.trim().is_empty()).count();
         if rows < SECRETS_PER_PAGE_N || !grew || wanted.iter().all(|w| seen.contains(*w)) {
-            return Ok(seen);
+            return Ok(Listing {
+                names: seen,
+                complete: true,
+            });
         }
     }
     Err(ListError::TooManyPages)
@@ -577,6 +602,7 @@ fn step_secrets(ctx: &mut Ctx<'_>) -> Outcome {
     }
     let mut unverified: Vec<String> = Vec::new();
     let mut absent: Vec<String> = Vec::new();
+    let mut unconfirmed: Vec<String> = Vec::new();
     for store in stores {
         let wanted: Vec<&str> = bound
             .iter()
@@ -584,10 +610,14 @@ fn step_secrets(ctx: &mut Ctx<'_>) -> Outcome {
             .map(|(_, _, sn)| *sn)
             .collect();
         match list_store_secrets(ctx, store, &wanted) {
-            Ok(found) => {
+            Ok(listing) => {
                 for (b, st, sn) in &bound {
-                    if *st == store && !found.contains(*sn) {
-                        absent.push(format!("{b} ({sn})"));
+                    if *st == store && !listing.names.contains(*sn) {
+                        if listing.complete {
+                            absent.push(format!("{b} ({sn})"));
+                        } else {
+                            unconfirmed.push(format!("{b} ({sn})"));
+                        }
                     }
                 }
             }
@@ -614,6 +644,19 @@ fn step_secrets(ctx: &mut Ctx<'_>) -> Outcome {
             format!(
                 "wrangler.toml binds secrets that are not in the Secrets Store: {}. Re-run `cloud-ci setup github-app` or create them with `wrangler secrets-store secret create`.",
                 absent.join(", ")
+            ),
+        );
+    }
+    if !unconfirmed.is_empty() {
+        ctx.checklist.push(format!(
+            "Confirm these secrets exist in the Secrets Store (the listing may have been cut short by an error): {}",
+            unconfirmed.join(", ")
+        ));
+        return out(
+            Status::Manual,
+            format!(
+                "could not confirm: the Secrets Store listing may have been cut short by an error, so these were not found but are not proven absent: {}",
+                unconfirmed.join(", ")
             ),
         );
     }
@@ -1681,6 +1724,144 @@ name = "NODE_CONTAINER"
     }
 
     #[test]
+    fn full_page_then_transient_failure_is_unconfirmed_not_absent() {
+        // P1: a failure on page 2 that is NOT wrangler's own empty-page
+        // error text must not be read as "the listing ended, so the
+        // missing name is absent" -- it may just be a transient error
+        // that cut the listing short. Report "could not confirm", not
+        // Failed.
+        let r = healthy_runner();
+        fn full_then_transient_failure(page: usize) -> (bool, String) {
+            if page == 1 {
+                (
+                    true,
+                    page_with(
+                        &[
+                            "github-app-private-key",
+                            "github-webhook-secret",
+                            "cloud-ci-master-key",
+                        ],
+                        SECRETS_PER_PAGE_N,
+                        "filler",
+                    ),
+                )
+            } else {
+                (false, s("network error: fetch failed"))
+            }
+        }
+        let paged = PagedRunner {
+            base: &r,
+            page_result: full_then_transient_failure,
+        };
+        let fs = FakeFs(RefCell::new(configured()));
+        let rep = run_wizard(&paged, &fs, &args(), "cloud-ci");
+        assert_eq!(rep.steps[3].status, Status::Manual, "{:?}", rep.steps[3]);
+        assert!(!rep.failed(), "{:?}", rep.steps);
+        assert!(
+            rep.steps[3].detail.contains("could not confirm"),
+            "{:?}",
+            rep.steps[3]
+        );
+        assert!(
+            !rep.steps[3].detail.contains("not in the Secrets Store"),
+            "{:?}",
+            rep.steps[3]
+        );
+        assert!(
+            rep.steps[3].detail.contains("(github-app-client-secret)"),
+            "{:?}",
+            rep.steps[3]
+        );
+        let calls = r.calls.borrow().clone();
+        let list_calls = calls.iter().filter(|c| c.contains("secrets-store")).count();
+        assert_eq!(list_calls, 2, "{calls:?}");
+    }
+
+    #[test]
+    fn transient_failure_on_page_two_with_every_wanted_name_still_on_page_two_is_unconfirmed() {
+        // Reproduces the post-merge review's run h: a 120-secret store
+        // where the four wanted names are on page 2, and page 2 fails
+        // transiently -- none of the names were ever seen, but that must
+        // not be reported as "absent", since the listing never finished.
+        let r = healthy_runner();
+        fn full_filler_then_transient_failure(page: usize) -> (bool, String) {
+            if page == 1 {
+                (true, page_with(&[], SECRETS_PER_PAGE_N, "filler"))
+            } else {
+                (false, s("502 Bad Gateway"))
+            }
+        }
+        let paged = PagedRunner {
+            base: &r,
+            page_result: full_filler_then_transient_failure,
+        };
+        let fs = FakeFs(RefCell::new(configured()));
+        let rep = run_wizard(&paged, &fs, &args(), "cloud-ci");
+        assert_eq!(rep.steps[3].status, Status::Manual, "{:?}", rep.steps[3]);
+        assert!(!rep.failed(), "{:?}", rep.steps);
+        assert!(
+            rep.steps[3].detail.contains("could not confirm"),
+            "{:?}",
+            rep.steps[3]
+        );
+        let calls = r.calls.borrow().clone();
+        let list_calls = calls.iter().filter(|c| c.contains("secrets-store")).count();
+        assert_eq!(
+            list_calls, 2,
+            "a third page must never be requested after page 2 fails: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn runner_transport_error_on_page_two_after_a_full_page_is_also_unconfirmed() {
+        // Same as the above, but page 2's failure is a true `Err` from the
+        // runner (e.g. the subprocess itself could not start), not just a
+        // non-zero exit -- pins the separate `Err(_) if page > 1` arm.
+        let r = healthy_runner();
+        struct ErrOnPage2<'a>(&'a FakeRunner);
+        impl Runner for ErrOnPage2<'_> {
+            fn run(&self, p: &str, a: &[String], c: Option<&Path>) -> Result<CmdOutput, String> {
+                if a.first().map(String::as_str) == Some("secrets-store")
+                    && a.iter().any(|x| x == "2")
+                {
+                    let line = format!("{p} {}", a.join(" "));
+                    self.0.calls.borrow_mut().push(line.clone());
+                    self.0.timeline.borrow_mut().push(format!("CALL: {line}"));
+                    return Err("simulated subprocess spawn failure".to_string());
+                }
+                if a.first().map(String::as_str) == Some("secrets-store") {
+                    let line = format!("{p} {}", a.join(" "));
+                    self.0.calls.borrow_mut().push(line.clone());
+                    self.0.timeline.borrow_mut().push(format!("CALL: {line}"));
+                    return Ok(CmdOutput {
+                        success: true,
+                        stdout: page_with(&[], SECRETS_PER_PAGE_N, "filler"),
+                    });
+                }
+                self.0.run(p, a, c)
+            }
+            fn run_inherit(&self, p: &str, a: &[String]) -> Result<bool, String> {
+                self.0.run_inherit(p, a)
+            }
+            fn env_is_set(&self, n: &str) -> bool {
+                self.0.env_is_set(n)
+            }
+            fn announce(&self, msg: &str) {
+                self.0.announce(msg)
+            }
+        }
+        let fs = FakeFs(RefCell::new(configured()));
+        let rep = run_wizard(&ErrOnPage2(&r), &fs, &args(), "cloud-ci");
+        assert_eq!(rep.steps[3].status, Status::Manual, "{:?}", rep.steps[3]);
+        assert!(!rep.failed(), "{:?}", rep.steps);
+        assert!(
+            rep.steps[3].detail.contains("could not confirm"),
+            "{:?}",
+            rep.steps[3]
+        );
+    }
+
+    #[test]
     fn secrets_store_pagination_caps_and_fails_closed() {
         let r = healthy_runner();
         fn always_new(page: usize) -> (bool, String) {
@@ -1730,5 +1911,99 @@ name = "NODE_CONTAINER"
         assert!(rep.steps[1].detail.contains("line"));
         assert!(!rep.steps[1].detail.contains(secret_token));
         assert!(!rep.steps[1].detail.contains("BROKEN"));
+    }
+
+    #[test]
+    fn t1_picks_the_first_non_empty_binding_entry_not_the_first_entry() {
+        // T1: a wrangler.toml with two `[[secrets_store_secrets]]` entries
+        // for the same binding, where the first is empty (as a hand-edit
+        // or a failed partial write might leave) and the second is the
+        // real one, must use the second -- not fail on the first's empty
+        // store_id.
+        let r = healthy_runner();
+        let mut toml = configured();
+        toml = toml.replacen(
+            "[[secrets_store_secrets]]\nbinding = \"GITHUB_APP_PRIVATE_KEY\"\nstore_id = \"st\"\nsecret_name = \"github-app-private-key\"\n",
+            "[[secrets_store_secrets]]\nbinding = \"GITHUB_APP_PRIVATE_KEY\"\nstore_id = \"\"\nsecret_name = \"\"\n[[secrets_store_secrets]]\nbinding = \"GITHUB_APP_PRIVATE_KEY\"\nstore_id = \"st\"\nsecret_name = \"github-app-private-key\"\n",
+            1,
+        );
+        let fs = FakeFs(RefCell::new(toml));
+        let rep = run_wizard(&r, &fs, &args(), "cloud-ci");
+        assert_eq!(
+            rep.steps[3].status,
+            Status::AlreadyDone,
+            "{:?}",
+            rep.steps[3]
+        );
+    }
+
+    #[test]
+    fn t2_allowed_orgs_rejects_a_leading_dash_file_without_running_a_command() {
+        // T2: the same leading-'-' --file validation that step_github_app
+        // has must also apply to step_allowed_orgs (they independently
+        // forward --file to a spawned `cloud-ci` subcommand).
+        let r = healthy_runner();
+        let mut a = args();
+        a.file = PathBuf::from("-w.toml");
+        a.allowed_orgs = Some("newco".into());
+        let fs = FakeFs(RefCell::new(configured()));
+        let rep = run_wizard(&r, &fs, &a, "cloud-ci");
+        assert_eq!(rep.steps[5].status, Status::Failed, "{:?}", rep.steps[5]);
+        assert!(
+            rep.steps[5]
+                .detail
+                .contains("--file must not start with '-'")
+        );
+        assert!(
+            !r.calls
+                .borrow()
+                .iter()
+                .any(|c| c.starts_with("cloud-ci setup allowed-orgs"))
+        );
+    }
+
+    #[test]
+    fn t3_stops_reading_once_every_wanted_name_is_seen_on_a_full_page() {
+        // T3: the `wanted.iter().all(|w| seen.contains(*w))` early exit
+        // saves a request once every name has been found, even on a full
+        // (100-row) page that would otherwise look like more pages follow.
+        let r = healthy_runner();
+        fn all_found_on_a_full_page_one(page: usize) -> (bool, String) {
+            if page == 1 {
+                (
+                    true,
+                    page_with(
+                        &[
+                            "github-app-private-key",
+                            "github-app-client-secret",
+                            "github-webhook-secret",
+                            "cloud-ci-master-key",
+                        ],
+                        SECRETS_PER_PAGE_N,
+                        "filler",
+                    ),
+                )
+            } else {
+                (
+                    true,
+                    page_with(&[], SECRETS_PER_PAGE_N, &format!("more-{page}")),
+                )
+            }
+        }
+        let paged = PagedRunner {
+            base: &r,
+            page_result: all_found_on_a_full_page_one,
+        };
+        let fs = FakeFs(RefCell::new(configured()));
+        let rep = run_wizard(&paged, &fs, &args(), "cloud-ci");
+        assert_eq!(
+            rep.steps[3].status,
+            Status::AlreadyDone,
+            "{:?}",
+            rep.steps[3]
+        );
+        let calls = r.calls.borrow().clone();
+        let list_calls = calls.iter().filter(|c| c.contains("secrets-store")).count();
+        assert_eq!(list_calls, 1, "{calls:?}");
     }
 }
