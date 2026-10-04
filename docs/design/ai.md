@@ -129,6 +129,8 @@ flowchart LR
 
 Consumer settings: `max_batch_size = 1`, because each message makes a model call that can take several seconds. `max_retries = 3`, and failures go to a dead-letter queue, `cloud-ci-analysis-dlq`. A 429 from Workers AI or the gateway is retried with the message's `delaySeconds` backoff (30s, 120s, 600s). `[unverified]` These are workers-rs Queue consumer knobs; how to express them depends on wrangler config, not code.
 
+Consumer idempotency: a redelivered `AnalysisRequested` message, or a retry after a partial write, never stores a duplicate `ai_insight` row or spends a second model call for the same `(run_id, kind, fingerprint, prompt_version, diff_hash)`. `migrations/0021_ai_insight_idempotency.sql` adds a unique index on that key (deduping any pre-existing duplicates first) plus `INSERT ... ON CONFLICT DO NOTHING` in the consumer; the model-call pass claims a row with a conditional `UPDATE` on `ai_insight.claimed_at` before calling the model, so two overlapping passes cannot both call the model for one row.
+
 ### Failure summaries: inputs
 
 The context builder collects inputs in priority order and stops when the budget is full. Everything is read from data cloud-ci already stores. The one exception is the PR diff, which is fetched from GitHub with the installation token (`GET /repos/{owner}/{repo}/pulls/{n}` with the `application/vnd.github.v3.diff` media type, documented at https://docs.github.com/en/rest/pulls/reviews, checked 2026-09-30).
