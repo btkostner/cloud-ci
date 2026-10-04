@@ -46,7 +46,7 @@ decision. Everything else is a stated rule or an owner question in §9.
 
 | Review finding | Root cause | Where this design closes it |
 | --- | --- | --- |
-| O1: second OOM undetectable | The retry's node id and attempt were never carried into the new container, so its report looked like a replay of the original (`decide_oom_recovery` doc: "indistinguishable from a duplicate delivery"). | §1: node id + shard attempt are injected at start; the report's `node_id` must equal the id derived from the report's own `(job, idx, attempt)`. |
+| O1: second OOM undetectable | The retry's node id and attempt were never carried into the new container, so its report looked like a replay of the original (`decide_oom_recovery` doc: "indistinguishable from a duplicate delivery"). | §1: under **option A (and C)**, node id + shard attempt are injected into the container's env at start, and the report's `node_id` must equal the id derived from the report's own `(job, idx, attempt)`; under **option B**, the coordinator takes the node id and attempt directly from the node row at `/complete-node` time, so there is nothing to carry into a report at all. |
 | O2/O3: post-decision failures not healed | Effects were run inline once; a crash or D1/stop failure stranded the lineage. | §3: durable per-decision effect flags, drained by an alarm sweep. |
 | O4: old container never stopped | The retry could be dispatched without `StopOld` completing. | §3: fixed effect order; `StartRetry` is gated on `old_stopped` and re-checks live state. |
 | R1: shard-terminal lookup killed the retry | `complete_own_shard_node` resolved by lineage ignoring the reporting attempt. | §4: resolve by exact reporting attempt only. |
@@ -324,28 +324,42 @@ fork extension and no command-wrapping fallback are needed: `NodeContainer` buil
 `ContainerExecOptions`, calls `add_env` for each variable, and passes `Some(options)` where it
 passes `None` today.
 
-* Variables set per node: `CLOUD_CI_NODE_ID={node_id}` and
-  `CLOUD_CI_SHARD_ATTEMPT={shard_attempt}`, plus whatever the agent needs
-  (`CLOUD_CI_TOKEN`, `CLOUD_CI_SERVER_URL`). **Because `exec` env replaces the environment,
-  this changes the environment of every node, not only auto ones**, and no dispatcher mints the
-  token or URL today (roadmap Phase 6: bootstrap-token path not built). See Q3.
-* **Command-template contract (M5, Q14).** `resolve_shard_attempt` and `resolve_node_id` give an
-  explicit flag priority over the env var (`cloud-ci-cli/src/identity.rs`,
-  `cloud-ci-cli/src/agent.rs`). Therefore the command a `runner_auto` shard node is started
-  with MUST carry **no** `--attempt`, `--node-id` or `--instance-type` flags. If it did, the
-  retry (same command, new env) would report the old attempt and node id and fail the §1.1
-  binding rule, so the second OOM would never be detected. `handle_start_node` rejects a
-  `runner_auto` command containing any of those three flags (422
-  `runner_auto_command_carries_identity_flag`). The current size is read from `node.size` (§1.1),
-  not from `--instance-type`.
+* **Variables set per node (needed for OOM detection under option A (and C); still useful,
+  but only for sample attribution, under option B - see below):**
+  `CLOUD_CI_NODE_ID={node_id}` and `CLOUD_CI_SHARD_ATTEMPT={shard_attempt}`, plus whatever the
+  agent needs (`CLOUD_CI_TOKEN`, `CLOUD_CI_SERVER_URL`). **Because `exec` env replaces the
+  environment, this changes the environment of every node, not only auto ones**, and no
+  dispatcher mints the token or URL today (roadmap Phase 6: bootstrap-token path not built).
+  See Q3.
+* **Command-template contract (M5, Q14) - option A (and C) only.** `resolve_shard_attempt` and
+  `resolve_node_id` give an explicit flag priority over the env var (`cloud-ci-cli/src/
+  identity.rs`, `cloud-ci-cli/src/agent.rs`). Therefore, under **option A (and C)**, the
+  command a `runner_auto` shard node is started with MUST carry **no** `--attempt`,
+  `--node-id` or `--instance-type` flags. If it did, the retry (same command, new env) would
+  report the old attempt and node id and fail the §1.1 binding rule, so the second OOM would
+  never be detected. `handle_start_node` rejects a `runner_auto` command containing any of
+  those three flags (422 `runner_auto_command_carries_identity_flag`) **only while option A
+  (or C) is the chosen trigger**; under **option B alone**, this ban is unnecessary for OOM
+  detection, because the coordinator never reads the command's own flags to identify the
+  node - it already has `req.node_id` as the call's own primary key (§1.1). The flags would
+  still exist on the command for the agent's own sample-attribution use (so its
+  `SubmitResourceSamples` batch, if any, is correctly attributed), independent of whether they
+  gate OOM recovery. The current size is read from `node.size` (§1.1), not from
+  `--instance-type`, under either option.
 * `StartNodeRequest` gains `shard_attempt: Option<u32>`, `runner_auto` (§5.1) and the instance
   size; `JobSpec` (`executor.rs`) gains the same; all feed `spec_hash`.
 
-A second OOM then maps unambiguously: the retry agent reports `node_id = shard:{job}:{idx}:{n+1}`
-and `attempt = n+1`; the binding rule matches the retry's node row; `decide_oom_recovery` sees
-the lineage's first decision with `attempt + 1 == incoming.attempt` and returns
-`New(FailedAtMax)` (existing, tested branch). A replay of the original attempt now has a
-different `node_id`/attempt pair and is rejected by the binding rule.
+**Under option A (and C), a second OOM then maps unambiguously** via the report: the retry
+agent reports `node_id = shard:{job}:{idx}:{n+1}` and `attempt = n+1`; the binding rule
+matches the retry's node row; `decide_oom_recovery` sees the lineage's first decision with
+`attempt + 1 == incoming.attempt` and returns `New(FailedAtMax)` (existing, tested branch). A
+replay of the original attempt now has a different `node_id`/attempt pair and is rejected by
+the binding rule. **Under option B**, there is no such report to map: the coordinator already
+knows which node completed (`req.node_id`, §1.1) and which `oom_decision` row (if any) that
+node is the live target of, so the same unambiguous mapping holds trivially, without needing
+the env carriers or the command-template ban at all - they remain useful only so the agent's
+own, separately-delivered samples (if the agent still runs) attribute correctly to the right
+attempt.
 
 ## 2. State
 
@@ -426,7 +440,9 @@ CREATE TABLE IF NOT EXISTS oom_decision (
 *Rules:*
 
 * **Target is always the row's own `target_node_id`.** `target_node_id` is set at insert from
-  the report, never from `base_node_id` and never from `resolve_oom_node_id` (which is replaced
+  the evidence event - under **option A (and C)** that is the report's own `node_id`; under
+  **option B** it is `req.node_id` from the `CompleteNodeRequest` the evidence arrived on
+  (§1.1) - never from `base_node_id` and never from `resolve_oom_node_id` (which is replaced
   in stage 1 by `oom_effect_target(row)`). For seq 1, the target is the original node. For
   seq 2, it is the retry node, which equals seq 1's `retry_node_id`; the insert verifies that
   equality and refuses otherwise.
@@ -438,16 +454,20 @@ CREATE TABLE IF NOT EXISTS oom_decision (
   insert path: read `SELECT MAX(seq) FROM oom_decision WHERE job_name = ? AND idx = ?` (or no
   row), compute `decide_oom_recovery(ladder, existing, incoming)` from that row's projection,
   and `INSERT` the new row with `seq = (max seq) + 1` (`1` if none) - with **no `await`
-  between the read and the insert**. The primary key `(job_name, idx, seq)` is the backstop,
-  not the primary race guard: with no intervening `await`, a second insert at the same
-  `(job_name, idx, seq)` can only happen on re-delivery of the same evidence event, not from a
-  genuine concurrent race.
-* **A primary-key collision on insert is handled as "already decided", never surfaced as an
-  SQL error (D1).** If the `INSERT` fails on the `(job_name, idx, seq)` constraint, the caller
-  re-reads the row that now exists at that `seq`, re-projects it, and returns its `outcome` as
-  `AlreadyDecided` - the same shape `decide_oom_recovery` already returns for a duplicate. This
-  is the re-delivery case: the same evidence event (the same batch content hash under option A,
-  or a duplicate `/complete-node` under option B) reaching the insert a second time.
+  between the read and the insert**. The primary key `(job_name, idx, seq)` is a defensive
+  backstop, not the primary race guard, and in practice **effectively unreachable**: with no
+  intervening `await`, a re-delivery of the same evidence event re-reads the now-latest row
+  (which the first delivery already inserted) and returns `AlreadyDecided` *before* ever
+  reaching a second `INSERT` - it never gets far enough to collide. The constraint exists only
+  to fail loudly, not silently corrupt state, if that invariant is ever violated by a future
+  change (for example two evidence-bearing transactions for the same lineage somehow
+  interleaving with an `await` between the read and the insert, which the current design does
+  not do).
+* **If the backstop is ever reached anyway, it is handled as "already decided", never
+  surfaced as an SQL error (D1).** If the `INSERT` fails on the `(job_name, idx, seq)`
+  constraint, the caller re-reads the row that now exists at that `seq`, re-projects it, and
+  returns its `outcome` as `AlreadyDecided` - the same shape `decide_oom_recovery` already
+  returns for a duplicate.
 * **Duplicate reports must pass the latest row, not always the seq-1 row (D1).** Revision 2
   said "any further report is `AlreadyDecided` (`decide_oom_recovery` already returns this for
   `FailedAtMax`)" - that is correct only once the **seq 2** row exists and is passed as
@@ -556,16 +576,16 @@ The order is already encoded in `logic::next_oom_effect_excluding` and is kept v
 **MarkOldTerminal's "already terminal" case is option-dependent (L1).** Under **option B**,
 evidence and the node's failure are recorded in the same transaction (§1.1), so the target
 node is always still non-terminal when `MarkOldTerminal` runs; a node that is terminal for
-another reason (it naturally `succeeded`, or was `cancelled`) genuinely means someone else won
-the race, and the decision is `abandoned` (§3.6), not overwritten. Under **option A**, the
-target node is very often *already* `failed` (plain exit 137, `closed_by` unset) by the time
-the batch arrives - H1's own problem statement is that this is the dominant case, not an edge
-case. `update_node_status` still writes only when non-terminal, but a node that is `failed`
-with `closed_by` unset **and** the arriving batch classifies as OOM (§1.1's classification)
-is **upgraded**, not abandoned: `closed_by` is set to `'oom'` and `result` is overwritten with
-the OOM message, even though the row was already terminal before this call. Only a node
-terminal as `succeeded`/`cancelled`/`timed_out` is abandoned under option A; a node terminal as
-plain `failed` with matching OOM evidence is upgraded.
+another reason (it naturally `succeeded`, was `cancelled`, or was `skipped`) genuinely means
+someone else won the race, and the decision is `abandoned` (§3.6), not overwritten. Under
+**option A**, the target node is very often *already* `failed` (plain exit 137, `closed_by`
+unset) by the time the batch arrives - H1's own problem statement is that this is the dominant
+case, not an edge case. `update_node_status` still writes only when non-terminal, but a node
+that is `failed` with `closed_by` unset **and** the arriving batch classifies as OOM (§1.1's
+classification) is **upgraded**, not abandoned: `closed_by` is set to `'oom'` and `result` is
+overwritten with the OOM message, even though the row was already terminal before this call.
+Only a node terminal as `succeeded`/`cancelled`/`skipped`/`timed_out` is abandoned under
+option A; a node terminal as plain `failed` with matching OOM evidence is upgraded.
 
 `start()` returns before the container is ready, and later failures need `monitor()`
 (Cloudflare, "Durable Object Container API" page, "Last updated Sep 30, 2026", read
@@ -892,8 +912,10 @@ behavior.
 * `oom_effect_target(row)`: seq 1 returns the original, seq 2 returns the retry node, never
   `base_node_id` (regression for H2's wrong-node result).
 * Second-decision model: seq 1 `retry` then a report with `attempt == observed_attempt + 1`
-  yields `New(FailedAtMax)`; a report with the original attempt and a different node id is
-  rejected by the binding rule; `AlreadyDecided` after seq 2 or a seq 1 `failed_at_max`.
+  yields `New(FailedAtMax)`; under **option A (and C)**, a report with the original attempt
+  and a different node id is rejected by the binding rule (§1.1); under **option B**, the
+  equivalent rejection is a `/complete-node` for a node whose `runner_auto`/`shard_attempt`
+  do not admit it; either way, `AlreadyDecided` after seq 2 or a seq 1 `failed_at_max`.
 * `oom_report_matches_node` (option A only): exact equality with `shard_node_id(job, idx,
   attempt)`; rejects a missing `node_id`, a node id of another attempt, a legacy node
   (`runner_auto = 0`). Option B has no equivalent matcher (§1.1): a test instead asserts the
@@ -930,9 +952,12 @@ after the cap with operator-visible state; **alarm order**: a terminal run with 
 decisions and overflow still drains both and then releases the slot; deadline passed with a
 stuck decision closes the run; a late `/complete-node` for an OOM-closed node writes nothing
 (M1); fail-fast between `InsertRetry` and `StartRetry` leaves no container (M3); healing
-continues with `OOM_RECOVERY` switched off; a seq-1-then-seq-2 PK insert collision (two
-near-simultaneous drains of the same lineage) resolves to `AlreadyDecided`, never a surfaced
-SQL error (D1); **a late or duplicate report after seq 2 exists is a clean no-op** (G6) -
+continues with `OOM_RECOVERY` switched off; **the PK-collision backstop (D1, N6)** - since the
+single-threaded read-then-insert path makes a real collision effectively unreachable (§2.2),
+this is tested by deliberately forcing the stale case rather than racing two drains: call the
+insert path with a stale `existing` (an already-superseded row) so its own `INSERT` targets a
+`seq` the harness pre-populated out of band, and assert the result is `AlreadyDecided`, never
+a surfaced SQL error; **a late or duplicate report after seq 2 exists is a clean no-op** (G6) -
 neither a seq 3 row nor an SQL error; **the seq-2 target node is already terminal when
 `MarkOldTerminal` for seq 2 runs** (G6, e.g. the retry was independently cancelled) - the
 decision proceeds to `StopOld`/projections without a conflicting write.
@@ -993,8 +1018,11 @@ while off (§5.1).
    `ensure_column` refactor.** No behavior change.
 2. **Executor ladder and `exec` env carrier.** The five-rung `durable_object` ladder, `exec`
    `ContainerExecOptions::add_env` for `CLOUD_CI_NODE_ID`, `CLOUD_CI_SHARD_ATTEMPT` and the
-   agent's token/URL (blocked on Q3 for the latter). Changes the environment of all nodes, so it
-   is not inert; ship with its own sign-off.
+   agent's token/URL (blocked on Q3 for the latter). The env carrier is a hard prerequisite
+   for OOM detection only under **option A (and C)** (§1.3); under **option B alone** it is
+   still shipped (the agent still needs its token/URL to upload ordinary reports), but is not
+   itself gating OOM recovery. Changes the environment of all nodes either way, so it is not
+   inert; ship with its own sign-off.
 3. **Barrier feed (blocked on H3/Q10).** Whichever of the two options is chosen. Shippable
    without OOM recovery (it makes a coordinator-failed shard node reach the barrier under
    option 2).
