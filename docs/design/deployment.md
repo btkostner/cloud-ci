@@ -146,23 +146,30 @@ themselves. `--dry-run` runs only read-only checks (`wrangler whoami`, `d1 migra
    `database_id` is not the repo's placeholder. Missing bindings or a still-placeholder id fail
    with the exact fix (e.g. `wrangler d1 create cloud-ci`); this step never edits the file itself.
 3. **D1 migrations** — `wrangler d1 migrations list <db> --remote`, classified positively: the
-   exact text "No migrations to apply" is clean, a listed `.sql` file (or "Migrations to be
-   applied") is pending, and anything else — including a non-zero exit — is undeterminable and
-   fails the step with no mutating command run. Only a positively-pending result (never
-   `--dry-run`) runs `wrangler d1 migrations apply <db> --remote`, first printing which database
-   it targets; a failed apply surfaces a redacted, truncated summary of wrangler's own output
-   instead of a bare "failed". The listing is re-run afterward and must come back positively
-   clean before the step reports done.
+   exact text "No migrations to apply" is clean, the "Migrations to be applied" heading is
+   pending, and anything else — including a non-zero exit — is undeterminable and fails the step
+   with no mutating command run. Only a positively-pending result (never `--dry-run`) runs
+   `wrangler d1 migrations apply <db> --remote`, first printing which database it targets. A
+   failed apply never echoes wrangler's own output — not even redacted — only the database name,
+   a non-zero-exit note, and a fixed hint to run the same command by hand to see the full output
+   (a prior round's heuristic redaction missed real token shapes such as a JWT or a JSON-quoted
+   value; the fix is to print nothing from wrangler at all, not a better heuristic). The listing
+   is re-run afterward and must come back positively clean before the step reports done.
 4. **Secrets Store secrets** — reads the four `[[secrets_store_secrets]]` bindings
    (`GITHUB_APP_PRIVATE_KEY`/`GITHUB_APP_CLIENT_SECRET`/`GITHUB_WEBHOOK_SECRET`/
    `CLOUD_CI_MASTER_KEY`) out of `wrangler.toml` and, if present, confirms each named secret
    shows up in `wrangler secrets-store secret list` for its store — by exact name match, never a
    substring (`FOO` does not match a listed `FOO_OLD`), paging through every result
-   (`--per-page`/`--page`, capped at 50 pages — hitting the cap while new names are still
-   appearing fails the step rather than concluding absence from a truncated listing) until every
-   wanted name is found or a page adds nothing new. No secret value is ever read or printed.
+   (`--per-page 100`/`--page`, capped at 50 pages — hitting the cap while new names are still
+   appearing fails the step rather than concluding absence from a truncated listing). Reading
+   stops after the first page with fewer than 100 output rows (wrangler's own page size), or when
+   a later page's call itself fails — wrangler 4.145.0 throws a non-zero-exit error ("List
+   request returned no secrets.") on a genuinely empty page rather than returning one
+   successfully, so that failure is treated as the end of the listing, not as "could not verify"
+   — **except** a failure on the very first page, which still means the store could not be
+   listed at all (reported manual, not a false absence). No secret value is ever read or printed.
    Missing bindings are reported manual (the next step creates them); a binding that names a
-   secret absent from the store is a hard failure.
+   secret absent from the store is a hard failure naming it.
 5. **GitHub App** — if `GITHUB_APP_ID` is already set and the four secret bindings exist, this is
    a no-op. Otherwise it runs `cloud-ci setup github-app` itself (forwarding `--name`,
    `--allowed-orgs`, `--deployment-url`, `--cloudflare-account-id`, `--secrets-store-id`, `--public`
@@ -187,23 +194,64 @@ regardless of whether the run as a whole succeeded or stopped early.
 ### What is exercised and what is not
 
 The step-ordering, idempotent-re-run, failed-prerequisite-stops, dry-run-changes-nothing,
-secret-redaction, positive migration-state classification (never treating unrecognized or
-failed-exit output as pending), paginated exact-name secret matching, and forwarded-value
-validation behavior are covered by `setup_wizard.rs`'s own unit tests against fake
-command-runner and filesystem implementations — no network, no real `wrangler`, no real
+no-raw-output-on-apply-failure, positive migration-state classification (never treating
+unrecognized or failed-exit output as pending), paginated exact-name secret matching against
+wrangler 4.145.0's documented empty-page failure behavior, announce-before-apply ordering, and
+forwarded-value validation behavior are covered by `setup_wizard.rs`'s own unit tests against
+fake command-runner and filesystem implementations — no network, no real `wrangler`, no real
 Cloudflare/GitHub account, same pattern as the rest of this `setup` family (see "Step by step"
-below). Two of those checks (the migration-list failed-exit branch, and the
-`CLOUDFLARE_API_TOKEN` precheck) were additionally confirmed load-bearing by removing each one
-in a scratch copy and observing its own pinning test fail. Separately, `cloud-ci setup --dry-run`
-was run for real in this environment against this repo's own
-`packages/cloud-ci-worker/wrangler.toml`: `wrangler` was not on the `PATH` the check
-environment's shell used (it is pinned via mise in `packages/cloud-ci-worker/mise.toml`, so a
-shell that has run `mise activate`/`mise exec` there would find it; this check environment's
-shell had not), and no Cloudflare account was available either. The run correctly stopped at
-step 1 with "could not run `wrangler whoami`: No such file or directory" rather than claiming
-success, confirming the fail-closed behavior for exactly that failure mode end to end — but it
-did not exercise steps 2–6 (bindings/migrations/secrets/App/orgs) against a real `wrangler` or
-real Cloudflare state, which this environment does not have.
+below). Three of those checks (the migration-list failed-exit branch, the
+`CLOUDFLARE_API_TOKEN` precheck, and the migration-list `Err` transport-failure branch) were
+additionally confirmed load-bearing by removing each one in a scratch copy and observing its own
+pinning test fail.
+
+Separately, the built `cloud-ci` binary was run against a real subprocess: a shell-script
+`wrangler` on `PATH` that logs every invocation and mimics wrangler 4.145.0's documented output
+shapes, including the empty-page `FatalError` on `secrets-store secret list` and an unrecognized
+`d1 migrations list` listing — see "Real-subprocess evidence" below for the exact scenarios and
+observed calls. `cloud-ci setup --dry-run` was also run once with no fake `wrangler` present at
+all: `wrangler` was not on the `PATH` that shell used (it is pinned via mise in
+`packages/cloud-ci-worker/mise.toml`, so a shell that has run `mise activate`/`mise exec` there
+would find it; that shell had not), and no Cloudflare account was available either. That run
+correctly stopped at step 1 with "could not run `wrangler whoami`: No such file or directory"
+rather than claiming success.
+
+### Real-subprocess evidence
+
+Built with `CARGO_TARGET_DIR` pointed at a scratch directory (never this repo's own `target/`,
+confirmed empty of new files afterward) and run with a shell-script `wrangler` placed first on
+`PATH` that logs every invocation and mimics wrangler 4.145.0's documented output shapes,
+against a temporary copy of `packages/cloud-ci-worker/wrangler.toml` (the real file was never
+written):
+
+- **Unrecognized `d1 migrations list` output, exit 0** — `D1 migrations` reported `FAILED`
+  ("could not determine whether D1 ... has pending migrations"); the logged calls were exactly
+  `wrangler whoami` then `wrangler d1 migrations list cloud-ci --remote` — zero
+  `migrations apply` calls.
+- **A pending migration followed by a failing `migrations apply`** — the announce line
+  ("D1 migrations: applying all pending migrations to REMOTE database `cloud-ci` ...") printed
+  before the step report, `migrations apply` was called exactly once, and the fake script's own
+  stderr (deliberately including a JWT-shaped string) never appeared anywhere in the CLI's
+  output — grepping the full captured output for that string returned zero matches. The failure
+  detail read only: "`wrangler d1 migrations apply cloud-ci --remote` exited non-zero against
+  remote database `cloud-ci`. Its output is not shown here: run ... yourself to see the full
+  output."
+- **An absent secret, reproducing wrangler's real empty-page-failure shape (M1)** — the fake
+  `secrets-store secret list` returned a short (3-row) successful page 1 naming three of the four
+  required secrets, then a non-zero exit with "List request returned no secrets." for any later
+  page — the same shape the review's reading of wrangler 4.145.0's source describes. The step
+  reported `FAILED`: "wrangler.toml binds secrets that are not in the Secrets Store:
+  CLOUD_CI_MASTER_KEY (cloud-ci-master-key)", from exactly one `secrets-store secret list` call
+  (the short-page stop rule fired, so no second, failing call was needed to reach that
+  conclusion) — not the `Manual`/"could not be verified" outcome the pre-M1 code produced for
+  this same scenario.
+- **`--dry-run` against the same pending-migration, absent-secret setup** — logged calls were
+  only `wrangler whoami`, `d1 migrations list`, and one `secrets-store secret list`; no
+  `migrations apply` or any other mutating call was made.
+
+None of these runs exercised step 5's actual GitHub App manifest flow (it needs a human in a
+real browser) or a real Cloudflare account's live D1/Secrets Store state — only wrangler's own
+documented CLI contract, mimicked by the fake script.
 
 ### Prerequisites the CLI assumes but does not create
 
@@ -257,6 +305,34 @@ real Cloudflare state, which this environment does not have.
 Steps 2–7 above need a real Cloudflare account, a real GitHub account, and (for step 5's App
 creation) a real browser session; they were **not executed end to end for this doc** — see "What
 is exercised and what is not" above for exactly what was and was not run in this environment.
+
+### Known limitations
+
+Accepted residuals from an independent review of this wizard, not fixed in this round because
+each is either a documentation-only gap or a deliberately fail-closed edge case, not a false
+success:
+
+- **Secret-name matching reads the whole page's text, not a structured table.** `name_tokens`
+  splits every non-identifier character, so it also tokenizes wrangler's own header line (store
+  id, page number) and any `Comment`/`Scopes` column wrangler prints alongside each secret name.
+  A secret name that happened to also appear in a comment would be (incorrectly) counted present.
+  wrangler has no machine-readable (`--format json` or similar) output for this command as of
+  2026-10-03's check; parsing its human-table output is the only option today.
+- **`--per-page 100` as a maximum is `[unverified]`.** The wizard relies on 100 being the real
+  per-page ceiling (and therefore the real page size to detect a "short" last page) for Secrets
+  Store secrets; this was not re-confirmed against a live account for this round, only against
+  wrangler's own `--help` text, which documents `--per-page`'s default (10) but not its maximum.
+- **A single duplicate `[[secrets_store_secrets]]` entry for one binding, where the first copy
+  has an empty `store_id`/`secret_name`, produces a misleading error** ("store_id ... has
+  unexpected characters") instead of naming the duplicate. This only happens with a hand-edited,
+  already-malformed `wrangler.toml`; the step still fails closed, just with the wrong reason.
+- **`CmdOutput` carries no exit code**, only a `success` boolean — an apply failure's message can
+  say "exited non-zero" but not which code. Adding one is a larger interface change than this
+  round's scope.
+- **wrangler's exact migration-table and empty-page-error text are read from wrangler
+  4.145.0's own distributed source** (the version this repo pins in
+  `packages/cloud-ci-worker/mise.toml`), not from a live account in this environment; "Real-
+  subprocess evidence" below exercises a script that mimics that text, not wrangler itself.
 
 ## Open items for other tracks
 
