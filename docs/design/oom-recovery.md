@@ -595,11 +595,30 @@ CREATE TABLE IF NOT EXISTS oom_decision (
   the insert, which the current design does not do) - it is a backstop against silent state
   corruption, not a signal this design expects a caller to ever see.
 * **If the backstop is ever reached anyway, it resolves to "already decided" without ever
-  surfacing an SQL error to the caller (D1).** If the `INSERT` fails on the `(job_name, idx,
-  seq)` constraint, the caller re-reads the row that now exists at that `seq`, re-projects it,
-  and returns its `outcome` as `AlreadyDecided` - the same shape `decide_oom_recovery` already
-  returns for a duplicate; the constraint violation itself is caught and absorbed inside this
-  retry, never propagated past it.
+  surfacing an SQL error to the caller (D1, N12).** The insert is split into two steps, not
+  one: a `read_latest_decision(sql, job, idx)` step (the `MAX(seq)` read above) and a
+  `insert_decision_at_seq(sql, job, idx, seq, ...)` step that takes the computed `seq` as an
+  explicit parameter rather than recomputing it - the same split the test seam in §6.2 calls
+  directly. `insert_decision_at_seq` is where the constraint error is caught: its `INSERT`
+  call's result is matched on the error text, the same *technique* `finalize_test_stats`
+  (`mod.rs` ~2623-2634) already uses for its own idempotency check against a `D1Error`'s
+  `.to_string()` - `if msg.contains("UNIQUE constraint failed") || msg.contains("PRIMARY KEY
+  constraint failed")` - rather than a typed constraint variant (D1 errors surface as strings
+  through this binding, not a typed enum, as that existing call site shows). `oom_decision` is
+  DO-local `SqlStorage`, not D1, so its `sql.exec()` call returns a `worker::Error`, a
+  different type than `D1Error`; whether its own `.to_string()` contains the identical
+  substrings for the same SQLite constraint violation is `[unverified]` - it rides on the same
+  underlying SQLite engine, but the two bindings (`D1Database` vs `SqlStorage`) are not
+  guaranteed to format the error identically, and this design has not confirmed it against a
+  real `worker::Error` instance. The match strings used for `insert_decision_at_seq` must be
+  confirmed against a real `worker::Error` for a `SqlStorage` constraint violation before
+  implementation, not assumed from the D1 precedent.
+  On that match, `insert_decision_at_seq` itself re-reads the row at the `seq` it tried to
+  insert, re-projects it, and returns its `outcome` as
+  `AlreadyDecided` - the same shape `decide_oom_recovery` already returns for a duplicate; the
+  constraint violation itself is caught and absorbed inside this one function, never
+  propagated past it. Any other `INSERT` failure (not matching either string) is a genuine,
+  unexpected error and is propagated normally, not swallowed.
 * **Duplicate reports must pass the latest row, not always the seq-1 row (D1).** Revision 2
   said "any further report is `AlreadyDecided` (`decide_oom_recovery` already returns this for
   `FailedAtMax`)" - that is correct only once the **seq 2** row exists and is passed as
@@ -689,7 +708,17 @@ The order is already encoded in `logic::next_oom_effect_excluding` and is kept v
 
 1. `MarkOldTerminal`: mark the decision's target node `failed`, `closed_by = 'oom'`, result
    `{"error":"oom", ...}` (naming the configured max and the measured peak, "unknown" if `None`,
-   for `failed_at_max`).
+   for `failed_at_max`). **This overwrites, and does not preserve, whatever completion payload
+   (`exit_code`, `stdout`, `stderr`) `run_and_report` already wrote to `result` (F2) -**
+   `node_container.rs` lines 325-350 posts that payload on every `/complete-node` call
+   regardless of exit reason, and under option A's upgrade rule (§3.2) the node's `result` at
+   the time `MarkOldTerminal` runs already holds exactly that output. The `oom_decision`
+   schema (§2.2) has no column to carry it either. **This is a stated design choice, not an
+   oversight: the job's own stdout/stderr - often exactly what an operator wants when
+   diagnosing an OOM - is lost at the moment a node is marked for recovery**, under both H1
+   options. A future revision that wants to preserve it would need either a column on
+   `oom_decision` or a merge (`result = {"error": "oom", ..., "original": <prior result>}`)
+   instead of an overwrite; this design does not do either.
 2. `StopOld`: `stop_node_container(target_node_id, target.physical_address)`.
 3. `InsertRetry` (retry only): `insert_node` with the §1.2 id, `runner_auto = 1`, `size = to_size`,
    `shard_attempt = observed_attempt + 1`.
@@ -714,17 +743,24 @@ The order is already encoded in `logic::next_oom_effect_excluding` and is kept v
 the evidence-accepting transaction writes only the `oom_decision` row, never the node's
 status (§1.1's option B description), so the target node is always still non-terminal when
 `MarkOldTerminal` - the decision's own first effect - runs and performs that write; a node
-that is terminal for another reason (it naturally `succeeded`, was `cancelled`, `skipped`, or
-`timed_out`) genuinely means someone else won the race, and the decision is `abandoned`
-(§3.6), not overwritten. Under **option A**, the target node is very often *already* `failed`
-(plain exit 137, `closed_by` unset) by the time the batch arrives - H1's own problem statement
-is that this is the dominant case, not an edge case. `update_node_status` still writes only
-when non-terminal, but a node that is `failed` with `closed_by` unset **and** the arriving
-batch classifies as OOM (§1.1's classification) is **upgraded**, not abandoned: `closed_by` is
-set to `'oom'` and `result` is overwritten with the OOM message, even though the row was
-already terminal before this call. Only a node terminal as
-`succeeded`/`cancelled`/`skipped`/`timed_out` is abandoned under option A; a node terminal as
-plain `failed` with matching OOM evidence is upgraded.
+that is terminal for another reason (it naturally `succeeded`, was `cancelled`, `skipped`,
+`timed_out`, **or already `failed` for a reason unrelated to this decision's own evidence**
+(F3) - concretely, seq 2's target is the retry node, and `StartRetry` failing already marks
+that same node `failed` via its own, separate path (§3.2's `StartRetry` row) before any OOM
+evidence about it exists) genuinely means someone else won the race, and the decision is
+`abandoned` (§3.6), not overwritten. Under **option A**, the target node is very often
+*already* `failed` (plain exit 137, `closed_by` unset) by the time the batch arrives - H1's
+own problem statement is that this is the dominant case, not an edge case. `update_node_status`
+still writes only when non-terminal, but a node that is `failed` with `closed_by` unset
+**and** the arriving batch classifies as OOM (§1.1's classification) is **upgraded**, not
+abandoned: `closed_by` is set to `'oom'` and `result` is overwritten with the OOM message,
+even though the row was already terminal before this call. A node `failed` for a reason this
+decision's own evidence does not corroborate - the same `StartRetry`-already-failed case as
+option B, above, which is option-independent - is abandoned like any other "someone else won"
+case, never upgraded; only a `failed` node whose closing evidence IS this decision's own is
+upgraded. Only a node terminal as `succeeded`/`cancelled`/`skipped`/`timed_out`, or `failed`
+for an unrelated reason, is abandoned under option A; a node terminal as plain `failed` with
+matching OOM evidence is upgraded.
 
 `start()` returns before the container is ready, and later failures need `monitor()`
 (Cloudflare, "Durable Object Container API" page, "Last updated Sep 30, 2026", read
@@ -1066,10 +1102,14 @@ behavior.
   NOT-OOM; `oom_kill > 0` + non-137 exit -> NOT-OOM; unreadable evidence -> UNKNOWN; a
   `Cancelled` node is excluded before classification runs (ties to `resolve_complete_node`'s
   existing `DroppedCancelled` test).
-* The explicit UNKNOWN mechanism itself (G1, Stage 4 deliverable): whichever is chosen, an
+* The explicit UNKNOWN mechanism itself (G1, Stage 4 deliverable, if Q11/Q17 pick it): an
   "evidence unavailable" upload parses to UNKNOWN the same as a successful batch with no OOM
-  evidence (not NOT-OOM, not a parse error); a coordinator-side window's deadline is bounded
-  and independent of the run timeout, and the decision is UNKNOWN only once that deadline
+  evidence (not NOT-OOM, not a parse error) - **UNKNOWN has no decision row** by this design's
+  own three-way classification (§1.1), exactly like NOT-OOM, so the test asserts an ordinary
+  failure write with no `oom_decision` row, never a row with some UNKNOWN status; if a
+  coordinator-side window is the chosen shape instead, its deadline is
+  `min(configured_window, remaining_run_time)` (F6), and the node's outcome is recorded as the
+  ordinary failure (classified UNKNOWN, still no decision row) only once that bounded deadline
   passes with no report, never before.
 * `resolve_complete_node` with `closed_by = 'oom'` returns a no-write variant (M1); failed-after-
   failed on an ordinary node still `Recorded`.
@@ -1218,6 +1258,11 @@ while off (§5.1).
    agent's "evidence unavailable" upload or the coordinator-side window, whichever the owner
    picks alongside H1 - the current abort-on-read-error agent behavior does not already cover
    this; a batch never arriving is not yet an observable signal, so this stage must build one.
+   **This stage is inert only because `runner_auto` is rejected 422 `oom_recovery_disabled`
+   until stage 5 enables the flag (F8)** - if Q11/Q17 pick the defer-the-write window shape,
+   this stage's deliverable genuinely changes how node failures get recorded once stage 5
+   turns it on (T1/T3); "recorded only ... triggers nothing" describes this stage's own code
+   path, not the eventual behavior once enabled.
 5. **Decision and effects behind the flag.** Node columns (literal guards), `oom_decision`,
    `runner_auto` at `startNode`, decision inside the evidence transaction, effect drain, alarm
    sweep (§3.6), fault-injection tests (§6.2) against a fake executor. Healing does not depend
@@ -1259,6 +1304,16 @@ answered - resolving every owner decision does not by itself make this design im
    field is required, and does not exist on `SubmitResourceSamplesRequest` or
    `CompleteNodeRequest` today. Blocks Q11's "hold via upload" mechanism (Q17) specifically,
    not the window mechanisms.
+6. **The `SqlStorage` constraint-violation error string (N12, §2.2).** `insert_decision_at_seq`
+   needs to recognize a `(job_name, idx, seq)` primary-key collision from `sql.exec()`'s
+   returned `worker::Error`, by string matching the same way `finalize_test_stats` (`mod.rs`
+   ~2623-2634) already does for a `D1Error`. `oom_decision` is DO-local `SqlStorage`, not D1,
+   and whether `worker::Error`'s `.to_string()` contains the identical `"UNIQUE constraint
+   failed"`/`"PRIMARY KEY constraint failed"` substrings for the same underlying SQLite
+   violation has not been confirmed. Blocks the PK-collision backstop (§2.2) for every option -
+   low risk, since the backstop is already "effectively unreachable" in production (§2.2), but
+   its failure mode (an unmatched string falls through to a genuine propagated error, not a
+   silent miscategorization) should be confirmed before relying on it.
 
 ## 9. Open questions needing an owner decision
 
