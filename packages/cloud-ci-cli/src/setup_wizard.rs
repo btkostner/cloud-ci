@@ -22,6 +22,7 @@
 //! Side effects go through the [`Runner`] and [`Fs`] traits so tests use
 //! fakes with no network, filesystem, or subprocesses.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -42,6 +43,9 @@ pub trait Runner {
     /// Runs `program` with inherited stdio (interactive); returns success.
     fn run_inherit(&self, program: &str, args: &[String]) -> Result<bool, String>;
     fn env_is_set(&self, name: &str) -> bool;
+    /// Prints a line to the operator immediately, before the run's final
+    /// report, so a mutating command is announced before it starts.
+    fn announce(&self, msg: &str);
 }
 
 pub trait Fs {
@@ -153,13 +157,90 @@ fn s(v: &str) -> String {
     v.to_string()
 }
 
+/// An identifier-like value (database name, store id, account id, org
+/// login) that is forwarded to a subprocess: non-empty, only letters,
+/// digits, `.`, `_`, `-`, and never starting with `-` (so it cannot be
+/// parsed as a flag).
+fn valid_ident(v: &str) -> bool {
+    !v.is_empty()
+        && !v.starts_with('-')
+        && v.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// Free text forwarded as a flag value (`--name`, `--deployment-url`):
+/// non-empty, no control characters, never starting with `-`.
+fn valid_free_text(v: &str) -> bool {
+    !v.is_empty() && !v.starts_with('-') && !v.chars().any(char::is_control)
+}
+
+fn valid_orgs_list(v: &str) -> bool {
+    let l = logins(v);
+    !l.is_empty() && l.iter().all(|x| valid_ident(x))
+}
+
+/// Best-effort redaction of one line of subprocess output before it is
+/// shown: PEM/authorization lines are dropped, and any long token-looking
+/// word (20+ chars of `[A-Za-z0-9_+=/-]` containing a digit or mixed case)
+/// is replaced. This is a heuristic, not a guarantee.
+fn redact(line: &str) -> String {
+    let lower = line.to_ascii_lowercase();
+    if line.contains("-----BEGIN") || lower.contains("authorization") || lower.contains("bearer ") {
+        return s("[redacted line]");
+    }
+    line.split_whitespace()
+        .map(|w| {
+            let tokenish = w.len() >= 20
+                && w.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '+' | '=' | '/'))
+                && (w.chars().any(|c| c.is_ascii_digit())
+                    || (w.chars().any(|c| c.is_ascii_uppercase())
+                        && w.chars().any(|c| c.is_ascii_lowercase())));
+            if tokenish { "[redacted]" } else { w }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The last ten non-empty lines of `text`, each redacted and truncated.
+fn summarize(text: &str) -> String {
+    let lines: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(|l| redact(l).chars().take(200).collect::<String>())
+        .collect();
+    if lines.is_empty() {
+        return s("(no output)");
+    }
+    lines[lines.len().saturating_sub(10)..].join("\n")
+}
+
 fn load_doc(ctx: &Ctx<'_>) -> Result<DocumentMut, String> {
     let text = ctx
         .fs
         .read_to_string(&ctx.args.file)
         .map_err(|e| format!("cannot read {}: {e}", ctx.args.file.display()))?;
-    text.parse::<DocumentMut>()
-        .map_err(|e| format!("{} is not valid TOML: {e}", ctx.args.file.display()))
+    // Report only the line number and the parser's description of the
+    // error kind, never source text (it may sit next to a secret).
+    text.parse::<DocumentMut>().map_err(|e| {
+        let line = e
+            .span()
+            .and_then(|sp| text.get(..sp.start))
+            .map(|prefix| prefix.matches('\n').count() + 1);
+        match line {
+            Some(l) => format!(
+                "{} is not valid TOML: {} (line {l})",
+                ctx.args.file.display(),
+                e.message()
+            ),
+            None => format!(
+                "{} is not valid TOML: {}",
+                ctx.args.file.display(),
+                e.message()
+            ),
+        }
+    })
 }
 
 fn has_entry(doc: &DocumentMut, path: &[&str], key: &str, value: &str) -> bool {
@@ -287,16 +368,41 @@ fn migrations_cwd(ctx: &Ctx<'_>) -> Option<PathBuf> {
     ctx.args.file.parent().map(Path::to_path_buf)
 }
 
-/// `Some(true)` = nothing left to apply, `Some(false)` = pending,
-/// `None` = could not be determined.
-fn migrations_clean(ctx: &Ctx<'_>, db: &str) -> Option<bool> {
+#[derive(Debug, PartialEq, Eq)]
+enum MigState {
+    /// Positively recognized: nothing left to apply.
+    Clean,
+    /// Positively recognized: at least one migration is pending.
+    Pending,
+    /// Failed exit or unrecognized output. Never a reason to mutate.
+    Unknown,
+}
+
+/// Classifies `wrangler d1 migrations list` output. Only text that is
+/// positively recognized counts: "No migrations to apply" is clean, a
+/// listed `.sql` file (or the "Migrations to be applied" heading) is
+/// pending, and everything else, including any failed exit, is unknown.
+fn classify_migrations(success: bool, text: &str) -> MigState {
+    if !success {
+        return MigState::Unknown;
+    }
+    if text.contains("No migrations to apply") {
+        MigState::Clean
+    } else if text.contains("Migrations to be applied") || text.lines().any(|l| l.contains(".sql"))
+    {
+        MigState::Pending
+    } else {
+        MigState::Unknown
+    }
+}
+
+fn migrations_state(ctx: &Ctx<'_>, db: &str) -> MigState {
     let cwd = migrations_cwd(ctx);
     let args = [s("d1"), s("migrations"), s("list"), s(db), s("--remote")];
-    let o = ctx.runner.run("wrangler", &args, cwd.as_deref()).ok()?;
-    if !o.success {
-        return None;
+    match ctx.runner.run("wrangler", &args, cwd.as_deref()) {
+        Ok(o) => classify_migrations(o.success, &o.stdout),
+        Err(_) => MigState::Unknown,
     }
-    Some(o.stdout.contains("No migrations to apply"))
 }
 
 fn step_migrations(ctx: &mut Ctx<'_>) -> Outcome {
@@ -304,25 +410,34 @@ fn step_migrations(ctx: &mut Ctx<'_>) -> Outcome {
         Ok(d) => database_name(&d),
         Err(e) => return out(Status::Failed, e),
     };
+    if !valid_ident(&db) {
+        return out(
+            Status::Failed,
+            "the D1 database_name in wrangler.toml is empty or has unexpected characters (allowed: letters, digits, '.', '_', '-', not starting with '-'); no command was run",
+        );
+    }
     let manual = format!(
         "wrangler d1 migrations apply {db} --remote   (run from the directory containing wrangler.toml)"
     );
-    match migrations_clean(ctx, &db) {
-        None => out(
+    match migrations_state(ctx, &db) {
+        MigState::Unknown => out(
             Status::Failed,
             format!(
-                "could not list D1 migrations for `{db}` (is the database created and wrangler logged in?). Check with `wrangler d1 migrations list {db} --remote`."
+                "could not determine whether D1 `{db}` has pending migrations (the list command failed or its output was not recognized). No migration was applied. Check with `wrangler d1 migrations list {db} --remote`, apply by hand if needed: {manual}"
             ),
         ),
-        Some(true) => out(
+        MigState::Clean => out(
             Status::AlreadyDone,
             format!("D1 `{db}` has no unapplied migrations"),
         ),
-        Some(false) if ctx.args.dry_run => out(
+        MigState::Pending if ctx.args.dry_run => out(
             Status::WouldApply,
             format!("D1 `{db}` has unapplied migrations; would run: {manual}"),
         ),
-        Some(false) => {
+        MigState::Pending => {
+            ctx.runner.announce(&format!(
+                "D1 migrations: applying all pending migrations to REMOTE database `{db}` (wrangler d1 migrations apply {db} --remote)"
+            ));
             let cwd = migrations_cwd(ctx);
             let args = [
                 s("d1"),
@@ -332,21 +447,30 @@ fn step_migrations(ctx: &mut Ctx<'_>) -> Outcome {
                 s("--remote"),
             ];
             match ctx.runner.run("wrangler", &args, cwd.as_deref()) {
-                Ok(o) if o.success => match migrations_clean(ctx, &db) {
-                    Some(true) => out(
+                Ok(o) if o.success => match migrations_state(ctx, &db) {
+                    MigState::Clean => out(
                         Status::Applied,
-                        format!("applied D1 migrations to `{db}` and re-verified"),
+                        format!("applied D1 migrations to remote `{db}` and re-verified"),
                     ),
                     _ => out(
                         Status::Failed,
                         format!(
-                            "apply reported success but `{db}` still lists unapplied migrations; run: {manual}"
+                            "apply reported success but `{db}` is not confirmed clean afterwards; check with `wrangler d1 migrations list {db} --remote`"
                         ),
                     ),
                 },
-                _ => out(
+                Ok(o) => out(
                     Status::Failed,
-                    format!("`wrangler d1 migrations apply` failed; run it by hand: {manual}"),
+                    format!(
+                        "`wrangler d1 migrations apply {db} --remote` failed. Output (redacted, last lines):\n{}\nRun it by hand: {manual}",
+                        summarize(&o.stdout)
+                    ),
+                ),
+                Err(e) => out(
+                    Status::Failed,
+                    format!(
+                        "could not run `wrangler d1 migrations apply`: {e}. Run it by hand: {manual}"
+                    ),
                 ),
             }
         }
@@ -366,6 +490,66 @@ fn secret_entries(doc: &DocumentMut) -> Vec<(String, String, String)> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+const SECRETS_PER_PAGE: &str = "100";
+const SECRETS_MAX_PAGES: usize = 50;
+
+enum ListError {
+    /// A list call failed; the store's contents are unknown.
+    Unavailable,
+    /// Still producing new names after the page cap; fail closed.
+    TooManyPages,
+}
+
+/// Name-shaped tokens in `wrangler secrets-store secret list` output.
+/// Matching is done on whole tokens, never substrings.
+fn name_tokens(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+        .filter(|t| !t.is_empty())
+}
+
+/// Reads `wrangler secrets-store secret list` pages (`--page`/`--per-page`)
+/// until every wanted name has been seen, or a page adds no new token
+/// (empty or past-the-end page). Returns every token seen. Hitting the page
+/// cap while pages still add tokens is an error, so absence is never
+/// concluded from a truncated listing.
+fn list_store_secrets(
+    ctx: &Ctx<'_>,
+    store: &str,
+    wanted: &[&str],
+) -> Result<HashSet<String>, ListError> {
+    let mut seen: HashSet<String> = HashSet::new();
+    for page in 1..=SECRETS_MAX_PAGES {
+        let args = [
+            s("secrets-store"),
+            s("secret"),
+            s("list"),
+            s(store),
+            s("--remote"),
+            s("--per-page"),
+            s(SECRETS_PER_PAGE),
+            s("--page"),
+            page.to_string(),
+        ];
+        let o = ctx
+            .runner
+            .run("wrangler", &args, None)
+            .map_err(|_| ListError::Unavailable)?;
+        if !o.success {
+            return Err(ListError::Unavailable);
+        }
+        let mut grew = false;
+        for t in name_tokens(&o.stdout) {
+            if seen.insert(t.to_string()) {
+                grew = true;
+            }
+        }
+        if !grew || wanted.iter().all(|w| seen.contains(*w)) {
+            return Ok(seen);
+        }
+    }
+    Err(ListError::TooManyPages)
 }
 
 fn step_secrets(ctx: &mut Ctx<'_>) -> Outcome {
@@ -396,26 +580,58 @@ fn step_secrets(ctx: &mut Ctx<'_>) -> Outcome {
         );
     }
     // Bindings exist; verify the named secrets exist in the store (names only).
+    let bound: Vec<(&str, &str, &str)> = SECRET_BINDINGS
+        .iter()
+        .filter_map(|b| {
+            entries
+                .iter()
+                .find(|(eb, _, _)| eb == b)
+                .map(|(_, st, sn)| (*b, st.as_str(), sn.as_str()))
+        })
+        .collect();
+    if bound.iter().any(|(_, st, _)| !valid_ident(st)) {
+        return out(
+            Status::Failed,
+            "a secrets_store_secrets store_id in wrangler.toml has unexpected characters (allowed: letters, digits, '.', '_', '-', not starting with '-'); no command was run",
+        );
+    }
+    let mut stores: Vec<&str> = Vec::new();
+    for (_, st, _) in &bound {
+        if !stores.contains(st) {
+            stores.push(st);
+        }
+    }
     let mut unverified: Vec<String> = Vec::new();
     let mut absent: Vec<String> = Vec::new();
-    for b in SECRET_BINDINGS {
-        let Some((_, store, name)) = entries.iter().find(|(eb, _, _)| eb == b) else {
-            continue;
-        };
-        let args = [
-            s("secrets-store"),
-            s("secret"),
-            s("list"),
-            store.clone(),
-            s("--remote"),
-        ];
-        match ctx.runner.run("wrangler", &args, None) {
-            Ok(o) if o.success => {
-                if !o.stdout.contains(name.as_str()) {
-                    absent.push(format!("{b} ({name})"));
+    for store in stores {
+        let wanted: Vec<&str> = bound
+            .iter()
+            .filter(|(_, st, _)| *st == store)
+            .map(|(_, _, sn)| *sn)
+            .collect();
+        match list_store_secrets(ctx, store, &wanted) {
+            Ok(found) => {
+                for (b, st, sn) in &bound {
+                    if *st == store && !found.contains(*sn) {
+                        absent.push(format!("{b} ({sn})"));
+                    }
                 }
             }
-            _ => unverified.push(b.to_string()),
+            Err(ListError::TooManyPages) => {
+                return out(
+                    Status::Failed,
+                    format!(
+                        "the Secrets Store listing still had new entries after {SECRETS_MAX_PAGES} pages, so the secrets cannot be verified from here. Check with `wrangler secrets-store secret list <store-id> --remote --page N`."
+                    ),
+                );
+            }
+            Err(ListError::Unavailable) => {
+                for (b, st, _) in &bound {
+                    if *st == store {
+                        unverified.push((*b).to_string());
+                    }
+                }
+            }
         }
     }
     if !absent.is_empty() {
@@ -462,22 +678,48 @@ fn step_github_app(ctx: &mut Ctx<'_>) -> Outcome {
         );
     }
     let a = ctx.args;
+    if a.file.to_string_lossy().starts_with('-') {
+        return out(
+            Status::Failed,
+            "--file must not start with '-'; no command was run",
+        );
+    }
     let mut cmd = vec![s("setup"), s("github-app")];
     let mut missing: Vec<&str> = Vec::new();
-    for (flag, val) in [
-        ("--name", &a.name),
-        ("--allowed-orgs", &a.allowed_orgs),
-        ("--deployment-url", &a.deployment_url),
-        ("--cloudflare-account-id", &a.cloudflare_account_id),
-        ("--secrets-store-id", &a.secrets_store_id),
-    ] {
+    let mut invalid: Vec<&str> = Vec::new();
+    type FlagSpec<'a> = (&'static str, &'a Option<String>, fn(&str) -> bool);
+    let flags: [FlagSpec<'_>; 5] = [
+        ("--name", &a.name, valid_free_text),
+        ("--allowed-orgs", &a.allowed_orgs, valid_orgs_list),
+        ("--deployment-url", &a.deployment_url, valid_free_text),
+        (
+            "--cloudflare-account-id",
+            &a.cloudflare_account_id,
+            valid_ident,
+        ),
+        ("--secrets-store-id", &a.secrets_store_id, valid_ident),
+    ];
+    for (flag, val, ok) in flags {
         match val {
             Some(v) if !v.is_empty() => {
-                cmd.push(s(flag));
-                cmd.push(v.clone());
+                if ok(v) {
+                    cmd.push(s(flag));
+                    cmd.push(v.clone());
+                } else {
+                    invalid.push(flag);
+                }
             }
             _ => missing.push(flag),
         }
+    }
+    if !invalid.is_empty() {
+        return out(
+            Status::Failed,
+            format!(
+                "invalid value for {}: values must not start with '-', and ids/logins may only contain letters, digits, '.', '_', '-'; no command was run",
+                invalid.join(", ")
+            ),
+        );
     }
     cmd.push(s("--file"));
     cmd.push(a.file.display().to_string());
@@ -559,6 +801,14 @@ fn step_allowed_orgs(ctx: &mut Ctx<'_>) -> Outcome {
         .as_deref()
         .map(logins)
         .unwrap_or_default();
+    if let Some(bad) = desired.iter().find(|d| !valid_ident(d)) {
+        return out(
+            Status::Failed,
+            format!(
+                "invalid org login `{bad}`: only letters, digits, '.', '_', '-' are allowed and it must not start with '-'; no command was run"
+            ),
+        );
+    }
     if desired.is_empty() {
         if current.is_empty() {
             return out(
@@ -713,6 +963,10 @@ impl Runner for RealRunner {
     fn env_is_set(&self, name: &str) -> bool {
         std::env::var(name).is_ok_and(|v| !v.is_empty())
     }
+
+    fn announce(&self, msg: &str) {
+        println!("{msg}");
+    }
 }
 
 pub struct RealFs;
@@ -743,6 +997,7 @@ mod tests {
         calls: RefCell<Vec<String>>,
         /// prefix -> (success, stdout)
         replies: RefCell<HashMap<String, (bool, String)>>,
+        announcements: RefCell<Vec<String>>,
         token: bool,
     }
     impl FakeRunner {
@@ -791,6 +1046,48 @@ mod tests {
         }
         fn env_is_set(&self, _: &str) -> bool {
             self.token
+        }
+        fn announce(&self, msg: &str) {
+            self.announcements.borrow_mut().push(msg.to_string());
+        }
+    }
+
+    /// Serves `wrangler secrets-store secret list` from a per-page
+    /// function (keyed by the `--page` value) instead of `FakeRunner`'s
+    /// single fixed reply, so pagination can be tested; every other
+    /// command delegates to `base`.
+    struct PagedRunner<'a> {
+        base: &'a FakeRunner,
+        page_stdout: fn(usize) -> String,
+    }
+    impl Runner for PagedRunner<'_> {
+        fn run(&self, p: &str, a: &[String], c: Option<&Path>) -> Result<CmdOutput, String> {
+            if a.first().map(String::as_str) == Some("secrets-store") {
+                let page: usize = a
+                    .iter()
+                    .position(|x| x == "--page")
+                    .and_then(|i| a.get(i + 1))
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(1);
+                self.base
+                    .calls
+                    .borrow_mut()
+                    .push(format!("{p} {}", a.join(" ")));
+                return Ok(CmdOutput {
+                    success: true,
+                    stdout: (self.page_stdout)(page),
+                });
+            }
+            self.base.run(p, a, c)
+        }
+        fn run_inherit(&self, p: &str, a: &[String]) -> Result<bool, String> {
+            self.base.run_inherit(p, a)
+        }
+        fn env_is_set(&self, n: &str) -> bool {
+            self.base.env_is_set(n)
+        }
+        fn announce(&self, msg: &str) {
+            self.base.announce(msg)
         }
     }
 
@@ -965,10 +1262,78 @@ name = "NODE_CONTAINER"
             fn env_is_set(&self, n: &str) -> bool {
                 self.0.env_is_set(n)
             }
+            fn announce(&self, msg: &str) {
+                self.0.announce(msg)
+            }
         }
         let rep = run_wizard(&Flip(&r), &fs, &args(), "cloud-ci");
         assert_eq!(rep.steps[2].status, Status::Applied);
         assert_eq!(r.mutating().len(), 1);
+        // W3: the apply is announced before it runs, naming its target.
+        assert!(
+            r.announcements
+                .borrow()
+                .iter()
+                .any(|m| m.contains("cloud-ci") && m.to_lowercase().contains("remote")),
+            "{:?}",
+            r.announcements.borrow()
+        );
+    }
+
+    #[test]
+    fn unrecognized_migrations_output_fails_closed_without_applying() {
+        let r = healthy_runner();
+        r.reply(
+            "wrangler d1 migrations list",
+            true,
+            "some future wrangler output format this wizard does not recognize",
+        );
+        let fs = FakeFs(RefCell::new(configured()));
+        let rep = run_wizard(&r, &fs, &args(), "cloud-ci");
+        assert_eq!(rep.steps[2].status, Status::Failed, "{:?}", rep.steps[2]);
+        assert!(rep.steps[2].detail.contains("could not determine"));
+        assert!(r.mutating().is_empty());
+        assert!(
+            !r.calls
+                .borrow()
+                .iter()
+                .any(|c| c.contains("migrations apply"))
+        );
+    }
+
+    #[test]
+    fn failed_list_exit_never_triggers_apply_even_with_pending_looking_output() {
+        // Pins the `!o.success` check: pending-shaped text on a failed
+        // exit must still be Unknown, never Pending.
+        let r = healthy_runner();
+        r.reply("wrangler d1 migrations list", false, "0099_new.sql pending");
+        let fs = FakeFs(RefCell::new(configured()));
+        let rep = run_wizard(&r, &fs, &args(), "cloud-ci");
+        assert_eq!(rep.steps[2].status, Status::Failed, "{:?}", rep.steps[2]);
+        assert!(
+            !r.calls
+                .borrow()
+                .iter()
+                .any(|c| c.contains("migrations apply"))
+        );
+    }
+
+    #[test]
+    fn migration_apply_failure_surfaces_redacted_summary_without_secrets() {
+        let r = healthy_runner();
+        r.reply("wrangler d1 migrations list", true, "0021_x.sql pending");
+        let token = "AbCdEf1234567890ZyXwVu9876543210";
+        r.reply(
+            "wrangler d1 migrations apply",
+            false,
+            &format!("Error: could not apply, token {token} rejected"),
+        );
+        let fs = FakeFs(RefCell::new(configured()));
+        let rep = run_wizard(&r, &fs, &args(), "cloud-ci");
+        assert_eq!(rep.steps[2].status, Status::Failed, "{:?}", rep.steps[2]);
+        assert!(!rep.steps[2].detail.contains(token));
+        assert!(rep.steps[2].detail.contains("[redacted]"));
+        assert!(rep.steps[2].detail.contains("Run it by hand"));
     }
 
     #[test]
@@ -1048,5 +1413,132 @@ name = "NODE_CONTAINER"
         // A missing store secret fails but still names only the binding.
         assert!(rep.failed());
         assert!(!rep.steps.iter().any(|s| s.detail.contains(SECRET_VALUE)));
+    }
+
+    #[test]
+    fn missing_cloudflare_token_blocks_github_app_without_invoking_it() {
+        // Pins the CLOUDFLARE_API_TOKEN precheck: every flag present and
+        // valid, but no token, must stop before `run_inherit` is called
+        // for the github-app subcommand specifically (a later, unrelated
+        // step is still free to run its own real subcommand).
+        let r = FakeRunner {
+            token: false,
+            ..Default::default()
+        };
+        r.reply(
+            "wrangler d1 migrations list",
+            true,
+            "No migrations to apply!",
+        );
+        let mut a = args();
+        a.name = Some("cloud-ci (acme)".into());
+        a.allowed_orgs = Some("acme".into());
+        a.deployment_url = Some("https://ci.example".into());
+        a.cloudflare_account_id = Some("acct".into());
+        a.secrets_store_id = Some("st".into());
+        let fs = FakeFs(RefCell::new(BASE.to_string()));
+        let rep = run_wizard(&r, &fs, &a, "cloud-ci");
+        assert_eq!(rep.steps[4].status, Status::Manual, "{:?}", rep.steps[4]);
+        assert!(rep.steps[4].detail.contains("CLOUDFLARE_API_TOKEN"));
+        assert!(
+            !r.calls
+                .borrow()
+                .iter()
+                .any(|c| c.starts_with("cloud-ci setup github-app"))
+        );
+    }
+
+    #[test]
+    fn secrets_store_pagination_reads_every_page_until_found() {
+        let r = healthy_runner();
+        fn two_pages(page: usize) -> String {
+            match page {
+                1 => s("github-app-private-key github-app-client-secret"),
+                2 => s("github-webhook-secret cloud-ci-master-key"),
+                _ => s(""),
+            }
+        }
+        let paged = PagedRunner {
+            base: &r,
+            page_stdout: two_pages,
+        };
+        let fs = FakeFs(RefCell::new(configured()));
+        let rep = run_wizard(&paged, &fs, &args(), "cloud-ci");
+        assert_eq!(
+            rep.steps[3].status,
+            Status::AlreadyDone,
+            "{:?}",
+            rep.steps[3]
+        );
+        let calls = r.calls.borrow().clone();
+        assert!(calls.iter().any(|c| c.contains("--page 1")));
+        assert!(calls.iter().any(|c| c.contains("--page 2")));
+    }
+
+    #[test]
+    fn secrets_store_matching_is_exact_not_a_substring() {
+        let r = healthy_runner();
+        let toml = configured().replace(
+            "secret_name = \"github-app-private-key\"",
+            "secret_name = \"FOO\"",
+        );
+        r.reply(
+            "wrangler secrets-store secret list",
+            true,
+            "FOO_OLD github-app-client-secret github-webhook-secret cloud-ci-master-key",
+        );
+        let fs = FakeFs(RefCell::new(toml));
+        let rep = run_wizard(&r, &fs, &args(), "cloud-ci");
+        assert_eq!(rep.steps[3].status, Status::Failed, "{:?}", rep.steps[3]);
+        assert!(rep.steps[3].detail.contains("(FOO)"));
+    }
+
+    #[test]
+    fn secrets_store_pagination_caps_and_fails_closed() {
+        let r = healthy_runner();
+        fn always_new(page: usize) -> String {
+            format!("filler-token-{page}")
+        }
+        let paged = PagedRunner {
+            base: &r,
+            page_stdout: always_new,
+        };
+        let fs = FakeFs(RefCell::new(configured()));
+        let rep = run_wizard(&paged, &fs, &args(), "cloud-ci");
+        assert_eq!(rep.steps[3].status, Status::Failed, "{:?}", rep.steps[3]);
+        assert!(rep.steps[3].detail.to_lowercase().contains("page"));
+        let calls = r.calls.borrow().clone();
+        let page_calls = calls.iter().filter(|c| c.contains("secrets-store")).count();
+        assert_eq!(page_calls, SECRETS_MAX_PAGES);
+    }
+
+    #[test]
+    fn invalid_org_login_is_rejected_without_running_a_command() {
+        let r = healthy_runner();
+        let mut a = args();
+        a.allowed_orgs = Some("-not-a-login".into());
+        let fs = FakeFs(RefCell::new(configured()));
+        let rep = run_wizard(&r, &fs, &a, "cloud-ci");
+        assert_eq!(rep.steps[5].status, Status::Failed, "{:?}", rep.steps[5]);
+        assert!(rep.steps[5].detail.contains("invalid org login"));
+        assert!(
+            !r.calls
+                .borrow()
+                .iter()
+                .any(|c| c.starts_with("cloud-ci setup allowed-orgs"))
+        );
+    }
+
+    #[test]
+    fn malformed_toml_reports_line_and_kind_not_source_text() {
+        let secret_token = "LEAKED-SECRET-ABCDEF0123456789";
+        let bad = format!("[vars]\nGITHUB_APP_ID = \"{secret_token}\nBROKEN\n");
+        let r = healthy_runner();
+        let fs = FakeFs(RefCell::new(bad));
+        let rep = run_wizard(&r, &fs, &args(), "cloud-ci");
+        assert_eq!(rep.steps[1].status, Status::Failed, "{:?}", rep.steps[1]);
+        assert!(rep.steps[1].detail.contains("line"));
+        assert!(!rep.steps[1].detail.contains(secret_token));
+        assert!(!rep.steps[1].detail.contains("BROKEN"));
     }
 }
