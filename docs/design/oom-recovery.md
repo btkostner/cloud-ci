@@ -281,11 +281,18 @@ does: today a read failure simply aborts the process with no observable trace at
 coordinator beyond the ordinary `/complete-node` the job's own exit produces (§1.1's "Option
 A" problem statement above). Whichever H1 option is chosen, this design needs one of:
 * **An explicit "evidence unavailable" upload.** The agent catches its own `CgroupReadError`
-  instead of propagating it with `?`, and still calls `SubmitResourceSamples` (or an
-  equivalent minimal report) with an explicit flag - for example `evidence_unavailable: true`
-  on the batch, or `oom_detected`/`memory_peak_bytes` both absent in a request the coordinator
-  can tell apart from "zero samples because the batch truly had none" - so UNKNOWN is a
-  positive signal, not an absence.
+  instead of propagating it with `?`, and still calls `SubmitResourceSamples` with an explicit
+  marker so UNKNOWN is a positive signal, not an absence. **The only workable marker is a new,
+  additive proto field (F4)** - for example `optional bool evidence_unavailable = 9`. The two
+  fields already on the request cannot carry this: `oom_detected` (field 7) is a plain,
+  required `bool`, not `optional`, so "absent" is not a representable state for it at all; and
+  a batch with `oom_detected = false`, no `memory_peak_bytes` and zero samples is already a
+  *legitimate* ordinary batch (`memory.peak` reading the literal `max`, or a job shorter than
+  the first 2 s tick - `handle_submit_resource_samples` does not reject an empty `samples`
+  list), so "both absent" cannot be told apart from a real empty batch. The new field must be
+  folded into `resource_sample_batch_content_hash` only when set, exactly as `node_id` already
+  is (`logic.rs` ~1280: `if let Some(node_id) = node_id.filter(|n| !n.is_empty())`), so an old
+  agent's content hash - and therefore its idempotency - is unchanged.
 * **A coordinator-side window.** Two distinct shapes exist under this name, and they are not
   interchangeable (T1/T3):
   * **Bound how long a late batch can still upgrade an already-recorded failure** (no change
