@@ -161,20 +161,24 @@ themselves. `--dry-run` runs only read-only checks (`wrangler whoami`, `d1 migra
    shows up in `wrangler secrets-store secret list` for its store — by exact name match, never a
    substring (`FOO` does not match a listed `FOO_OLD`), paging through every result
    (`--per-page 100`/`--page`, capped at 50 pages — hitting the cap while new names are still
-   appearing fails the step rather than concluding absence from a truncated listing). Reading
-   stops, as a confirmed-complete listing, after the first page with fewer than 100 output rows
-   (wrangler's own page size), after a page that adds nothing new, once every wanted name has
-   been seen, or when a later page's call fails with text containing wrangler 4.145.0's own
-   empty-page error ("List request returned no secrets", `[unverified]` against a live account —
-   read from wrangler's distributed source, not reproduced against a real deployment). A later
-   page's call failing for any OTHER reason (a transient network error, a rate limit, a true
-   subprocess-spawn failure) does **not** confirm the listing is complete — a name still missing
-   at that point is reported "could not confirm: the listing may have been cut short by an
-   error" (manual action, not a hard failure), never a false "not in the Secrets Store" claim. A
-   failure on the very first page still means the store could not be listed at all (also
-   reported manual). No secret value is ever read or printed. Missing bindings are reported
-   manual (the next step creates them); a binding whose secret is confirmed absent from a
-   complete listing is a hard failure naming it.
+   appearing fails the step rather than concluding absence from a truncated listing). A listing
+   is only treated as confirmed-complete — so a still-missing name can be reported as a hard
+   failure — when: a page comes back with fewer than 100 output rows (wrangler's own page size);
+   every wanted name has been seen; or a later page's call fails with a message that, once
+   trimmed and a common `[ERROR]`-style prefix and trailing period are stripped, IS (not merely
+   contains) wrangler 4.145.0's own empty-page error text, "List request returned no secrets"
+   (`[unverified]` against a live account — read from wrangler's distributed source, not
+   reproduced against a real deployment). Two cases stop short of that proof and are reported
+   manual instead of failed: a later page's call failing for any OTHER reason (the error message
+   doesn't match the marker exactly — a transient network error, a rate limit, a proxy wrapping
+   wrangler's own error in more text, a true subprocess-spawn failure), and a SUCCESSFUL page
+   that adds no new name while a wanted name is still missing (wrangler may have ignored `--page`
+   and repeated an earlier page). Either way the message is exactly: *"could not confirm: the
+   Secrets Store listing may have been cut short by an error, so these were not found but are not
+   proven absent: `<names>`"*. A failure on the very first page still means the store could not
+   be listed at all (also reported manual). No secret value is ever read or printed. Missing
+   bindings are reported manual (the next step creates them); a binding whose secret is confirmed
+   absent from a complete listing is a hard failure naming it.
 5. **GitHub App** — if `GITHUB_APP_ID` is already set and the four secret bindings exist, this is
    a no-op. Otherwise it runs `cloud-ci setup github-app` itself (forwarding `--name`,
    `--allowed-orgs`, `--deployment-url`, `--cloudflare-account-id`, `--secrets-store-id`, `--public`
@@ -206,11 +210,14 @@ confirmed empty page and a transient failure — see step 4 above), announce-bef
 ordering, and forwarded-value validation behavior are covered by `setup_wizard.rs`'s own unit
 tests against fake command-runner and filesystem implementations — no network, no real
 `wrangler`, no real Cloudflare/GitHub account, same pattern as the rest of this `setup` family
-(see "Step by step" below). Seven of those checks (the migration-list failed-exit branch, the
-`CLOUDFLARE_API_TOKEN` precheck, the migration-list `Err` transport-failure branch, the
-first-non-empty-entry-per-binding secret lookup, the `allowed-orgs` leading-`-` `--file` check,
-and the pagination early exit once every wanted name is seen) were additionally confirmed
-load-bearing by removing each one in a scratch copy and observing its own pinning test fail.
+(see "Step by step" below). Nine of those checks were additionally confirmed load-bearing by
+removing each one in a scratch copy and observing its own pinning test fail: the migration-list
+failed-exit branch; the `CLOUDFLARE_API_TOKEN` precheck; the migration-list `Err`
+transport-failure branch; the first-non-empty-entry-per-binding secret lookup; the
+`allowed-orgs` leading-`-` `--file` check; the pagination early exit once every wanted name is
+seen; treating ANY post-page-one failure as proof of a complete listing (reverted to show a
+false absence claim reappears); requiring the empty-page marker to be the whole message rather
+than a substring (A1); and treating a page that adds no new name as proof of completion (A2).
 
 Separately, the built `cloud-ci` binary was run against a real subprocess: a shell-script
 `wrangler` on `PATH` that logs every invocation and mimics wrangler 4.145.0's documented output
@@ -261,6 +268,16 @@ written):
   text** ("List request returned no secrets.") — the step correctly reported `FAILED`, exit 1,
   naming the names not seen: this is the genuine-absence case, and it must stay `FAILED`, not
   regress to `Manual` alongside the transient-failure fix above.
+- **The same full-page-one setup, but page 2 fails with the empty-page marker wrapped in a
+  longer proxy error** (`"proxy error 503: upstream said 'List request returned no secrets'
+  while retrying (request id 7f3)"`) — the step reported `manual action needed`, exit 0, same as
+  the plain transient-failure case: the marker's mere presence inside a longer message is not
+  treated as proof (A1).
+- **A full page 1, then the exact same full page returned again for page 2** (as if wrangler had
+  ignored `--page`) — the step reported `manual action needed`, exit 0, not `FAILED`: a
+  successful page that repeats rather than fails is also not proof the listing ended (A2). Both
+  scenarios logged exactly 2 `secrets-store secret list` calls, and the real repo's `target/`
+  gained zero new files in either run.
 - **`--dry-run` against the same pending-migration, absent-secret setup** — logged calls were
   only `wrangler whoami`, `d1 migrations list`, and one `secrets-store secret list`; no
   `migrations apply` or any other mutating call was made.
