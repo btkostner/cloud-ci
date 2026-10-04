@@ -164,11 +164,20 @@ themselves. `--dry-run` runs only read-only checks (`wrangler whoami`, `d1 migra
    appearing fails the step rather than concluding absence from a truncated listing). A listing
    is only treated as confirmed-complete — so a still-missing name can be reported as a hard
    failure — when: a page comes back with fewer than 100 output rows (wrangler's own page size);
-   every wanted name has been seen; or a later page's call fails with a message that, once
-   trimmed and a common `[ERROR]`-style prefix and trailing period are stripped, IS (not merely
-   contains) wrangler 4.145.0's own empty-page error text, "List request returned no secrets"
-   (`[unverified]` against a live account — read from wrangler's distributed source, not
-   reproduced against a real deployment). Two cases stop short of that proof and are reported
+   every wanted name has been seen; or a later page's call fails with a message whose ANSI colour
+   codes (if any) and `Logs were written to "..."` trailer line (if any) are stripped, then whose
+   last non-empty line, once a leading run of glyphs (e.g. `✘`/`✖`/`×`/`▲`, or the single letter
+   `X`) before a literal `[ERROR]`, or a plain `ERROR:`, or neither, is removed, and one trailing
+   period is stripped, IS (not merely contains) wrangler 4.145.0's own empty-page error text,
+   "List request returned no secrets". Confirmed directly against the real `wrangler@4.145.0`
+   binary and its bundled esbuild on this repo's own pinned install (Darwin, `wrangler d1
+   migrations apply`'s sibling command run with `--local`'s persistence, piped output captured
+   byte for byte): on this platform wrangler always prints
+   `✘ [ERROR] List request returned no secrets.` with ANSI colour codes when piped, never the
+   `X [ERROR]` shape (esbuild's own Windows-only rendering of the same prefix, still accepted
+   here since a Windows deployer's output was not captured). `[unverified]`: a live account's
+   remote response, and the exact bytes on Windows or a non-piped terminal.
+   Two cases stop short of that proof and are reported
    manual instead of failed: a later page's call failing for any OTHER reason (the error message
    doesn't match the marker exactly — a transient network error, a rate limit, a proxy wrapping
    wrangler's own error in more text, a true subprocess-spawn failure), and a SUCCESSFUL page
@@ -210,14 +219,18 @@ confirmed empty page and a transient failure — see step 4 above), announce-bef
 ordering, and forwarded-value validation behavior are covered by `setup_wizard.rs`'s own unit
 tests against fake command-runner and filesystem implementations — no network, no real
 `wrangler`, no real Cloudflare/GitHub account, same pattern as the rest of this `setup` family
-(see "Step by step" below). Nine of those checks were additionally confirmed load-bearing by
+(see "Step by step" below). Thirteen of those checks were additionally confirmed load-bearing by
 removing each one in a scratch copy and observing its own pinning test fail: the migration-list
 failed-exit branch; the `CLOUDFLARE_API_TOKEN` precheck; the migration-list `Err`
 transport-failure branch; the first-non-empty-entry-per-binding secret lookup; the
 `allowed-orgs` leading-`-` `--file` check; the pagination early exit once every wanted name is
 seen; treating ANY post-page-one failure as proof of a complete listing (reverted to show a
 false absence claim reappears); requiring the empty-page marker to be the whole message rather
-than a substring (A1); and treating a page that adds no new name as proof of completion (A2).
+than a substring (A1); treating a page that adds no new name as proof of completion (A2); and,
+for the glyph-prefixed shape wrangler actually prints (E1): stripping the leading glyph run at
+all, requiring a literal `[ERROR]` after it rather than accepting any glyph-prefixed text,
+stripping ANSI colour escapes before matching, and skipping wrangler's own
+`Logs were written to "..."` trailer line when choosing the message's last line.
 
 Separately, the built `cloud-ci` binary was run against a real subprocess: a shell-script
 `wrangler` on `PATH` that logs every invocation and mimics wrangler 4.145.0's documented output
@@ -358,12 +371,16 @@ success:
 - **`CmdOutput` carries no exit code**, only a `success` boolean — an apply failure's message can
   say "exited non-zero" but not which code. Adding one is a larger interface change than this
   round's scope.
-- **The "is this a confirmed empty page" check matches one specific error string**
-  ("List request returned no secrets", `[unverified]`, read from wrangler 4.145.0's own
-  distributed source). If a live account's wrangler ever words that error differently, a page-2+
-  failure on a genuinely empty page would be treated as unconfirmed rather than a confirmed
-  absence — the step would report "could not confirm" (manual action) instead of naming the
-  secret as missing. This fails safe (never a false success) but costs an extra manual check.
+- **The "is this a confirmed empty page" check still depends on exact wording, even though the
+  leading glyph is now accepted generically.** Any single run of non-alphanumeric
+  characters before a literal `[ERROR]` (or a plain `ERROR:`, or no prefix at all) is stripped —
+  confirmed against wrangler 4.145.0's real Darwin/piped output, its bundled esbuild, and the
+  `X [ERROR]` shape esbuild uses on Windows — but the word `ERROR` itself and the phrase "List
+  request returned no secrets" must still match exactly (case-sensitive, no extra internal
+  whitespace). `[unverified]`: a live account's exact remote response, and whether any wrangler
+  version or locale ever rewords the message or the `ERROR` keyword. If it does, a genuinely
+  empty page is reported "could not confirm" (manual action) instead of a confirmed absence —
+  fails safe (never a false success), just costs an extra manual check.
 - **wrangler's exact migration-table and empty-page-error text are read from wrangler
   4.145.0's own distributed source** (the version this repo pins in
   `packages/cloud-ci-worker/mise.toml`), not from a live account in this environment; "Real-
