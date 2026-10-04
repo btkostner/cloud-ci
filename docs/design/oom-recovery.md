@@ -38,9 +38,12 @@ main has since moved to 464decd, whose two newer commits touch only `setup_wizar
 | H3 / Q10 | What feeds the shard barrier (`shard_state`) for a retried shard. | §4 |
 | Q1 | Default instance size for managed nodes (they run at `lite` today). | Stage 0 |
 | Q9, Q10 | (same as H1, H3) | |
+| Q17 | If Q11 is "hold": which UNKNOWN-holding mechanism, of several non-equivalent shapes. | §1.1 (G1) |
+| Q18 | Window length, and what resolves a still-deferred node when the run closes first. | §1.1, §3.6 (F6) |
 
 H2 (the second decision's persistence model) is specified in §2.2 and needs review, not a policy
-decision. Everything else is a stated rule or an owner question in §9.
+decision. Q17 and Q18 only apply if Q11 is answered "hold" (§9). Everything else is a stated
+rule or an owner question in §9.
 
 ## 0. Why the earlier wiring failed, mapped to this design
 
@@ -1241,6 +1244,15 @@ while off (§5.1).
   `decide_oom_recovery` (this design: `node.size`).
 * **Q16.** Should `handle_close_run` stop non-terminal nodes, for the retry and for all nodes
   (C1)? Today a timeout or normal close leaves running containers.
+* **Q17 (new, F7).** If Q11 is answered "hold": which mechanism (§1.1's G1 discussion) -
+  the agent's explicit "evidence unavailable" upload, the late-upgrade-bound coordinator
+  window, the defer-the-write coordinator window (option A only, requires changing
+  `handle_complete_node`), or some combination? These are not mutually exclusive, but the
+  defer-the-write shape is the only one with a non-additive cost (T1/T3).
+* **Q18 (new, F7).** Whichever window shape Q17 picks: how long (the configured window before
+  `min(window, remaining_run_time)` applies, F6), and what resolves a `runner_auto` node still
+  deferred or still un-classified when the run closes first (F6) - record the ordinary failure
+  with no retry (this design's fail-closed default elsewhere), or something else?
 
 ## 10. Contradictions found in the existing docs and code
 
