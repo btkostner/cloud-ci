@@ -98,13 +98,26 @@ content hash (`logic::resource_sample_batch_content_hash`). Idempotency identity
 `(job_id, shard_index, attempt)`; the same identity with a different `node_id` is a 409
 conflict.
 
-**Binding rule (replaces revision 1's "row binds to (job, idx, attempt)"):** the coordinator
-resolves `job_name` from `job_id` (`read_job_by_id`, DO-local `job` table), computes
-`expected = logic::shard_node_id(job_name, shard_index, attempt)`, and acts only if
-`req.node_id == Some(expected)` (exact string equality, no parsing of the id), the `node` row
-exists, `node.runner_auto = 1`, and `node.shard_attempt == attempt`. A report with no
-`node_id` (old agent, or a dispatcher that sets none) is samples-only and **never** triggers
-recovery: absent identity means no action, not a guess.
+**Binding rule - depends on the H1 option (L2).** How the coordinator decides "this evidence
+is for this node" is shaped by which H1 option is chosen; the general principle is the same
+under both: absent or unmatched identity means no action, not a guess.
+
+* **Under option A** (the agent is the evidence source, `SubmitResourceSamples`): the
+  coordinator resolves `job_name` from `job_id` (`read_job_by_id`, DO-local `job` table),
+  computes `expected = logic::shard_node_id(job_name, shard_index, attempt)`, and acts only if
+  `req.node_id == Some(expected)` (exact string equality, no parsing of the id), the `node` row
+  exists, `node.runner_auto = 1`, and `node.shard_attempt == attempt`. A report with no
+  `node_id` (old agent, or a dispatcher that sets none) is samples-only and **never** triggers
+  recovery. This check is what the pure helper `oom_report_matches_node` implements (§6.1); it
+  is specific to the `SubmitResourceSamples` request shape and has no equivalent under B.
+* **Under option B** (`NodeContainer` is the evidence source, on `/complete-node`): there is no
+  separate report to bind identity against. The evidence (exit code, `oom_kill`) arrives as
+  optional fields on the existing `CompleteNodeRequest` for `req.node_id` itself, which
+  `handle_complete_node` already resolves to one real `node` row (line 2813) before any OOM
+  logic runs - the node id is the call's own primary key, so there is nothing to cross-check
+  it against. The gate is simply `node.runner_auto = 1` (plus the structural exclusion for an
+  already-`Cancelled` node, §1.1's classification table). No pure matcher function is needed;
+  the classification (above) runs directly on the request's exit code and `oom_kill` fields.
 
 **Size source (M5, Q15):** `decide_oom_recovery`'s `current_size` comes from the node row
 (`node.size`), never from the report's `instance_type`. The agent takes `--instance-type` only
@@ -507,11 +520,25 @@ The order is already encoded in `logic::next_oom_effect_excluding` and is kept v
 
 | Effect | Idempotent because | Flag set when |
 | --- | --- | --- |
-| MarkOldTerminal | `update_node_status` to `failed` only if the node is non-terminal; a node already terminal for another reason (it naturally succeeded, or was cancelled) means the decision is `abandoned` (§3.6), not overwritten. | the row is terminal and `closed_by` is ours |
+| MarkOldTerminal | `update_node_status` to `failed` only if the node is non-terminal. Option-dependent (L1): see the paragraph below the table for what "already terminal" means under option A versus option B. | the row is terminal, `closed_by = 'oom'`, and (option A only) `result` carries the OOM message |
 | StopOld | `NodeContainer::handle_stop` is a no-op when not running; `resolve_stop_outcome(addr, ok) == Pending` keeps the flag unset. | stop returned 2xx |
 | InsertRetry | deterministic id plus `resolve_start_node` (same spec hash = no-op; different = conflict, `stuck`). | row exists with our spec hash |
 | StartRetry | `NodeContainer::handle_start` returns `started:false` if already `running()`. A start that throws marks the retry row `failed` (as `handle_start_node` does) and still sets the flag. | start 2xx, or row marked failed |
 | Project* | `INSERT .. ON CONFLICT DO UPDATE`. | D1 call returned ok |
+
+**MarkOldTerminal's "already terminal" case is option-dependent (L1).** Under **option B**,
+evidence and the node's failure are recorded in the same transaction (§1.1), so the target
+node is always still non-terminal when `MarkOldTerminal` runs; a node that is terminal for
+another reason (it naturally `succeeded`, or was `cancelled`) genuinely means someone else won
+the race, and the decision is `abandoned` (§3.6), not overwritten. Under **option A**, the
+target node is very often *already* `failed` (plain exit 137, `closed_by` unset) by the time
+the batch arrives - H1's own problem statement is that this is the dominant case, not an edge
+case. `update_node_status` still writes only when non-terminal, but a node that is `failed`
+with `closed_by` unset **and** the arriving batch classifies as OOM (§1.1's classification)
+is **upgraded**, not abandoned: `closed_by` is set to `'oom'` and `result` is overwritten with
+the OOM message, even though the row was already terminal before this call. Only a node
+terminal as `succeeded`/`cancelled`/`timed_out` is abandoned under option A; a node terminal as
+plain `failed` with matching OOM evidence is upgraded.
 
 `start()` returns before the container is ready, and later failures need `monitor()`
 (Cloudflare, "Durable Object Container API", `start`: "To catch later errors, including a
@@ -643,16 +670,31 @@ shard node, original or retry, is `shard:{job}:{idx}:{attempt}` with `attempt` i
 attempt, so **exact-attempt resolution already lands on the right node**. The R1 bug existed
 only because the removed code replaced that lookup with a lineage lookup.
 
-**Rules that hold under either H3 option:**
+**Rules under H3 option 1 (a public `ShardTerminal` RPC, or any future caller of the existing
+internal `/shard-terminal` route) - not applicable under option 2 (L3):**
 
-1. **Resolve by the reporting attempt, always.** A shared helper
+1. **Resolve by the reporting attempt, always.** `complete_own_shard_node` (`mod.rs` line
+   3685, the only call site) runs only inside the internal `/shard-terminal` handling path,
+   which has no traffic until an option-1 caller exists. A shared helper
    `resolve_live_shard_node(sql, job, idx, attempt) -> Option<NodeRow>` (exact `shard_node_id`,
-   no lineage redirect) is the only lookup `complete_own_shard_node` and
-   `drain_shard_terminal_effects` use. A late attempt-1 report completes attempt 1's node
-   (already terminal via `MarkOldTerminal`, so `shard_self_completion_target` changes nothing)
-   and can never touch attempt 2. A unit test proves it never returns attempt N+1 for N.
+   no lineage redirect) is the only lookup it and `drain_shard_terminal_effects` use. A
+   **late attempt-1 shard-terminal report** - only possible once option 1 has a caller -
+   completes attempt 1's node (already terminal via `MarkOldTerminal`, so
+   `shard_self_completion_target` changes nothing) and can never touch attempt 2. A unit test
+   proves it never returns attempt N+1 for N.
 2. **Stop only the node you resolved**, via that row's own `physical_address`; attempt 1's stop
    cannot kill attempt 2 (addresses differ).
+
+**Under H3 option 2, rules 1-2 above do not apply: there is no separate shard-terminal report
+to resolve.** `/complete-node` already addresses one specific `node_id` - the attempt-specific
+id itself - so there is no lineage redirection to get wrong and no "late attempt-1 report"
+scenario of this kind. A late `/complete-node` for attempt 1 under option 2 is handled
+entirely by the pre-existing, H3-independent rules already stated in §2.1 and §3.2
+(`resolve_complete_node`'s terminal-status idempotency, and M1's `closed_by` rule), not by
+anything specific to shard-terminal resolution.
+
+**Rule that holds under either H3 option:**
+
 3. **Fail-fast** still freezes `cancel_node_ids` at decision time
    (`resolve_shard_cancel_node_ids`). A retry that exists at that moment matches
    `shard_node_matches` and is cancelled. A retry created after the freeze is not in the frozen
@@ -788,8 +830,14 @@ behavior.
 * Second-decision model: seq 1 `retry` then a report with `attempt == observed_attempt + 1`
   yields `New(FailedAtMax)`; a report with the original attempt and a different node id is
   rejected by the binding rule; `AlreadyDecided` after seq 2 or a seq 1 `failed_at_max`.
-* `oom_report_matches_node`: exact equality with `shard_node_id(job, idx, attempt)`; rejects a
-  missing `node_id`, a node id of another attempt, a legacy node (`runner_auto = 0`).
+* `oom_report_matches_node` (option A only): exact equality with `shard_node_id(job, idx,
+  attempt)`; rejects a missing `node_id`, a node id of another attempt, a legacy node
+  (`runner_auto = 0`). Option B has no equivalent matcher (§1.1): a test instead asserts the
+  simpler gate (`node.runner_auto = 1`, node not `Cancelled`) admits or rejects correctly.
+* Trigger classification (G1): exit 137 + `oom_kill > 0` -> OOM; exit 137 + `oom_kill = 0` ->
+  NOT-OOM; `oom_kill > 0` + non-137 exit -> NOT-OOM; unreadable evidence -> UNKNOWN; a
+  `Cancelled` node is excluded before classification runs (ties to `resolve_complete_node`'s
+  existing `DroppedCancelled` test).
 * `resolve_complete_node` with `closed_by = 'oom'` returns a no-write variant (M1); failed-after-
   failed on an ordinary node still `Recorded`.
 * Retry id injectivity and `shard_nodes_to_cancel` matching `shard:J:I:2` (regression for the
@@ -802,20 +850,38 @@ behavior.
   command (Q14); spec hash differs when size or `shard_attempt` differs.
 * Effect state machine: existing `next_oom_effect_excluding` tests stay; add the `abandoned`
   path (no `InsertRetry`/`StartRetry`, `StopOld` still due).
+* `decide_oom_recovery` given the **latest** row (D1): a seq-1 `RetryAt` existing record plus
+  an `attempt + 1` report returns `New(FailedAtMax)` (not yet `AlreadyDecided`); the same call
+  repeated with the seq-2 `FailedAtMax` record now passed as `existing` returns
+  `AlreadyDecided` - the two calls must use different `existing` values and return differently.
 
 ### 6.2 Durable-Object-level behavior (needs a runtime harness)
 
 `RunCoordinator` methods take a real `SqlStorage`, and there is **no in-repo DO harness** today
 (Q4): options are (a) extract the effect executor behind a trait and test against an in-memory
 SQLite dev-dependency with fault injection, or (b) `workerd` via `wrangler dev`/Miniflare.
-Scenarios: crash between each pair of effects then re-drain converges; duplicate
-`SubmitResourceSamples` delivery yields one decision; a report after the run is terminal is
-samples-only; a second OOM yields seq 2 whose effects stop the **retry** node's container;
-stuck/degraded after the cap with operator-visible state; **alarm order**: a terminal run with
-pending decisions and overflow still drains both and then releases the slot; deadline passed
-with a stuck decision closes the run; a late `/complete-node` for an OOM-closed node writes
-nothing (M1); fail-fast between `InsertRetry` and `StartRetry` leaves no container (M3);
-healing continues with `OOM_RECOVERY` switched off.
+Scenarios, option-independent: crash between each pair of effects then re-drain converges; a
+second OOM yields seq 2 whose effects stop the **retry** node's container; stuck/degraded
+after the cap with operator-visible state; **alarm order**: a terminal run with pending
+decisions and overflow still drains both and then releases the slot; deadline passed with a
+stuck decision closes the run; a late `/complete-node` for an OOM-closed node writes nothing
+(M1); fail-fast between `InsertRetry` and `StartRetry` leaves no container (M3); healing
+continues with `OOM_RECOVERY` switched off; a seq-1-then-seq-2 PK insert collision (two
+near-simultaneous drains of the same lineage) resolves to `AlreadyDecided`, never a surfaced
+SQL error (D1); **a late or duplicate report after seq 2 exists is a clean no-op** (G6) -
+neither a seq 3 row nor an SQL error; **the seq-2 target node is already terminal when
+`MarkOldTerminal` for seq 2 runs** (G6, e.g. the retry was independently cancelled) - the
+decision proceeds to `StopOld`/projections without a conflicting write.
+
+Option A scenarios: duplicate `SubmitResourceSamples` delivery yields one decision; a report
+after the run is terminal is samples-only; a report arriving for a node already `failed`
+(plain exit 137) with matching OOM evidence **upgrades** it rather than abandoning the
+decision (L1); a report for a node terminal as `succeeded`/`cancelled` abandons the decision.
+
+Option B scenarios (L1/L2): a duplicate `/complete-node` delivery for the same node carries
+evidence only once (no double decision); exit 137 with `oom_kill = 0` classifies NOT-OOM, not
+OOM, and the node's failure is recorded normally with no decision row; `memory.events`
+unreadable by the second `exec` classifies UNKNOWN, same outcome as NOT-OOM.
 
 ### 6.3 Live smoke (not runnable in this environment)
 
