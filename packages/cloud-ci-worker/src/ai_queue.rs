@@ -453,6 +453,27 @@ pub const SELECT_CLAIMABLE_SQL: &str = "SELECT id, repo_id, context_json FROM ai
      AND (claimed_at IS NULL OR claimed_at <= ?1 - ?2) \
      ORDER BY created_at ASC LIMIT ?3";
 
+/// Terminal transition for a claimed row whose stored `context_json` cannot
+/// be deserialized: it can never succeed on retry, so it is set to
+/// `status = 'error'` (a status ai.md already defines) instead of being
+/// left claimed to be retried every [`MODEL_CALL_CLAIM_LEASE_MS`] forever.
+/// Params: `?1` id, `?2` the pass's own claim timestamp, `?3` now_ms.
+/// Guarded like [`RELEASE_CLAIM_SQL`] so a pass whose lease expired cannot
+/// terminate a row a newer pass owns.
+pub const MARK_CONTEXT_UNPARSABLE_SQL: &str = "UPDATE ai_insight \
+     SET status = 'error', updated_at = ?3 \
+     WHERE id = ?1 AND status = 'pending_model_call' AND claimed_at = ?2";
+
+/// Canonical, parsed reports of one run, in a deterministic order
+/// (`accepted_seq`, then report id) so the failing-test list — and with it
+/// the per-fingerprint representative `assemble_failure_context` picks —
+/// never depends on D1 row order. Columns: `kind`, `r2_key`. Param: `?1`
+/// run_id.
+pub const CANONICAL_REPORTS_SQL: &str = "SELECT reports.kind AS kind, reports.r2_key AS r2_key \
+     FROM reports JOIN jobs ON reports.job_id = jobs.id \
+     WHERE jobs.run_id = ?1 AND reports.is_canonical = 1 AND reports.parsed = 1 \
+     ORDER BY reports.accepted_seq ASC, reports.id ASC";
+
 /// Whether a [`CLAIM_PENDING_SQL`] conditional `UPDATE` won the race, from
 /// D1's reported changed-row count. An unknown count (`None`, a driver
 /// surprise) is treated as "not claimed" rather than "claimed", so an
@@ -958,6 +979,117 @@ mod migration_sql_tests {
         let release_after_resolved_changes =
             conn.execute(super::RELEASE_CLAIM_SQL, params!["ins_claim", 5001_i64])?;
         assert_eq!(release_after_resolved_changes, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn unparsable_context_reaches_terminal_status_and_is_not_claimable_again()
+    -> rusqlite::Result<()> {
+        let conn = db_after_0021()?;
+        let lease = super::MODEL_CALL_CLAIM_LEASE_MS;
+        conn.execute(
+            super::INSERT_INSIGHT_SQL,
+            params!["ins_bad", 1_i64, "run1", "fp_bad", "v1", "not json", 1000_i64],
+        )?;
+        conn.execute(
+            super::INSERT_INSIGHT_SQL,
+            params!["ins_good", 1_i64, "run1", "fp_good", "v1", "{}", 1001_i64],
+        )?;
+        // Both claimed by one pass, as `ai_model_call_pass` does.
+        for id in ["ins_bad", "ins_good"] {
+            conn.execute(super::CLAIM_PENDING_SQL, params![id, 5000_i64, lease])?;
+        }
+        let changed = conn.execute(
+            super::MARK_CONTEXT_UNPARSABLE_SQL,
+            params!["ins_bad", 5000_i64, 5001_i64],
+        )?;
+        assert_eq!(changed, 1);
+
+        let status = |id: &str| -> rusqlite::Result<String> {
+            conn.query_row("SELECT status FROM ai_insight WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+        };
+        assert_eq!(status("ins_bad")?, "error");
+        assert_eq!(status("ins_good")?, "pending_model_call");
+
+        // Long after the lease expires, only the good row is selectable and
+        // the bad row can no longer be claimed.
+        let far_future = 5000_i64 + lease * 100;
+        let claimable: Vec<String> = conn
+            .prepare(super::SELECT_CLAIMABLE_SQL)?
+            .query_map(params![far_future, lease, 10_i64], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        assert_eq!(claimable, vec!["ins_good".to_string()]);
+        let reclaim = conn.execute(
+            super::CLAIM_PENDING_SQL,
+            params!["ins_bad", far_future, lease],
+        )?;
+        assert!(!super::claim_won(Some(reclaim)));
+        Ok(())
+    }
+
+    /// Inserts `reports` rows (job `j<n>`, given `accepted_seq`) in the
+    /// given order and returns the assembled context JSON built from the
+    /// rows `CANONICAL_REPORTS_SQL` returns, in that order.
+    fn assembled_json_for_insert_order(order: &[usize]) -> rusqlite::Result<String> {
+        use super::FailingTestInput;
+        let conn = db_after_0021()?;
+        conn.execute(
+            "INSERT INTO jobs (id, run_id, job_name, shard_total) VALUES \
+             ('j1', 'run1', 'a', 1), ('j2', 'run1', 'b', 1)",
+            [],
+        )?;
+        // (report id, job, accepted_seq, r2_key). Reports 0 and 1 hold the
+        // same failing test (same fingerprint) with different captured
+        // output, so the representative depends on row order.
+        let rows = [
+            ("r_a", "j1", 1_i64, "k_a"),
+            ("r_b", "j2", 2_i64, "k_b"),
+            ("r_c", "j2", 3_i64, "k_c"),
+        ];
+        for &i in order {
+            let (id, job, seq, key) = rows[i];
+            conn.execute(
+                "INSERT INTO reports (id, job_id, shard_index, kind, name, content_sha256, \
+                 accepted_seq, created_at, r2_key, parsed) \
+                 VALUES (?1, ?2, 0, 'junit', ?1, ?1, ?3, 1, ?4, 1)",
+                params![id, job, seq, key],
+            )?;
+        }
+        let failing = |test: &str, out: &str| FailingTestInput {
+            test_id: test.to_string(),
+            message: "boom".to_string(),
+            stack_trace: vec!["at foo".to_string()],
+            system_out: out.to_string(),
+            system_err: String::new(),
+        };
+        let content = |key: &str| match key {
+            "k_a" => vec![failing("t1", "out from a")],
+            "k_b" => vec![failing("t1", "out from b")],
+            _ => vec![failing("t2", "out from c")],
+        };
+        let keys: Vec<String> = conn
+            .prepare(super::CANONICAL_REPORTS_SQL)?
+            .query_map(params!["run1"], |r| r.get(1))?
+            .collect::<rusqlite::Result<_>>()?;
+        let tests: Vec<FailingTestInput> = keys.iter().flat_map(|k| content(k)).collect();
+        let assembled = super::assemble_failure_context(&tests, 8192);
+        Ok(serde_json::to_string(&serde_json::json!({
+            "entries": assembled.entries,
+            "selected": assembled.selected_fingerprints,
+            "systemic": assembled.systemic,
+        }))
+        .expect("serializes"))
+    }
+
+    #[test]
+    fn assembled_context_is_independent_of_report_row_insert_order() -> rusqlite::Result<()> {
+        let baseline = assembled_json_for_insert_order(&[0, 1, 2])?;
+        assert!(baseline.contains("out from a"), "{baseline}");
+        for order in [[2, 1, 0], [1, 2, 0], [2, 0, 1], [1, 0, 2], [0, 2, 1]] {
+            assert_eq!(assembled_json_for_insert_order(&order)?, baseline);
+        }
         Ok(())
     }
 

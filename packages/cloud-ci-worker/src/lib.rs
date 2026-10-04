@@ -357,11 +357,7 @@ async fn handle_analysis_requested(env: &Env, message: &ai_queue::AnalysisReques
         r2_key: String,
     }
     let reports: Vec<ReportRef> = db
-        .prepare(
-            "SELECT reports.kind AS kind, reports.r2_key AS r2_key \
-             FROM reports JOIN jobs ON reports.job_id = jobs.id \
-             WHERE jobs.run_id = ?1 AND reports.is_canonical = 1 AND reports.parsed = 1",
-        )
+        .prepare(ai_queue::CANONICAL_REPORTS_SQL)
         .bind(&[JsValue::from_str(&message.run_id)])?
         .all()
         .await?
@@ -845,9 +841,18 @@ async fn ai_model_call_pass(env: &Env) -> Result<()> {
                 Ok(c) => c,
                 Err(e) => {
                     worker::console_log!(
-                        "ai: ai_insight {} has unparsable context_json, skipping: {e}",
+                        "ai: ai_insight {} has unparsable context_json, marking status=error \
+                         (unrecoverable — retrying would never deserialize it): {e}",
                         row.id,
                     );
+                    db.prepare(ai_queue::MARK_CONTEXT_UNPARSABLE_SQL)
+                        .bind(&[
+                            JsValue::from_str(&row.id),
+                            JsValue::from_f64(claim_now_ms as f64),
+                            JsValue::from_f64(Date::now().as_millis() as f64),
+                        ])?
+                        .run()
+                        .await?;
                     continue;
                 }
             };
