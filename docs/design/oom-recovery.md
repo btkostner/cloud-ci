@@ -262,8 +262,34 @@ fails (missing file, permission denied), `sample_for` propagates the error with 
 run before any `SubmitResourceSamples` call is made** - there is no partial batch. So under
 option A, "`memory.events` unreadable" does not produce a batch with missing fields; it
 produces no batch at all, and the node's eventual `/complete-node` (posted independently by
-`run_and_report`) carries only the job's own exit code, with no OOM evidence attached -
-UNKNOWN by construction.
+`run_and_report`) carries only the job's own exit code, with no OOM evidence attached - which
+**should** classify as UNKNOWN per §1.1's classification table, but today nothing turns that
+silence into an actual UNKNOWN determination the coordinator acts on. See the next paragraph.
+
+**The classification is correct; the detection mechanism does not exist yet (G1).** Today,
+"no batch arrives" is indistinguishable, from the coordinator's point of view, from "the agent
+hasn't finished yet", "the agent was never dispatched", or "the agent is still inside its
+sampling window" - there is no positive signal that evidence was attempted and failed. The
+classification table above treats "unreadable evidence" as UNKNOWN, but that is a design
+requirement on what must be *built*, not a description of what the current agent already
+does: today a read failure simply aborts the process with no observable trace at the
+coordinator beyond the ordinary `/complete-node` the job's own exit produces (§1.1's "Option
+A" problem statement above). Whichever H1 option is chosen, this design needs one of:
+* **An explicit "evidence unavailable" upload.** The agent catches its own `CgroupReadError`
+  instead of propagating it with `?`, and still calls `SubmitResourceSamples` (or an
+  equivalent minimal report) with an explicit flag - for example `evidence_unavailable: true`
+  on the batch, or `oom_detected`/`memory_peak_bytes` both absent in a request the coordinator
+  can tell apart from "zero samples because the batch truly had none" - so UNKNOWN is a
+  positive signal, not an absence.
+* **A coordinator-side window.** The coordinator treats a missing `SubmitResourceSamples` (or,
+  under option B, a missing second-`exec` result) as UNKNOWN once the node's own
+  `/complete-node` has arrived and some bounded time has passed with no evidence report -
+  analogous to the existing run-timeout pattern (§3.6), not a new unbounded wait. This needs
+  its own deadline, separate from the run timeout, stated by the owner alongside H1.
+
+Neither mechanism exists today; both are additive (an agent code change for the first, a
+coordinator timer for the second), and either is a genuine stage deliverable (§8 Stage 4), not
+something Stage 4 can treat as already covered by the agent's current abort-on-error behavior.
 
 **When it flushes (option A).** Once, after `sample_for`'s bounded loop for `--duration-secs`
 (default 60 s), as one `SubmitResourceSamples` call. `node_status_for_exit_code` (`logic.rs`
@@ -955,6 +981,11 @@ behavior.
   NOT-OOM; `oom_kill > 0` + non-137 exit -> NOT-OOM; unreadable evidence -> UNKNOWN; a
   `Cancelled` node is excluded before classification runs (ties to `resolve_complete_node`'s
   existing `DroppedCancelled` test).
+* The explicit UNKNOWN mechanism itself (G1, Stage 4 deliverable): whichever is chosen, an
+  "evidence unavailable" upload parses to UNKNOWN the same as a successful batch with no OOM
+  evidence (not NOT-OOM, not a parse error); a coordinator-side window's deadline is bounded
+  and independent of the run timeout, and the decision is UNKNOWN only once that deadline
+  passes with no report, never before.
 * `resolve_complete_node` with `closed_by = 'oom'` returns a no-write variant (M1); failed-after-
   failed on an ordinary node still `Recorded`.
 * Retry id injectivity and `shard_nodes_to_cancel` matching `shard:J:I:2` (regression for the
@@ -1009,6 +1040,16 @@ Option B scenarios (L1/L2): a duplicate `/complete-node` delivery for the same n
 evidence only once (no double decision); exit 137 with `oom_kill = 0` classifies NOT-OOM, not
 OOM, and the node's failure is recorded normally with no decision row; `memory.events`
 unreadable by the second `exec` classifies UNKNOWN, same outcome as NOT-OOM.
+
+Explicit UNKNOWN scenarios (G1, option-independent): a node whose `/complete-node` carries an
+explicit "evidence unavailable" marker is recorded as an ordinary failure with no decision
+row, exactly like a successful-batch NOT-OOM; **if a coordinator-side window is the chosen
+mechanism**, a node whose completion arrives with no evidence report stays un-classified
+(no decision, no ordinary-failure write forced early) until that window's own deadline
+passes, at which point it is recorded as UNKNOWN - a report that arrives after the node was
+already recorded this way is a late report, handled like any other late evidence (§1.1); the
+window's deadline is independent of, and strictly shorter than, the run timeout, so it is
+never the run-timeout drain (§3.6) that resolves it.
 
 ### 6.3 Live smoke (not runnable in this environment)
 
@@ -1066,7 +1107,11 @@ while off (§5.1).
    option 2).
 4. **Evidence capture, recorded only (blocked on H1/Q9).** Option B's second `exec` and the
    optional `CompleteNodeRequest` field, or option A's agent contract change; evidence is stored
-   and logged but triggers nothing.
+   and logged but triggers nothing. **Includes the explicit UNKNOWN mechanism (§1.1's "The
+   classification is correct; the detection mechanism does not exist yet"):** either the
+   agent's "evidence unavailable" upload or the coordinator-side window, whichever the owner
+   picks alongside H1 - the current abort-on-read-error agent behavior does not already cover
+   this; a batch never arriving is not yet an observable signal, so this stage must build one.
 5. **Decision and effects behind the flag.** Node columns (literal guards), `oom_decision`,
    `runner_auto` at `startNode`, decision inside the evidence transaction, effect drain, alarm
    sweep (§3.6), fault-injection tests (§6.2) against a fake executor. Healing does not depend
