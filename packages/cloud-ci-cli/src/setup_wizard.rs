@@ -486,23 +486,85 @@ struct Listing {
 /// period or an `[ERROR]` prefix. See [`is_empty_page_error`].
 const EMPTY_PAGE_MARKER: &str = "List request returned no secrets";
 
-/// True only when a failed call's text IS wrangler's empty-page error: the
-/// whole trimmed text, or its last non-empty line, equals
-/// [`EMPTY_PAGE_MARKER`] once an optional leading `X [ERROR]`/`[ERROR]`/
-/// `ERROR:` prefix and a trailing `.` are removed. A transient error that
-/// merely mentions the marker inside longer text is NOT proof the listing
-/// ended.
-fn is_empty_page_error(text: &str) -> bool {
-    let Some(last) = text.lines().map(str::trim).rfind(|l| !l.is_empty()) else {
-        return false;
-    };
-    let mut line = last;
-    for prefix in ["X [ERROR]", "[ERROR]", "ERROR:"] {
-        if let Some(rest) = line.strip_prefix(prefix) {
-            line = rest.trim_start();
-            break;
+/// Removes ANSI CSI escape sequences (`ESC [ <params> <final byte>`).
+/// wrangler 4.145.0 formats errors with esbuild's `formatMessagesSync` and a
+/// hardcoded `color: true`, so piped output still carries them.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            while let Some(&n) = chars.peek() {
+                if ('\u{20}'..='\u{3f}').contains(&n) {
+                    chars.next();
+                } else {
+                    if ('\u{40}'..='\u{7e}').contains(&n) {
+                        chars.next();
+                    }
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
         }
     }
+    out
+}
+
+/// Leading run of glyphs and whitespace (`✘`, `✖`, `×`, `▲`, an emoji, ...):
+/// everything that is neither alphanumeric nor the `[` of `[ERROR]`.
+fn skip_glyphs(line: &str) -> &str {
+    line.trim_start_matches(|c: char| c != '[' && !c.is_alphanumeric())
+}
+
+/// wrangler prints `<glyph>  Logs were written to "<path>"` after an error
+/// when it wrote a debug log. It is decoration, not part of the message.
+fn is_logs_trailer(line: &str) -> bool {
+    let rest = skip_glyphs(line);
+    rest.starts_with("Logs were written to \"") && rest.ends_with('"')
+}
+
+/// Removes the error-line decoration: an optional leading glyph run (or the
+/// single letter `X` esbuild uses on Windows) followed by `[ERROR]`, or a
+/// plain `ERROR:`. A line with none of these is returned unchanged, so a
+/// glyph in front of bare text is NOT accepted.
+fn strip_error_prefix(line: &str) -> &str {
+    let rest = skip_glyphs(line);
+    let rest = match rest.strip_prefix('X') {
+        Some(after) if after.trim_start().starts_with("[ERROR]") => after.trim_start(),
+        _ => rest,
+    };
+    if let Some(after) = rest.strip_prefix("[ERROR]") {
+        return after.trim_start();
+    }
+    if let Some(after) = line.strip_prefix("ERROR:") {
+        return after.trim_start();
+    }
+    line
+}
+
+/// True only when a failed call's text IS wrangler's empty-page error. After
+/// ANSI escapes are removed, the last non-empty line that is not wrangler's
+/// `Logs were written to "..."` trailer must, once the decoration of
+/// [`strip_error_prefix`] and one trailing `.` are removed, EQUAL
+/// [`EMPTY_PAGE_MARKER`] exactly. A transient error that merely mentions
+/// the marker inside longer text is NOT proof the listing ended.
+///
+/// Shapes confirmed against the real wrangler 4.145.0 binary on Darwin
+/// (`✘ [ERROR] List request returned no secrets.` with ANSI colour, blank
+/// lines, then the logs trailer) and from its source; `[unverified]` on a
+/// live account and on other platforms.
+fn is_empty_page_error(text: &str) -> bool {
+    let clean = strip_ansi(text);
+    let Some(last) = clean
+        .lines()
+        .map(str::trim)
+        .rfind(|l| !l.is_empty() && !is_logs_trailer(l))
+    else {
+        return false;
+    };
+    let line = strip_error_prefix(last);
     line.strip_suffix('.').unwrap_or(line).trim_end() == EMPTY_PAGE_MARKER
 }
 
@@ -2049,6 +2111,146 @@ name = "NODE_CONTAINER"
         assert_eq!(
             list_calls, 2,
             "a repeated page must stop after confirming it repeats, not loop to the cap: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn is_empty_page_error_accepts_every_confirmed_wrangler_shape() {
+        // E1: real wrangler 4.145.0 formats a fatal error through esbuild's
+        // formatMessagesSync with color: true, which on Darwin/Linux prints
+        // `✘ [ERROR] <message>` (not the `X [ERROR]` esbuild uses on
+        // Windows), with ANSI colour codes when piped, blank lines, and
+        // (when a debug log was written) a `<glyph>  Logs were written to
+        // "<path>"` trailer line after the error. Captured directly from
+        // the real `wrangler@4.145.0` binary and its bundled esbuild on
+        // this (Darwin) machine; [unverified] on a live account or other
+        // platforms.
+        let accepted = [
+            "List request returned no secrets",
+            "List request returned no secrets.",
+            "X [ERROR] List request returned no secrets.",
+            "[ERROR] List request returned no secrets.",
+            "ERROR: List request returned no secrets.",
+            "\u{2718} [ERROR] List request returned no secrets.",
+            "\u{2716} [ERROR] List request returned no secrets.",
+            "\u{d7} [ERROR] List request returned no secrets.",
+            "\u{25b2} [ERROR] List request returned no secrets.",
+            "\u{2718} [ERROR] List request returned no secrets.\n\n",
+            "warn: retrying request\n\u{2718} [ERROR] List request returned no secrets.",
+            // The exact bytes esbuild's formatMessagesSync({color:false})
+            // produces for this message.
+            "\u{2718} [ERROR] List request returned no secrets.\n\n",
+            // The exact bytes with color:true (what a real piped
+            // `wrangler ... --remote` run actually printed on this
+            // machine), and the real run's logs-written trailer line.
+            "\u{1b}[31m\u{2718} \u{1b}[41;31m[\u{1b}[41;97mERROR\u{1b}[41;31m]\u{1b}[0m \u{1b}[1mList request returned no secrets.\u{1b}[0m\n\n\u{1f9f5}  Logs were written to \"/tmp/x/wrangler-2026-10-04.log\"\n",
+        ];
+        for text in accepted {
+            assert!(is_empty_page_error(text), "expected accepted: {text:?}");
+        }
+    }
+
+    #[test]
+    fn is_empty_page_error_rejects_every_shape_that_is_not_the_marker() {
+        let rejected = [
+            "",
+            "\u{2718} [ERROR] A request to the Cloudflare API failed.",
+            "\u{2718} [ERROR] List request returned no secrets (rate limited)",
+            "\u{2718} List request returned no secrets.",
+            "proxy error 503: upstream said 'List request returned no secrets' while retrying",
+            "\u{2718} [ERROR] [ERROR] List request returned no secrets.",
+            "List request returned no secrets..",
+            "\u{2718} [ERROR] List request returned no secrets.\nand then a trailer line",
+        ];
+        for text in rejected {
+            assert!(!is_empty_page_error(text), "expected rejected: {text:?}");
+        }
+    }
+
+    #[test]
+    fn real_wrangler_symbol_prefixed_empty_page_error_confirms_absence() {
+        // E1 end-to-end: the real `✘ [ERROR] ... \n\n<logs trailer>` shape,
+        // with ANSI colour, after a full first page, must still confirm
+        // the listing and report FAILED naming the missing secret.
+        let r = healthy_runner();
+        fn full_then_real_wrangler_symbol_error(page: usize) -> (bool, String) {
+            if page == 1 {
+                (
+                    true,
+                    page_with(
+                        &[
+                            "github-app-private-key",
+                            "github-webhook-secret",
+                            "cloud-ci-master-key",
+                        ],
+                        SECRETS_PER_PAGE_N,
+                        "filler",
+                    ),
+                )
+            } else {
+                (
+                    false,
+                    s(
+                        "\u{1b}[31m\u{2718} \u{1b}[41;31m[\u{1b}[41;97mERROR\u{1b}[41;31m]\u{1b}[0m \u{1b}[1mList request returned no secrets.\u{1b}[0m\n\n\u{1f9f5}  Logs were written to \"/tmp/x/wrangler.log\"\n",
+                    ),
+                )
+            }
+        }
+        let paged = PagedRunner {
+            base: &r,
+            page_result: full_then_real_wrangler_symbol_error,
+        };
+        let fs = FakeFs(RefCell::new(configured()));
+        let rep = run_wizard(&paged, &fs, &args(), "cloud-ci");
+        assert_eq!(rep.steps[3].status, Status::Failed, "{:?}", rep.steps[3]);
+        assert!(
+            rep.steps[3].detail.contains("(github-app-client-secret)"),
+            "{:?}",
+            rep.steps[3]
+        );
+        let calls = r.calls.borrow().clone();
+        let list_calls = calls.iter().filter(|c| c.contains("secrets-store")).count();
+        assert_eq!(list_calls, 2, "{calls:?}");
+    }
+
+    #[test]
+    fn symbol_prefixed_non_marker_text_stays_unconfirmed() {
+        // E1 control: a glyph-prefixed failure that is NOT the marker must
+        // still be unconfirmed, not mistaken for a confirmed empty page.
+        let r = healthy_runner();
+        fn full_then_symbol_prefixed_non_marker(page: usize) -> (bool, String) {
+            if page == 1 {
+                (
+                    true,
+                    page_with(
+                        &[
+                            "github-app-private-key",
+                            "github-webhook-secret",
+                            "cloud-ci-master-key",
+                        ],
+                        SECRETS_PER_PAGE_N,
+                        "filler",
+                    ),
+                )
+            } else {
+                (
+                    false,
+                    s("\u{2718} [ERROR] A request to the Cloudflare API failed."),
+                )
+            }
+        }
+        let paged = PagedRunner {
+            base: &r,
+            page_result: full_then_symbol_prefixed_non_marker,
+        };
+        let fs = FakeFs(RefCell::new(configured()));
+        let rep = run_wizard(&paged, &fs, &args(), "cloud-ci");
+        assert_eq!(rep.steps[3].status, Status::Manual, "{:?}", rep.steps[3]);
+        assert!(!rep.failed(), "{:?}", rep.steps);
+        assert!(
+            rep.steps[3].detail.contains("could not confirm"),
+            "{:?}",
+            rep.steps[3]
         );
     }
 
