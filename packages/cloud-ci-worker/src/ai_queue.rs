@@ -1031,9 +1031,16 @@ mod migration_sql_tests {
         Ok(())
     }
 
-    /// Inserts `reports` rows (job `j<n>`, given `accepted_seq`) in the
-    /// given order and returns the assembled context built from the rows
-    /// `CANONICAL_REPORTS_SQL` returns, in that order.
+    /// Inserts three `reports` rows (one per job `j1`/`j2`/`j3`, in the
+    /// given order), all sharing one fingerprint (same `test_id`/message/
+    /// stack) but distinguishable `output_tail`s, and returns the assembled
+    /// context built from the rows `CANONICAL_REPORTS_SQL` returns in that
+    /// order. `j1`'s report has the *highest* `accepted_seq` and `j2`'s has
+    /// the lowest, deliberately inverted from both insertion order and
+    /// `job_id`/`r2_key` lexical order: a query plan that incidentally
+    /// returns rows in join/index order instead of `accepted_seq` order
+    /// would pick `j1`'s ("third accepted") as the representative, not
+    /// `j2`'s ("first accepted").
     fn assembled_context_for_insert_order(
         order: &[usize],
     ) -> rusqlite::Result<super::AssembledFailureContext> {
@@ -1041,16 +1048,14 @@ mod migration_sql_tests {
         let conn = db_after_0021()?;
         conn.execute(
             "INSERT INTO jobs (id, run_id, job_name, shard_total) VALUES \
-             ('j1', 'run1', 'a', 1), ('j2', 'run1', 'b', 1)",
+             ('j1', 'run1', 'a', 1), ('j2', 'run1', 'b', 1), ('j3', 'run1', 'c', 1)",
             [],
         )?;
-        // (report id, job, accepted_seq, r2_key). Reports 0 and 1 hold the
-        // same failing test (same fingerprint) with different captured
-        // output, so the representative depends on row order.
+        // (report id, job, accepted_seq, r2_key).
         let rows = [
-            ("r_a", "j1", 1_i64, "k_a"),
-            ("r_b", "j2", 2_i64, "k_b"),
-            ("r_c", "j2", 3_i64, "k_c"),
+            ("rep_c", "j1", 3_i64, "k_c"),
+            ("rep_a", "j2", 1_i64, "k_a"),
+            ("rep_b", "j3", 2_i64, "k_b"),
         ];
         for &i in order {
             let (id, job, seq, key) = rows[i];
@@ -1061,38 +1066,43 @@ mod migration_sql_tests {
                 params![id, job, seq, key],
             )?;
         }
-        let failing = |test: &str, out: &str| FailingTestInput {
-            test_id: test.to_string(),
+        let failing = |out: &str| FailingTestInput {
+            test_id: "t1".to_string(),
             message: "boom".to_string(),
             stack_trace: vec!["at foo".to_string()],
             system_out: out.to_string(),
             system_err: String::new(),
         };
         let content = |key: &str| match key {
-            "k_a" => vec![failing("t1", "out from a")],
-            "k_b" => vec![failing("t1", "out from b")],
-            _ => vec![failing("t2", "out from c")],
+            "k_a" => failing("accepted first"),
+            "k_b" => failing("accepted second"),
+            _ => failing("accepted third"),
         };
         let keys: Vec<String> = conn
             .prepare(super::CANONICAL_REPORTS_SQL)?
             .query_map(params!["run1"], |r| r.get(1))?
             .collect::<rusqlite::Result<_>>()?;
-        let tests: Vec<FailingTestInput> = keys.iter().flat_map(|k| content(k)).collect();
+        let tests: Vec<FailingTestInput> = keys.iter().map(|k| content(k)).collect();
         Ok(super::assemble_failure_context(&tests, 8192))
     }
 
     #[test]
     fn assembled_context_is_independent_of_report_row_insert_order() -> rusqlite::Result<()> {
-        let baseline = assembled_context_for_insert_order(&[0, 1, 2])?;
-        assert!(
-            baseline
-                .entries
-                .iter()
-                .any(|e| e.output_tail.contains("out from a")),
-            "{baseline:?}"
-        );
-        for order in [[2, 1, 0], [1, 2, 0], [2, 0, 1], [1, 0, 2], [0, 2, 1]] {
-            assert_eq!(assembled_context_for_insert_order(&order)?, baseline);
+        // The one selected representative must be the earliest-accepted
+        // report's ("accepted first", `accepted_seq = 1`) — never
+        // `j1`'s/`j3`'s later ones — regardless of the order these three
+        // reports happened to be inserted in.
+        for order in [
+            [0, 1, 2],
+            [2, 1, 0],
+            [1, 2, 0],
+            [2, 0, 1],
+            [1, 0, 2],
+            [0, 2, 1],
+        ] {
+            let assembled = assembled_context_for_insert_order(&order)?;
+            assert_eq!(assembled.entries.len(), 1, "{assembled:?}");
+            assert_eq!(assembled.entries[0].output_tail, "accepted first");
         }
         Ok(())
     }
