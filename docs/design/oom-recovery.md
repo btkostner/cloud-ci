@@ -18,6 +18,15 @@ commit on this branch (`f9fa884`), independent of any pending decision here. **N
 decision (H1, H3, Q1, or any other) is made in this revision**: every fix states the rule
 correctly under each option, or marks the point as still open.
 
+**Owner decisions are not the only thing blocking code (F5/N7/revision 4).** This document
+tracks two different kinds of open item, and they do not resolve the same way: an **owner
+decision** (H1, H3, Q1-Q18) is a policy choice this design deliberately leaves open and will
+not guess; a **technical prerequisite** is a fact about the runtime or an existing code path
+that is currently unknown, unverified, or absent, and that blocks implementation regardless of
+how every owner decision is answered. See "Technical prerequisites before implementation"
+(after §8) for the full list - it is not a restatement of the owner-decision list, and
+resolving every Q above does not by itself make this design implementable.
+
 It replaces the "remaining prerequisites" prose in
 [parallelization.md](./parallelization.md#runner-auto-oom-recovery-pure-logic-only-not-wired-2026-10-03)
 and elaborates the policy in [analytics.md](./analytics.md) ("OOM retry", "Instance selection").
@@ -261,6 +270,19 @@ from `cloud-ci-cli/src/agent.rs::sample_for` once at the start (lines 174-176, t
 oom_kill_at_end > oom_kill_at_start` (`cloud_ci_core::sampler::Sampler::finish`,
 `packages/cloud-ci-core/src/sampler.rs` lines 119-123).
 
+**Unresolved technical prerequisite: how the agent is launched and shares the job's cgroup
+(N7).** The "Evidence source" paragraph above assumes `cloud-ci agent` runs inside the same
+cgroup as the job command it is measuring, but this design never states the mechanism that
+makes that true. `NodeContainer::handle_start` execs exactly **one** `command: &[String]`
+per node (`run_and_report`, `node_container.rs` lines 325-350, via `exec_in_container`,
+itself one `container.exec(&cmd, ...)` call); there is no second, agent-specific exec and no
+documented convention for a command that runs both the agent and the job (a wrapper script, a
+sidecar process, an agent that forks and execs the real job command and waits on it, or
+something else). Whichever shape is used determines whether the agent's `--cgroup-path` read
+(below) actually observes the job's own memory pressure, or a different cgroup entirely. This
+is listed as an unresolved technical prerequisite, not an owner decision (see "Technical
+prerequisites before implementation" after §8): no amount of deciding H1 settles it.
+
 **Path, permissions, and failure mode (option A).** `CgroupReader::new(base)` takes
 `--cgroup-path` (default `/sys/fs/cgroup`, `cloud-ci-cli/src/cli.rs` line 386).
 `CgroupReader::read` (`cgroup.rs` lines 169-174) is a plain `std::fs::read_to_string` with no
@@ -438,6 +460,21 @@ passes `None` today.
   `runner_auto_command_carries_identity_flag`). Under option B alone the ban protects sample
   attribution only, not OOM detection; whether to enforce it on B is the same Q14 question. The
   current size is read from `node.size` (§1.1), not from `--instance-type`, under every option.
+
+**Unresolved technical prerequisite: the `--instance-type` ban is not implementable as stated
+today (F5).** `handle_start_node` is specified above to reject a `runner_auto` command
+containing `--instance-type` at all - but the shipped agent hard-fails immediately without
+it: `cloud-ci-cli/src/agent.rs` lines 110-113 return `AgentError::new("resolve instance type",
+"--instance-type is required")` when the flag is absent, and `cli.rs` lines 424-425 declare it
+as a flag-only argument (`#[arg(long = "instance-type")] pub instance_type: Option<String>`,
+no corresponding env var anywhere in `identity.rs` or `agent.rs`, unlike `--attempt`/
+`--node-id`). As specified, banning the flag from a `runner_auto` command's command line makes
+that command unable to run `cloud-ci agent` at all, not merely unable to report an accurate
+size. **This ban is unimplementable until the agent gains an env fallback for
+`--instance-type`** (the same pattern `CLOUD_CI_SHARD_ATTEMPT`/`CLOUD_CI_NODE_ID` already use)
+- that fallback is a technical prerequisite (see "Technical prerequisites before
+implementation" after §8), not a Q14 policy choice; Q14 itself only decides whether the ban
+additionally applies under option B once the prerequisite exists.
 * `StartNodeRequest` gains `shard_attempt: Option<u32>`, `runner_auto` (§5.1) and the instance
   size; `JobSpec` (`executor.rs`) gains the same; all feed `spec_hash`.
 
@@ -1190,6 +1227,38 @@ while off (§5.1).
    that run's evidence; flip the default.
 
 `sizing_decisions` ships with the cron work, not in this sequence.
+
+## Technical prerequisites before implementation
+
+Separate from the owner-decision list in §9: these are facts about the runtime or existing
+code that are currently unknown, unverified, or absent. Every one of them blocks real
+implementation of at least part of this design regardless of how H1, H3 and every Q are
+answered - resolving every owner decision does not by itself make this design implementable.
+
+1. **The cgroup v2 layout visible inside a Cloudflare `durable_object`-policy container.**
+   Whether `/sys/fs/cgroup` (the agent's own default path, `cli.rs` line 386) inside such a
+   container actually exposes `memory.events`/`memory.peak`/`cpu.stat` the way a standard
+   Linux cgroup v2 hierarchy does is not documented in any Cloudflare page read for this
+   design; §1.1's own `CgroupReader` evidence section assumes it does. `[unverified]`.
+2. **The second `exec()` option B needs.** §1.1's "Option B is new code with no precedent in
+   the tree" discussion already lists this and the spike it requires (whether a second `exec`
+   succeeds after the main process exited, whether it sees the same cgroup, and whether the
+   pseudofiles are still readable); restated here because it blocks option B specifically, the
+   same way the other four entries block parts of every option. `[unverified]`.
+3. **The agent launch model and cgroup sharing (N7, §1.1).** How `cloud-ci agent` is launched
+   relative to the job command it measures, and whether they share one cgroup, is not
+   specified anywhere in this design or in the existing code (`NodeContainer::handle_start`
+   execs exactly one `command: &[String]`). Blocks option A's evidence collection and every
+   trigger classification that assumes the agent measured the right process.
+4. **An env fallback for `--instance-type` (F5, §1.3).** The command-template contract bans
+   the flag from a `runner_auto` command, but the shipped agent hard-fails without it
+   (`agent.rs` lines 110-113) and has no env fallback today, unlike `--attempt`/`--node-id`.
+   Blocks the command-template contract (§1.3) for every H1 option.
+5. **A new additive proto field for the explicit UNKNOWN marker (F4, §1.1).** `oom_detected`
+   (a required `bool`) and `memory_peak_bytes` cannot represent "evidence unavailable"; a new
+   field is required, and does not exist on `SubmitResourceSamplesRequest` or
+   `CompleteNodeRequest` today. Blocks Q11's "hold via upload" mechanism (Q17) specifically,
+   not the window mechanisms.
 
 ## 9. Open questions needing an owner decision
 
