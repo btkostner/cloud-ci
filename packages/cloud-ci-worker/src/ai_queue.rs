@@ -989,7 +989,9 @@ mod migration_sql_tests {
         let lease = super::MODEL_CALL_CLAIM_LEASE_MS;
         conn.execute(
             super::INSERT_INSIGHT_SQL,
-            params!["ins_bad", 1_i64, "run1", "fp_bad", "v1", "not json", 1000_i64],
+            params![
+                "ins_bad", 1_i64, "run1", "fp_bad", "v1", "not json", 1000_i64
+            ],
         )?;
         conn.execute(
             super::INSERT_INSIGHT_SQL,
@@ -1030,9 +1032,11 @@ mod migration_sql_tests {
     }
 
     /// Inserts `reports` rows (job `j<n>`, given `accepted_seq`) in the
-    /// given order and returns the assembled context JSON built from the
-    /// rows `CANONICAL_REPORTS_SQL` returns, in that order.
-    fn assembled_json_for_insert_order(order: &[usize]) -> rusqlite::Result<String> {
+    /// given order and returns the assembled context built from the rows
+    /// `CANONICAL_REPORTS_SQL` returns, in that order.
+    fn assembled_context_for_insert_order(
+        order: &[usize],
+    ) -> rusqlite::Result<super::AssembledFailureContext> {
         use super::FailingTestInput;
         let conn = db_after_0021()?;
         conn.execute(
@@ -1074,21 +1078,21 @@ mod migration_sql_tests {
             .query_map(params!["run1"], |r| r.get(1))?
             .collect::<rusqlite::Result<_>>()?;
         let tests: Vec<FailingTestInput> = keys.iter().flat_map(|k| content(k)).collect();
-        let assembled = super::assemble_failure_context(&tests, 8192);
-        Ok(serde_json::to_string(&serde_json::json!({
-            "entries": assembled.entries,
-            "selected": assembled.selected_fingerprints,
-            "systemic": assembled.systemic,
-        }))
-        .expect("serializes"))
+        Ok(super::assemble_failure_context(&tests, 8192))
     }
 
     #[test]
     fn assembled_context_is_independent_of_report_row_insert_order() -> rusqlite::Result<()> {
-        let baseline = assembled_json_for_insert_order(&[0, 1, 2])?;
-        assert!(baseline.contains("out from a"), "{baseline}");
+        let baseline = assembled_context_for_insert_order(&[0, 1, 2])?;
+        assert!(
+            baseline
+                .entries
+                .iter()
+                .any(|e| e.output_tail.contains("out from a")),
+            "{baseline:?}"
+        );
         for order in [[2, 1, 0], [1, 2, 0], [2, 0, 1], [1, 0, 2], [0, 2, 1]] {
-            assert_eq!(assembled_json_for_insert_order(&order)?, baseline);
+            assert_eq!(assembled_context_for_insert_order(&order)?, baseline);
         }
         Ok(())
     }
