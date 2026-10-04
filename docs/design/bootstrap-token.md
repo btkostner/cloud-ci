@@ -145,7 +145,7 @@ payload = {v:1, typ:"bootstrap", repo_id, run_id, node_id, gen, jti, exp}
 `cc_boot_<32 random bytes>`; store the hash. Instant, simple revocation and a leaked-DB export is
 inert. But the exchange handler cannot route to the run's DO from an opaque value; it needs a
 global D1 table `bootstrap_tokens(token_hash PK, run_id, node_id, ...)` (migration
-`0021_*.sql`) read by the Worker, which then must write redemption back to a table the
+`0022_*.sql`) read by the Worker, which then must write redemption back to a table the
 coordinator owns, pushing a second writer toward run state (violates the first invariant) or
 requiring a prefix scheme (`cc_boot_<run_id>.<random>`), which is Option A with extra storage.
 Random plaintext also cannot be re-derived, so a crash between mint and delivery loses it
@@ -250,8 +250,11 @@ state about it.
 `CREATE TABLE IF NOT EXISTS` in `ensure_schema` (`mod.rs:4350`), which is forward-only and safe
 on a live deployment by construction (a new table cannot break an old DO instance). If the owner
 wants dashboards of bootstrap events in D1, that is a separate projection and a forward-only
-migration `0021_bootstrap_tokens.sql` (latest today is `0020_runs_settings_sha.sql`) written by
-the coordinator's projection path like `project_node_to_d1`, not by the handler.
+migration `0022_bootstrap_tokens.sql` written by the coordinator's projection path like
+`project_node_to_d1`, not by the handler. The number is a placeholder: `main` today ends at
+`0020_runs_settings_sha.sql`, and `0021` is already claimed by the in-flight
+`ai-consumer-idempotency` branch (`0021_ai_insight_idempotency.sql`), so the real number is the
+next free one at the time this migration is written.
 
 ### Retry and idempotency semantics
 
