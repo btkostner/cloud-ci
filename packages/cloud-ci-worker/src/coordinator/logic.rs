@@ -1192,16 +1192,19 @@ pub fn resolve_submit_resource_samples(
 /// of the decoded fields instead (same length-prefixing discipline
 /// `coordinator::do_name` already uses, for the same "two different
 /// inputs must never collide" reason) is codec-independent by
-/// construction. `node_id` folds in via the same `push_len_prefixed`
-/// framing as `job_id`/`instance_type` above, normalizing an absent value
-/// to an empty string first (`unwrap_or("")`) rather than a separate
-/// presence flag -- `SubmitResourceSamplesRequest.node_id`'s own doc
-/// comment (`cloud-ci-proto`) requires an unset value and an explicit
-/// empty one to "be treated identically", which this framing gives for
-/// free: both hash exactly like a zero-length `job_id` would. An old
-/// agent (which never sends this field) and a redelivery that only later
-/// started sending an empty string therefore resolve to the exact same
-/// identity -- never a spurious conflict.
+/// construction.
+///
+/// `node_id` is hashed **only when it is non-empty**, as one extra
+/// length-prefixed field appended *after* the samples. An absent value
+/// and an explicit empty string therefore produce exactly the bytes the
+/// pre-`node_id` function produced (pinned by
+/// `content_hash_without_node_id_matches_the_pre_node_id_bytes`, whose
+/// expected bytes were computed from the function at commit `8ac47a7`),
+/// so a batch accepted before this field existed and redelivered after an
+/// upgrade is still an identical replay, never a spurious 409 conflict.
+/// Appending (rather than inserting mid-buffer) keeps the old prefix
+/// byte-for-byte intact; the sample count is length-framed, so the
+/// suffix cannot be confused with sample data.
 #[allow(clippy::too_many_arguments)]
 pub fn resource_sample_batch_content_hash(
     job_id: &str,
@@ -1221,13 +1224,15 @@ pub fn resource_sample_batch_content_hash(
     buf.extend_from_slice(&memory_peak_bytes.unwrap_or(u64::MAX).to_le_bytes());
     buf.push(u8::from(memory_peak_bytes.is_some()));
     buf.push(u8::from(oom_detected));
-    push_len_prefixed(&mut buf, node_id.unwrap_or("").as_bytes());
     buf.extend_from_slice(&(samples.len() as u64).to_le_bytes());
     for sample in samples {
         buf.extend_from_slice(&sample.timestamp_unix_ms.to_le_bytes());
         buf.extend_from_slice(&sample.elapsed_usec.to_le_bytes());
         buf.extend_from_slice(&sample.cpu_usage_usec_delta.to_le_bytes());
         buf.extend_from_slice(&sample.memory_current_bytes.to_le_bytes());
+    }
+    if let Some(node_id) = node_id.filter(|n| !n.is_empty()) {
+        push_len_prefixed(&mut buf, node_id.as_bytes());
     }
     buf
 }
@@ -2513,6 +2518,92 @@ mod tests {
             &samples,
         );
         assert_eq!(absent, empty);
+    }
+
+    #[test]
+    fn content_hash_without_node_id_matches_the_pre_node_id_bytes() {
+        // Pins `resource_sample_batch_content_hash`'s output, for a
+        // `node_id`-omitting call, to the exact bytes the pre-`node_id`
+        // version of this function produced at commit `8ac47a7` (the
+        // commit immediately before `node_id` was added) -- computed by
+        // extracting that commit's `resource_sample_batch_content_hash`/
+        // `push_len_prefixed` verbatim into a standalone throwaway
+        // program and printing the hex of its two outputs. A pre-upgrade
+        // batch redelivered after this deploy must still hash identically
+        // here, or a legitimate retry looks like a 409 conflict.
+        let samples_a = vec![ResourceSampleInput {
+            timestamp_unix_ms: 1_000,
+            elapsed_usec: 2_000_000,
+            cpu_usage_usec_delta: 500,
+            memory_current_bytes: 1024,
+        }];
+        let a = resource_sample_batch_content_hash(
+            "job-1",
+            0,
+            1,
+            "standard-2",
+            Some(2048),
+            false,
+            None,
+            &samples_a,
+        );
+        #[rustfmt::skip]
+        let expected_a: Vec<u8> = vec![
+            5, 0, 0, 0, 0, 0, 0, 0, 106, 111, 98, 45, 49, 0, 0, 0, 0, 1, 0, 0, 0, 10, 0, 0, 0, 0,
+            0, 0, 0, 115, 116, 97, 110, 100, 97, 114, 100, 45, 50, 0, 8, 0, 0, 0, 0, 0, 0, 1, 0,
+            1, 0, 0, 0, 0, 0, 0, 0, 232, 3, 0, 0, 0, 0, 0, 0, 128, 132, 30, 0, 0, 0, 0, 0, 244,
+            1, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0,
+        ];
+        assert_eq!(a, expected_a);
+
+        let b = resource_sample_batch_content_hash("job-2", 3, 2, "basic", None, true, None, &[]);
+        #[rustfmt::skip]
+        let expected_b: Vec<u8> = vec![
+            5, 0, 0, 0, 0, 0, 0, 0, 106, 111, 98, 45, 50, 3, 0, 0, 0, 2, 0, 0, 0, 5, 0, 0, 0, 0, 0,
+            0, 0, 98, 97, 115, 105, 99, 255, 255, 255, 255, 255, 255, 255, 255, 0, 1, 0, 0, 0, 0,
+            0, 0, 0, 0,
+        ];
+        assert_eq!(b, expected_b);
+
+        // Empty node_id must match the same pinned bytes too.
+        let a_empty_node = resource_sample_batch_content_hash(
+            "job-1",
+            0,
+            1,
+            "standard-2",
+            Some(2048),
+            false,
+            Some(""),
+            &samples_a,
+        );
+        assert_eq!(a_empty_node, expected_a);
+    }
+
+    #[test]
+    fn content_hash_with_node_id_differs_from_the_pinned_no_node_id_bytes() {
+        let a_with_node = resource_sample_batch_content_hash(
+            "job-1",
+            0,
+            1,
+            "standard-2",
+            Some(2048),
+            false,
+            Some("shard:job-1:0:1"),
+            &[ResourceSampleInput {
+                timestamp_unix_ms: 1_000,
+                elapsed_usec: 2_000_000,
+                cpu_usage_usec_delta: 500,
+                memory_current_bytes: 1024,
+            }],
+        );
+        #[rustfmt::skip]
+        let pinned_no_node: Vec<u8> = vec![
+            5, 0, 0, 0, 0, 0, 0, 0, 106, 111, 98, 45, 49, 0, 0, 0, 0, 1, 0, 0, 0, 10, 0, 0, 0, 0,
+            0, 0, 0, 115, 116, 97, 110, 100, 97, 114, 100, 45, 50, 0, 8, 0, 0, 0, 0, 0, 0, 1, 0,
+            1, 0, 0, 0, 0, 0, 0, 0, 232, 3, 0, 0, 0, 0, 0, 0, 128, 132, 30, 0, 0, 0, 0, 0, 244,
+            1, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0,
+        ];
+        assert_ne!(a_with_node, pinned_no_node);
     }
 
     #[test]
